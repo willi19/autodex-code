@@ -25,6 +25,7 @@ from curobo.types.math import Pose
 from curobo.types.robot import JointState
 from curobo.geom.types import WorldConfig
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+from curobo.rollout.rollout_base import Goal
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 from curobo.geom.sdf.world import CollisionQueryBuffer
@@ -106,8 +107,8 @@ class GraspPlanner:
 
     HAND_CONFIGS = {
         "allegro":      ("xarm_allegro.yml",      "allegro_floating.yml",      0.01,  32, InterpolateType.CUBIC),
-        "inspire":      ("xarm_inspire.yml",      "inspire_floating.yml",      0.0, 32, InterpolateType.LINEAR_CUDA),
-        "inspire_left": ("xarm_inspire_left.yml", "inspire_left_floating.yml", 0.0, 32, InterpolateType.LINEAR_CUDA),
+        "inspire":      ("xarm_inspire.yml",      "inspire_floating.yml",      0.002, 32, InterpolateType.LINEAR_CUDA),
+        "inspire_left": ("xarm_inspire_left.yml", "inspire_left_floating.yml", 0.002, 32, InterpolateType.LINEAR_CUDA),
     }
 
     def __init__(self, robot_cfg_path: Optional[str] = None, hand_cfg_path: Optional[str] = None,
@@ -157,7 +158,7 @@ class GraspPlanner:
 
     # ── world setup ───────────────────────────────────────────────────────────
 
-    def _init_motion_gen(self, world_cfg: dict):
+    def _init_motion_gen(self, world_cfg: dict, use_cuda_graph: bool = True):
         config = MotionGenConfig.load_from_robot_config(
             self._robot_cfg,
             WorldConfig.from_dict(world_cfg),
@@ -165,7 +166,7 @@ class GraspPlanner:
             num_trajopt_seeds=self._num_trajopt_seeds,
             num_graph_seeds=1,
             num_ik_seeds=32,
-            use_cuda_graph=True,
+            use_cuda_graph=use_cuda_graph,
             interpolation_dt=0.01,
             interpolation_type=self._interpolation_type,
             collision_cache={"obb": self.N_CUBOIDS, "mesh": self.N_MESHES},
@@ -180,7 +181,7 @@ class GraspPlanner:
             enable_graph=True,
             enable_opt=True,
             enable_graph_attempt=2,    # was 4 — fewer GP retries per call
-            max_attempts=5,            # was 20 — cap internal retry storm
+            max_attempts=3,            # 20 -> 5 -> 3: failing plans exhaust attempts (slow); successes hit early
             enable_finetune_trajopt=True,
             num_trajopt_seeds=32,
             num_ik_seeds=32,
@@ -357,7 +358,7 @@ class GraspPlanner:
 
     # ── IK solver ─────────────────────────────────────────────────────────────
 
-    def _init_ik_solver(self, world_cfg: dict):
+    def _init_ik_solver(self, world_cfg: dict, use_cuda_graph: bool = True):
         config = IKSolverConfig.load_from_robot_config(
             self._robot_cfg,
             WorldConfig.from_dict(world_cfg),
@@ -365,6 +366,7 @@ class GraspPlanner:
             num_seeds=32,
             collision_cache={"obb": self.N_CUBOIDS, "mesh": self.N_MESHES},
             collision_activation_distance=self._collision_act_dist,
+            use_cuda_graph=use_cuda_graph,
         )
         self._ik_solver = IKSolver(config)
 
@@ -1027,6 +1029,101 @@ class GraspPlanner:
             return True, result.get_interpolated_plan().position.cpu().numpy()
         return False, None
 
+    def plan_with_seed(self, goal_qpos: np.ndarray, seed_traj: np.ndarray,
+                       start_qpos: Optional[np.ndarray] = None,
+                       newton_iters: Optional[int] = None):
+        """Joint-space trajopt seeded by an EXTERNAL trajectory — mechanism (B).
+
+        Bypasses MotionGen's graph/IK seeding and feeds ``seed_traj`` straight
+        into ``js_trajopt_solver`` as seed #0 (the solver pads the remaining
+        seeds with linear interpolation and returns the best). A near-feasible
+        seed makes trajopt converge in 1 shot instead of stochastically failing.
+
+        Args:
+            goal_qpos:  (dof,) goal joint config — typically IK of the actual
+                        (off-grid) grasp wrist pose, fingers = pregrasp.
+            seed_traj:  (H_seed, dof) seed trajectory (already adjusted to this
+                        start/goal); resampled to the solver action_horizon.
+            start_qpos: (dof,) start state; defaults to INIT_STATE.
+
+        Returns (success: bool, traj: (T, dof) | None, solve_time: float).
+        """
+        dev = self._tensor_args.device
+        torch.manual_seed(0)          # determinism: frozen seed -> same plan every run
+        solver = self._motion_gen.js_trajopt_solver
+        H, dof = solver.action_horizon, len(self._init_state)
+        if start_qpos is None:
+            start_qpos = self._init_state
+
+        start = JointState.from_position(
+            torch.tensor(start_qpos, dtype=torch.float32, device=dev).unsqueeze(0))
+        goal_js = JointState.from_position(
+            torch.tensor(goal_qpos, dtype=torch.float32, device=dev).unsqueeze(0))
+        goal = Goal(current_state=start, goal_state=goal_js)
+
+        # Resample the (possibly dense) seed to the solver's action_horizon.
+        seed_np = np.asarray(seed_traj, dtype=np.float32)
+        xs, xt = np.linspace(0, 1, len(seed_np)), np.linspace(0, 1, H)
+        seed_rs = np.stack([np.interp(xt, xs, seed_np[:, j]) for j in range(dof)], axis=1)
+        seed_t = torch.tensor(seed_rs, dtype=torch.float32, device=dev).view(1, 1, H, dof)
+        seed_js = JointState.from_position(seed_t)
+
+        result = solver.solve_single(goal, seed_traj=seed_js, newton_iters=newton_iters)
+        ok = bool(result.success.view(-1)[0].item())
+        if not ok:
+            return False, None, float(result.solve_time)
+        sol = (result.interpolated_solution if result.interpolated_solution is not None
+               else result.solution)
+        traj = sol.position.cpu().numpy().reshape(-1, dof)
+        # interpolated_solution is a fixed-size buffer padded with the final
+        # state; trim to the valid length (same as MotionGen.get_interpolated_plan).
+        if (result.interpolated_solution is not None
+                and result.path_buffer_last_tstep is not None):
+            traj = traj[: int(result.path_buffer_last_tstep[0])]
+        return True, traj, float(result.solve_time)
+
+    def plan_lift(self, grasp_qpos: np.ndarray, grasp_wrist_world: np.ndarray,
+                  scene_lift: dict, lift_h: float = 0.10):
+        """Plan the grasp->lift segment as a JOINT trajectory for joint-space
+        execution (``executor.execute_lift``), replacing the cartesian-servo lift
+        whose kinematic errors are UNRECOVERABLE on xarm (force a full restart).
+
+        Lift goal = the grasp wrist raised by ``lift_h`` in world +z, SAME
+        orientation, fingers HELD at ``grasp_qpos[6:]``. A pure +z lift moves the
+        held object straight up (away from the table), so failures here are
+        kinematic (the lifted wrist unreachable for this off-grid arm config —
+        joint limit / singularity) or scene-collision (shelf/wall above), NOT
+        table collision. The held object must already be STRIPPED from
+        ``scene_lift`` (it moves with the hand, not the world).
+
+        Returns ``(ok, traj)``; ``ok=False`` (lifted pose IK-unreachable or trajopt
+        fail) means the caller SKIPS the lift at PLAN time — no robot crash.
+        """
+        world_cfg = _to_curobo_world(scene_lift)
+        if self._motion_gen is None:
+            self._init_motion_gen(world_cfg)
+        elif self._world_structure_changed(world_cfg):
+            self._update_world(world_cfg)
+        else:
+            self._update_target_pose_only(world_cfg)
+        self._cached_world = world_cfg
+
+        dev = self._tensor_args.device
+        lift_w = np.asarray(grasp_wrist_world, dtype=np.float64).copy()
+        lift_w[2, 3] += lift_h
+        gq = torch.tensor(grasp_qpos, dtype=torch.float32, device=dev)
+        r = self._ik_solver.solve_batch(
+            _to_curobo_pose(lift_w[None], dev), retract_config=gq.unsqueeze(0))
+        if not bool(r.success.view(-1)[0]):
+            return False, None                       # lifted wrist unreachable (joint limit)
+        q_lift = np.asarray(grasp_qpos, dtype=np.float32).copy()
+        arm_q = r.solution.cpu().numpy().reshape(-1)[:6]
+        arm_q[5] = _snap_joint6(arm_q[5], float(grasp_qpos[5]))   # joint-6 wrap toward grasp
+        q_lift[:6] = arm_q
+        ok, traj = self._refine_fingers(
+            np.asarray(grasp_qpos, dtype=np.float32), q_lift)
+        return (ok, traj if ok else None)
+
     def _export_collision_debug(self, goal_joint: np.ndarray):
         """Export hand collision spheres + world meshes at goal state for
         debugging. Spheres colliding with any world mesh/cube are red, safe
@@ -1049,8 +1146,8 @@ class GraspPlanner:
             if self._motion_gen.world_model is not None:
                 wm = self._motion_gen.world_model
                 for m in (getattr(wm, "mesh", None) or []):
-                    pose = np.asarray(getattr(m, "pose",
-                        [0, 0, 0, 1, 0, 0, 0]) or [0, 0, 0, 1, 0, 0, 0])
+                    _p = getattr(m, "pose", None)
+                    pose = np.asarray(_p if _p is not None else [0, 0, 0, 1, 0, 0, 0])
                     file_path = getattr(m, "file_path", None)
                     verts, faces = m.vertices, m.faces
                     if (verts is None or faces is None) and file_path:
@@ -1176,7 +1273,8 @@ class GraspPlanner:
                 meshes = getattr(wm, "mesh", None) or []
                 for m in meshes:
                     name = getattr(m, "name", "mesh")
-                    pose = np.asarray(getattr(m, "pose", [0, 0, 0, 1, 0, 0, 0]) or [0, 0, 0, 1, 0, 0, 0])
+                    _p = getattr(m, "pose", None)
+                    pose = np.asarray(_p if _p is not None else [0, 0, 0, 1, 0, 0, 0])
                     file_path = getattr(m, "file_path", None)
                     verts, faces = m.vertices, m.faces
                     if (verts is None or faces is None) and file_path:

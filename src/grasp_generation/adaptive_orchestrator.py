@@ -42,7 +42,7 @@ SUCCESS_THRESHOLD = 5
 
 # BODex GPU memory budget — W_ks tensor scales as -w * N.
 # CLAUDE.md says -w=10 is safe for N=200 (default).  We keep -w*N <= 2000.
-PARALLEL_PER_N = {200: 10, 1000: 2, 5000: 1}
+PARALLEL_PER_N = {200: 20, 1000: 4, 5000: 1}
 
 Z_ROTS_DEFAULT = [0, 72, 144, 216, 288]
 VERTICAL_THRESH = 0.95
@@ -398,36 +398,12 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                 write_scene_file(obj_name, obj_root, scene_type, scenes[sid], obb_info, prior_gap)
                 n_resumed += 1
             else:
-                # Exhausted/failed/scene_none — try to advance to first untried (gap, N)
-                history = prior.get("history", [])
-                tried = set()
-                for h in history:
-                    g, n = h.get("gap"), h.get("N")
-                    if g is not None and n is not None:
-                        tried.add((round(float(g), 4), int(n)))
-                state[sid]["history"] = history
+                # Exhausted scene — keep as-is (don't retry). User explicitly requested downscale only.
+                state[sid]["done"] = True
+                state[sid]["final"] = prior["final"]
                 state[sid]["best_valid"] = prior.get("best_valid", 0)
-                # find first (gi, ni) where (sched[gi], N_SWEEP[ni]) NOT in tried
-                advanced = False
-                for gi in range(len(sched)):
-                    for ni in range(len(N_SWEEP)):
-                        gap_v = sched[gi]
-                        n_v = N_SWEEP[ni]
-                        key = (round(float(gap_v), 4) if gap_v is not None else None, n_v)
-                        if key not in tried:
-                            state[sid]["gap_idx"] = gi
-                            state[sid]["N_idx"] = ni
-                            advanced = True
-                            break
-                    if advanced:
-                        break
-                if advanced:
-                    n_skip_ahead += 1
-                else:
-                    # all schedule rounds already tried → keep exhausted
-                    state[sid]["done"] = True
-                    state[sid]["final"] = prior["final"]
-                    n_all_tried += 1
+                state[sid]["history"] = prior.get("history", [])
+                n_all_tried += 1
         print(f"  [{scene_type}] resume: {n_resumed} success-restored, {n_skip_ahead} skip-ahead, {n_all_tried} all-tried (kept exhausted)")
 
     # Wipe prior outputs for scenes NOT being resumed (i.e. not done)

@@ -594,6 +594,28 @@ class RealExecutor:
         self._log_state("lift_done")
         return s_hand
 
+    def execute_lift(self, lift_traj, hold_hand):
+        """JOINT-SPACE lift: follow a pre-PLANNED qpos trajectory with
+        ``_move_joints`` instead of ``_move_cartesian``. The cartesian servo
+        (``set_servo_cartesian_aa``) throws kinematic errors at borderline wrist
+        configs that are UNRECOVERABLE on xarm (force a full program/robot/camera
+        restart). Feeding a planned joint trajectory sidesteps the cartesian IK
+        entirely, and any infeasibility is caught at PLAN time (skip) rather than
+        crashing the robot mid-execution.
+
+        Args:
+            lift_traj: (T, dof) planned qpos trajectory (e.g. from the planner's
+                       grasp->lift segment). Only the arm joints (``[:, :6]``) are
+                       commanded.
+            hold_hand: hand command (controller units, e.g. the squeezed ``s_hand``
+                       from ``execute(skip_lift=True)``) held constant throughout.
+        """
+        self._log_state("lift")
+        arm_traj = np.asarray(lift_traj)[:, :6]
+        hand_traj = np.tile(np.asarray(hold_hand, dtype=float), (len(arm_traj), 1))
+        self._move_joints(arm_traj, hand_traj)        # no monitor: arm carries the object
+        self._log_state("lift_done")
+
     def place(self, plan_result: PlanResult, lift_height: float = 0.10,
               overshoot: float = 0.0,
               mcc_model_path: str = None,

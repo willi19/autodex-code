@@ -42,7 +42,7 @@ from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 from curobo.geom.sdf.world import CollisionQueryBuffer
 
 
-N_ITER = 60
+N_ITER = 600
 LR = 0.04
 K_SWEEP = 30
 

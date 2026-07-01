@@ -362,7 +362,7 @@ class BODexBrowser(ViserViewer):
     def _on_source_change(self):
         self.current_source = self.source_selector.value
         hands = self._list_dirs(self._source_root())
-        self.hand_selector.options = hands
+        self.hand_selector.options = hands if hands else ["(none)"]
         if hands:
             self.hand_selector.value = hands[0]
         self._on_hand_change()
@@ -371,7 +371,7 @@ class BODexBrowser(ViserViewer):
         self.current_hand = self.hand_selector.value
         hand_path = os.path.join(self._source_root(), self.current_hand) if self.current_hand else ""
         versions = self._list_dirs(hand_path)
-        self.version_selector.options = versions
+        self.version_selector.options = versions if versions else ["(none)"]
         if versions:
             self.version_selector.value = versions[0]
         self._on_version_change()
@@ -379,7 +379,7 @@ class BODexBrowser(ViserViewer):
     def _on_version_change(self):
         self.current_version = self.version_selector.value
         objs = self._list_dirs(self._data_root())
-        self.obj_selector.options = objs
+        self.obj_selector.options = objs if objs else ["(none)"]
         if objs:
             self.obj_selector.value = objs[0]
             self._on_object_change()

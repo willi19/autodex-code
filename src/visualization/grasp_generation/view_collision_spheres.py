@@ -28,6 +28,12 @@ HAND_CONFIGS = {
         "urdf": os.path.join(BODEX_ASSETS, "assets", "robot", "inspire_f1_description", "inspire_f1_hand_right.urdf"),
         "spheres": os.path.join(BODEX_ASSETS, "configs", "robot", "spheres", "inspire_f1.yml"),
     },
+    # full xarm6 + inspire-left robot: the spheres file uses full robot link names
+    # (link_base, link1..6, hand links), so FK needs the full robot URDF.
+    "inspire_left": {
+        "urdf": os.path.expanduser("~/shared_data/AutoDex/content/assets/robot/inspire_left_description/xarm_inspire_left.urdf"),
+        "spheres": os.path.expanduser("~/shared_data/AutoDex/content/configs/robot/spheres/xarm_inspire_left.yml"),
+    },
 }
 
 # Distinct colors per link group

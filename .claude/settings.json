@@ -1,10 +1,12 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(bash /home/robot/AutoDex/scripts/gotrack_daemons.sh log capture1)",
+      "Bash(cd /home/mingi/object_processing/MeshProcess *)",
+      "Read(//home/mingi/object_processing/MeshProcess/**)"
+    ],
     "additionalDirectories": [
       "/home/robot/shared_data/AutoDex/content/assets/robot/allegro_description/xarm"
-    ],
-    "allow": [
-      "Bash(bash /home/robot/AutoDex/scripts/gotrack_daemons.sh log capture1)"
     ]
   }
 }
