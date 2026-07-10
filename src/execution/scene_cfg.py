@@ -23,6 +23,7 @@ TABLE_SURFACE_Z = -0.1 + 0.039 + 0.1  # 0.039
 CYLINDER_OBJECTS = [
     "pepper_tuna", "pepper_tuna_light", "pepsi", "pepsi_light",
     "smallbowl", "jja_ramen", "open_short_pringles",
+    "beige_brush",
 ]
 
 # Spherical objects — use first tabletop pose rotation directly.

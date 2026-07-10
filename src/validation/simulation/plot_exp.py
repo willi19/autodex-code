@@ -13,6 +13,7 @@ from paradex.robot.robot_wrapper import RobotWrapper
 from paradex.calibration.utils import load_current_C2R
 from rsslib.conversion import se32cart, cart2se3
 from rsslib.path import candidate_path, obj_path, urdf_path, project_dir
+from autodex.utils.path import get_scene_dir
 
 def parse_allegro(allegro_traj):
     ret_allegro_traj = np.zeros((allegro_traj.shape[0], 16))
@@ -77,7 +78,7 @@ if __name__ == "__main__":
     scene_idx = "3"
     grasp_idx = "95"
 
-    scene = json.load(open(os.path.join(obj_path, obj_name, "scene", f"{scene_type}", f"{scene_idx}.json")))["scene"]
+    scene = json.load(open(os.path.join(get_scene_dir("allegro", obj_name, scene_type), f"{scene_idx}.json")))["scene"]
     obj_T = cart2se3(np.array(scene["mesh"]["target"]["pose"]))
     
     vis = Renderer(version, obj_name, exp_idx, obj_T)

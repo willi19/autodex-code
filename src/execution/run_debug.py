@@ -188,11 +188,37 @@ def main():
             shelf_sides=not args.no_shelf_sides,
             shelf_top=not args.no_shelf_top,
         )
+        # Classify perceived pose against the object's tabletop poses to
+        # filter candidates to the matching scene_id + pick openpose_{stem}
+        # appropriately.
+        from src.experiment.reset.tabletop_pose import classify_tabletop_pose
+        from autodex.utils.symmetry import get_cyl_axis_local
+        pose_robot = np.linalg.inv(c2r) @ pose_world
+        tb_before = classify_tabletop_pose(pose_robot, args.obj)
+        if tb_before is not None:
+            scene_id = str(tb_before["idx"])
+            pose_stem = tb_before["filename"].replace(".npy", "")
+            print(f"    [tabletop] idx={tb_before['idx']} "
+                  f"({tb_before['filename']}) err={tb_before['rot_err_deg']:.1f}°")
+        else:
+            scene_id = None
+            pose_stem = None
+        # Cylinder freedom — expand candidates by symmetry-axis rotations when
+        # the axis ends up horizontal at the current pose (lying cylinder).
+        # Symmetry-axis enumerate. Continuous-revolute → 8 angles. Discrete
+        # (e.g. blue_alarm 180°) → order-N grid from pose_symmetry.json.
+        from autodex.utils.symmetry import get_cyl_yaw_grid as _get_cyl_yaw_grid
+        _cyl_axis = get_cyl_axis_local(args.obj)
+        _cyl_grid = _get_cyl_yaw_grid(args.obj)
         planner = GraspPlanner(hand=args.hand)
         result = planner.plan(
             scene_cfg, args.obj, args.grasp_version,
             skip_done=False,
             success_only=args.success_only, hand=args.hand,
+            scene_id=scene_id,
+            openpose_pose_stem=pose_stem,
+            cyl_axis_local=_cyl_axis,
+            cyl_yaw_grid=_cyl_grid,
         )
         timing["plan_s"] = round(time.time() - t0, 2)
         print(f"    Plan: {timing['plan_s']}s  success={result.success}")
@@ -248,7 +274,7 @@ def main():
         print(f"[4/4] Executing...")
         timing["execution_start"] = _ts()
         executor = RealExecutor(hand_name=args.hand)
-        s_hand = executor.execute(result)         # grasp + lift (object held up)
+        s_hand = executor.execute(result, planner=planner)  # grasp + lift (z-constrained)
 
         # Auto-label probe (info only — does NOT decide trial success).
         label_rel = os.path.join("shared_data", "AutoDex", "experiment",

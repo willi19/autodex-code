@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"for f in src/visualization/mesh_process/scene_progress_viewer.py src/visualization/scene_required_pose.py src/visualization/mesh_process/required_pose_viewer.py src/grasp_generation/sim_fi...",
+  "error": "Exit code 1\n=== src/visualization/mesh_process/scene_progress_viewer.py ===\n26:from autodex.utils.path import obj_path, get_candidate_path\n=== src/visualization/scene_required_pose.py ===\n23:from autodex.utils.path import obj_path, get_candidate_path\n=== src/visualization/mesh_process/required_pose_viewer.py ===\n22:from autodex.utils.path import obj_path, get_candidate_path\n=== src/grasp_generation/sim_filter/dump_mujoco_pose.py ===\n=== src/visualization/grasp_generation/debug_collision.py ===\n=...",
+  "timestamp": "2026-07-03T11:10:42.259Z",
+  "retry_count": 1
+}

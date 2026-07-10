@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd ~/AutoDex/src/grasp_generation/BODex\\necho \\\"apple\\\" > /tmp/claude-1000/-home-mingi-AutoDex/701cf6c8-498f-4fb3-b9f2-07dfc3159eaf/scratchpad/obj_apple.txt\\nPYTHON=/home/mingi/miniconda3/...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s",
+  "timestamp": "2026-07-01T21:51:59.158Z",
+  "retry_count": 1
+}

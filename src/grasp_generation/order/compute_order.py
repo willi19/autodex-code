@@ -15,7 +15,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 
-from autodex.utils.path import obj_path, candidate_path
+from autodex.utils.path import obj_path, candidate_path, get_scene_dir
 from autodex.utils.conversion import cart2se3, se32action
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
@@ -165,7 +165,7 @@ if __name__ == "__main__":
         print(f"  Loaded {len(grasp_info_list)} candidates")
 
         # Build valid_array: for each scene, check collision-free reachability
-        scene_root = os.path.join(obj_root, obj_name, "scene")
+        scene_root = get_scene_dir(args.hand, obj_name)
         valid_array = []
 
         for scene_type in tqdm(sorted(os.listdir(scene_root)), desc="  Scene types", leave=False):

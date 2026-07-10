@@ -74,14 +74,20 @@ class WorldConfigDataset(Dataset):
         }
 
 class ParadexDataset(Dataset):
-    def __init__(self, obj_list=[], scene_type_list=[], batch_size=1, version="", seed_offset=0, output_dir=None, obj_root_dir=None, scene_filter=None):
+    def __init__(self, obj_list=[], scene_type_list=[], batch_size=1, version="", seed_offset=0, output_dir=None, obj_root_dir=None, scene_filter=None, hand="allegro"):
         """
         scene_filter: optional dict {scene_type: set(scene_id_no_ext)}. When set,
         restricts the dataset to scenes whose filename (without .json) is in
         scene_filter[scene_type]. Used by the adaptive orchestrator for
         per-scene retry batching.
+
+        hand: scenes are hand-specific (adaptive gap differs per hand) and read
+        from get_scene_dir(hand, obj, scene_type). obj_root_dir still supplies
+        the hand-agnostic mesh/OBB info (processed_data/).
         """
-        from autodex.utils.path import obj_path as _autodex_obj_path
+        from autodex.utils.path import obj_path as _autodex_obj_path, get_scene_dir
+        self._get_scene_dir = get_scene_dir
+        self.hand = hand
         self.obj_root_dir = obj_root_dir or _autodex_obj_path
         self.output_dir = output_dir
 
@@ -97,7 +103,10 @@ class ParadexDataset(Dataset):
             gravity_center = np.array(obj_info_dict["gravity_center"])
 
             for scene_type in scene_type_list:
-                scene_list = os.listdir(os.path.join(obj_dir, "scene", scene_type))
+                scene_type_dir = self._get_scene_dir(self.hand, obj_name, scene_type)
+                if not os.path.isdir(scene_type_dir):
+                    continue
+                scene_list = os.listdir(scene_type_dir)
                 allowed = scene_filter.get(scene_type) if scene_filter else None
 
                 for scene_name in scene_list:
@@ -113,7 +122,7 @@ class ParadexDataset(Dataset):
                     if skip:
                         # print(f"Skip existing scene: {save_path}")
                         continue
-                    scene_path = os.path.join(obj_dir, "scene", scene_type, scene_name)
+                    scene_path = os.path.join(scene_type_dir, scene_name)
                     scene_cfg = json.load(open(scene_path, "r"))
 
                     pose = np.eye(4)
@@ -153,12 +162,12 @@ def _world_config_collate_fn(list_data):
     return ret_data
 
 
-def get_world_config_dataloader(configs, batch_size, seed_num, version="", seed_offset=0, output_dir=None, obj_root_dir=None, scene_filter=None):
+def get_world_config_dataloader(configs, batch_size, seed_num, version="", seed_offset=0, output_dir=None, obj_root_dir=None, scene_filter=None, hand="allegro"):
     if configs["type"] == "scene_cfg":
         dataset = WorldConfigDataset(**configs)
 
     elif configs["type"] == "paradex":
-        dataset = ParadexDataset(configs.get("obj_list", []), configs.get("scene_type", []), seed_num, version, seed_offset, output_dir=output_dir, obj_root_dir=obj_root_dir, scene_filter=scene_filter)
+        dataset = ParadexDataset(configs.get("obj_list", []), configs.get("scene_type", []), seed_num, version, seed_offset, output_dir=output_dir, obj_root_dir=obj_root_dir, scene_filter=scene_filter, hand=hand)
 
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, collate_fn=_world_config_collate_fn

@@ -8,7 +8,7 @@ Stable scene IDs across rounds: scene/{type}/{id}.json is the same logical
 scene config across iterations; only the gap/height_offset value changes.
 
 Output:
-  obj/scene/{type}/         — overwritten with adaptive scene set (1st run backs up to {type}_prev/)
+  {AutoDex}/scene/{hand}/{obj}/{type}/  — per-hand adaptive scene set (1st run backs up to {type}_prev/)
   bodex_outputs/{hand}/{version_adaptive}/{obj}/{type}/{id}/{seed}/
   candidates/{hand}/{version_adaptive}/{obj}/{type}/{id}/{seed}/   — sim-filter-passing
   {output_dir}/{obj}/adaptive_summary.json
@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src", "scene_generation"))
 
 from generate_scene import get_shelf_scene, get_wall_scene, get_box_scene, get_tabletop_scene  # noqa: E402
 
-from autodex.utils.path import obj_path as default_obj_path  # noqa: E402
+from autodex.utils.path import obj_path as default_obj_path, get_scene_dir  # noqa: E402
 
 
 # --- Schedules ---
@@ -161,24 +161,24 @@ def make_meta(scene_type, cfg, gap_or_h):
     return meta
 
 
-def write_scene_file(obj_name, obj_root, scene_type, cfg, obb_info, gap_or_h):
-    """Write scene/{type}/{id}.json. Returns True if scene is non-None."""
+def write_scene_file(hand, obj_name, obj_root, scene_type, cfg, obb_info, gap_or_h):
+    """Write {hand}/{obj}/{type}/{id}.json. Returns True if scene is non-None."""
     scene = build_scene_dict(obj_name, scene_type, cfg, obb_info, gap_or_h)
     if scene is None:
         return False
-    out_dir = os.path.join(obj_root, obj_name, "scene", scene_type)
+    out_dir = get_scene_dir(hand, obj_name, scene_type)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, f"{cfg['id']}.json"), "w") as f:
         json.dump({"scene": scene, "meta": make_meta(scene_type, cfg, gap_or_h)}, f, indent=2)
     return True
 
 
-def initial_scene_generation(obj_name, scene_type, obj_root, symmetry_reg, initial_gap, pose_filter=None):
-    """Backup existing scene/{type}/ to _prev (once), then write fresh scenes
-    with stable IDs at initial_gap. Returns dict {id: cfg}.
+def initial_scene_generation(hand, obj_name, scene_type, obj_root, symmetry_reg, initial_gap, pose_filter=None):
+    """Backup existing {hand}/{obj}/{type}/ to _prev (once), then write fresh
+    scenes with stable IDs at initial_gap. Returns dict {id: cfg}.
     """
     obj_dir = os.path.join(obj_root, obj_name)
-    out_dir = os.path.join(obj_dir, "scene", scene_type)
+    out_dir = get_scene_dir(hand, obj_name, scene_type)
 
     if os.path.isdir(out_dir):
         prev = out_dir + "_prev"
@@ -193,7 +193,7 @@ def initial_scene_generation(obj_name, scene_type, obj_root, symmetry_reg, initi
 
     scenes = {}
     for cfg in cfgs:
-        ok = write_scene_file(obj_name, obj_root, scene_type, cfg, obb_info, initial_gap)
+        ok = write_scene_file(hand, obj_name, obj_root, scene_type, cfg, obb_info, initial_gap)
         if not ok:
             continue  # scene impossible at this gap (e.g. box too small)
         scenes[cfg["id"]] = cfg
@@ -370,7 +370,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
             prior_state = {}
 
     # Initial generation with first gap (always re-generate scene files, but optionally skip wipe of candidates)
-    scenes, _ = initial_scene_generation(obj_name, scene_type, obj_root, symmetry_reg, sched[0],
+    scenes, _ = initial_scene_generation(hand, obj_name, scene_type, obj_root, symmetry_reg, sched[0],
                                          pose_filter=pose_filter)
     print(f"  [{scene_type}] {len(scenes)} initial scenes at gap/h={sched[0]}")
 
@@ -395,7 +395,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                 state[sid]["best_valid"] = prior.get("best_valid", prior["final"].get("valid", 0))
                 state[sid]["history"] = prior.get("history", [])
                 prior_gap = prior["final"].get("gap", sched[0])
-                write_scene_file(obj_name, obj_root, scene_type, scenes[sid], obb_info, prior_gap)
+                write_scene_file(hand, obj_name, obj_root, scene_type, scenes[sid], obb_info, prior_gap)
                 n_resumed += 1
             else:
                 # Exhausted scene — keep as-is (don't retry). User explicitly requested downscale only.
@@ -442,7 +442,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
         if step_ni == 0 and step_gi > 0:
             valid_active = []
             for sid in active_ids:
-                ok = write_scene_file(obj_name, obj_root, scene_type,
+                ok = write_scene_file(hand, obj_name, obj_root, scene_type,
                                       scenes[sid], obb_info, gap)
                 if not ok:
                     # Scene not buildable at this gap (e.g. box too small at larger h)
@@ -555,7 +555,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                 for (g_v, n_v), sids in groups.items():
                     # Per scene: write scene file at g, wipe candidates, clear bodex
                     for sid in sids:
-                        ok = write_scene_file(obj_name, obj_root, scene_type,
+                        ok = write_scene_file(hand, obj_name, obj_root, scene_type,
                                               scenes[sid], obb_info, g_v)
                         if not ok:
                             ds_state[sid]["active"] = False
@@ -598,7 +598,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                             if os.path.isdir(s["best_backup"]):
                                 shutil.move(s["best_backup"], cand_dir)
                             s["best_backup"] = cand_dir + "_ds_backup"
-                            write_scene_file(obj_name, obj_root, scene_type, scenes[sid], obb_info,
+                            write_scene_file(hand, obj_name, obj_root, scene_type, scenes[sid], obb_info,
                                              s["best_final"].get("gap", sched[0]))
                             clear_scene_bodex(hand, exp_name, obj_name, scene_type, sid)
                             s["active"] = False
@@ -609,8 +609,8 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                 if os.path.isdir(s["best_backup"]):
                     shutil.rmtree(s["best_backup"])
 
-    # ── Bonus phase: disabled (user request — too expensive per round).
-    if False and scene_type != "box":
+    # ── Bonus phase: on success at sched[0], try gap 0.0 (v7 behavior).
+    if scene_type != "box":
         bonus_gap = 0.0
         bonus_candidates = [sid for sid, s in state.items()
                             if s["final"] and s["final"].get("status") == "success"
@@ -626,13 +626,13 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                     shutil.rmtree(backup)
                 if os.path.isdir(cand_dir):
                     shutil.move(cand_dir, backup)
-                ok = write_scene_file(obj_name, obj_root, scene_type,
+                ok = write_scene_file(hand, obj_name, obj_root, scene_type,
                                       scenes[sid], obb_info, bonus_gap)
                 if not ok:
                     # Scene not buildable at gap=0.0. Restore primary.
                     if os.path.isdir(backup):
                         shutil.move(backup, cand_dir)
-                    write_scene_file(obj_name, obj_root, scene_type,
+                    write_scene_file(hand, obj_name, obj_root, scene_type,
                                      scenes[sid], obb_info, sched[0])
                     bonus_candidates = [s for s in bonus_candidates if s != sid]
                     continue
@@ -671,7 +671,7 @@ def process_obj_scene_type(obj_name, scene_type, hand, exp_name, obj_root,
                             shutil.rmtree(cand_dir)
                         if os.path.isdir(backup):
                             shutil.move(backup, cand_dir)
-                        write_scene_file(obj_name, obj_root, scene_type,
+                        write_scene_file(hand, obj_name, obj_root, scene_type,
                                          scenes[sid], obb_info, sched[0])
                         clear_scene_bodex(hand, exp_name, obj_name, scene_type, sid)
                         state[sid]["history"].append({"gap": bonus_gap, "N": bonus_N,

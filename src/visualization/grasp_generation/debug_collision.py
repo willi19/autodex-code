@@ -20,6 +20,7 @@ sys.path.insert(0, REPO_ROOT)
 
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 from autodex.utils.conversion import cart2se3
+from autodex.utils.path import get_scene_dir
 
 HAND_CFGS = {
     "inspire_f1": "autodex/planner/src/curobo/content/configs/robot/inspire_f1_floating.yml",
@@ -41,7 +42,7 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
 
-    scene_json = os.path.join(args.obj_root, args.obj, "scene", args.scene, f"{args.scene_id}.json")
+    scene_json = os.path.join(get_scene_dir(args.hand, args.obj, args.scene), f"{args.scene_id}.json")
     seed_dir = os.path.join(REPO_ROOT, "bodex_outputs", args.hand, args.version,
                              args.obj, args.scene, args.scene_id, args.seed)
     print(f"scene_json: {scene_json}")

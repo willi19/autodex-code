@@ -244,7 +244,7 @@ class RealExecutor:
         arm_name: str = "xarm",
         hand_name: str = "allegro",
         dt: float = 0.01,
-        squeeze_level: int = 10,
+        squeeze_level: int = 2,
     ):
         if hand_name not in HAND_CONFIG:
             raise ValueError(f"Unknown hand: {hand_name}. Choose from {list(HAND_CONFIG)}")
@@ -398,9 +398,16 @@ class RealExecutor:
                 break
 
     def _move_joint_sequential(self, target_qpos, joint_order, threshold=0.06,
+                               vel_limit: float = 0.06,
+                               first_vel_limit: "Optional[float]" = None,
                                monitor: "Optional[ContactMonitor]" = None):
+        """``first_vel_limit`` (if set) overrides vel_limit for the FIRST
+        joint in joint_order — useful for slowing only the initial motion
+        that moves the held object away from a placed scene."""
         current_target = self.arm.get_data()["qpos"].copy()
-        for j in joint_order:
+        for step_i, j in enumerate(joint_order):
+            vel = (first_vel_limit if (step_i == 0 and first_vel_limit is not None)
+                   else vel_limit)
             current_target[j] = target_qpos[j]
             stall_count = 0
             prev_qpos = None
@@ -436,7 +443,7 @@ class RealExecutor:
                 else:
                     stall_count = 0
                 prev_qpos = cur.copy()
-                nxt = self._safe_joint_step(cur, current_target, vel_limit=0.06)
+                nxt = self._safe_joint_step(cur, current_target, vel_limit=vel)
                 self.arm.move(nxt, is_servo=True)
                 time.sleep(self.dt)
                 if monitor is not None and monitor.tick():
@@ -506,7 +513,9 @@ class RealExecutor:
         )
 
     def execute(self, plan_result: PlanResult, lift_height: float = 0.10,
-                skip_lift: bool = False):
+                skip_lift: bool = False, planner=None,
+                scene_cfg=None, debug_dump_dir=None,
+                lift_traj_override=None):
         """
         Execute: init -> approach -> pregrasp -> grasp -> squeeze -> lift.
         State timestamps stored in self.state_timestamps.
@@ -549,15 +558,14 @@ class RealExecutor:
                 f"— arm not at XARM_INIT, refusing to approach. "
                 f"final_qpos={self.arm.get_data()['qpos'].round(3)}"
             )
-        # Threshold raised 15→25→30→50 Nm because free-space approach motion
-        # naturally produces tau_dev ~20Nm on joint 2 (shoulder) from inertia
-        # + Coriolis effects the tau_model under-predicts. False positives
-        # were aborting trials before any actual contact.
-        monitor = self._make_monitor(thresh_nm=50.0, sustained_ticks=50)
+        # Threshold raised 50→70 Nm because inertia spikes (joint 2
+        # shoulder ~50-60Nm during free-space motion) were aborting valid
+        # approaches.
+        monitor = self._make_monitor(thresh_nm=70.0, sustained_ticks=50)
         print("[executor] warming up approach contact monitor (1s static)...")
         monitor.warmup(seconds=1.0)
         print(f"[executor] approach baseline tau = {monitor._baseline.round(2)}  "
-              f"(thresh=50Nm, sustained=0.5s)")
+              f"(thresh=70Nm, sustained=0.5s)")
 
         # 2. Approach trajectory (contact-monitored).
         self._log_state("approach")
@@ -568,16 +576,20 @@ class RealExecutor:
         self._log_state("pregrasp")
         self._move_hand(pg_hand)
 
-        # 4. Grasp
+        # 4. Grasp — interpolated ramp pregrasp → grasp for slower close.
         self._log_state("grasp")
-        self._move_hand(g_hand)
+        n_grasp_steps = 50
+        for i in range(1, n_grasp_steps + 1):
+            t = i / n_grasp_steps
+            self._move_hand(pg_hand * (1 - t) + g_hand * t)
+            time.sleep(0.01)
 
-        # 5. Squeeze
+        # 5. Squeeze (2× slower than before: sleep 0.01 → 0.02)
         self._log_state("squeeze")
         for i in range(sl * 5):
             s_hand = g_hand * (1 + i / 5) - pg_hand * (i / 5)
             self._move_hand(s_hand)
-            time.sleep(0.01)
+            time.sleep(0.02)
 
         if skip_lift:
             self._log_state("squeeze_done")
@@ -587,9 +599,45 @@ class RealExecutor:
         #    empty-arm baseline is invalid for tau_dev. place() does its own
         #    baseline at the lifted pose.
         self._log_state("lift")
-        lift_pose = wrist_ee.copy()
-        lift_pose[2, 3] += lift_height
-        self._move_cartesian(lift_pose, vel_scale=1/1.5)
+        # Straight +z lift. plan_pose_constrained needs WRIST target;
+        # _move_cartesian needs LINK6 target. Build both.
+        link6_now = self.arm.get_data()["position"].copy()
+        link6_lift_pose = link6_now.copy()
+        link6_lift_pose[2, 3] += lift_height
+        wrist_lift_pose = (link6_now @ self._link6_to_wrist)
+        wrist_lift_pose[2, 3] += lift_height
+        if lift_traj_override is not None:
+            # Use precomputed trajectory (e.g. the one viz showed). Ensures
+            # what the user sees in viz == what the robot actually executes.
+            print(f"[execute] using precomputed lift_traj "
+                  f"shape={lift_traj_override.shape}")
+            arm_lift = lift_traj_override[:, :6]
+            hand_lift = np.tile(s_hand, (len(lift_traj_override), 1))
+            self._move_joints(arm_lift, hand_lift)
+        elif planner is not None:
+            start_full = np.concatenate([
+                np.asarray(self.arm.get_data()["qpos"][:6], dtype=np.float32),
+                np.asarray(plan_result.grasp_pose, dtype=np.float32),
+            ])
+            traj_lift = planner.plan_pose_constrained(
+                start_full, wrist_lift_pose,
+                hold_vec_weight=[1, 1, 1, 1, 1, 0],
+                scene_cfg=scene_cfg,
+                include_obj_obstacle=False,
+                debug_dump_dir=debug_dump_dir,
+            )
+            if traj_lift is not None:
+                arm_lift = traj_lift[:, :6]
+                # Hold hand at the squeeze pose during lift (planner traj's
+                # hand portion = grasp_pose which is LESS closed than s_hand
+                # and would open fingers mid-lift → drop obj).
+                hand_lift = np.tile(s_hand, (len(traj_lift), 1))
+                self._move_joints(arm_lift, hand_lift)
+            else:
+                print("[execute] constrained lift failed, falling back to cartesian")
+                self._move_cartesian(link6_lift_pose, vel_scale=1/1.5)
+        else:
+            self._move_cartesian(link6_lift_pose, vel_scale=1/1.5)
 
         self._log_state("lift_done")
         return s_hand
@@ -619,8 +667,8 @@ class RealExecutor:
     def place(self, plan_result: PlanResult, lift_height: float = 0.10,
               overshoot: float = 0.0,
               mcc_model_path: str = None,
-              descend_time_s: float = 8.0,
-              total_time_s: float = 12.0,
+              descend_time_s: float = 4.0,
+              total_time_s: float = 6.4,
               log_path: str = None) -> dict:
         """Descend with mcc_minimal admittance control. Target z = lift_pose -
         (lift_height + overshoot) — i.e. with overshoot=0, the arm targets the
@@ -672,13 +720,10 @@ class RealExecutor:
         FILTER_ALPHA = 0.1
         QDOT_SMOOTH_ALPHA = 0.1
         WARMUP_SEC = 1.0
-        # baseline noise per joint (Nm) — from mcc DEADBAND_J. Contact threshold
-        # is some multiplier above this.
+        # baseline noise per joint (Nm) — from mcc DEADBAND_J. Kept for ref;
+        # current contact check uses a flat 20 Nm threshold from lift baseline.
         DEADBAND_J = np.array([3.0, 3.0, 3.0, 1.0, 2.0, 0.5])
-        # 10 Nm on the watched joints (2, 3) — deadband is 3 Nm there, so
-        # mult = 10/3.
-        CONTACT_MULT = 10.0 / 3.0
-        CONTACT_THRESH = DEADBAND_J * CONTACT_MULT
+        CONTACT_THRESH = np.full(6, 10.0)
         # Same constants mcc uses to convert _joints_torque (raw current in
         # whatever units xarm reports) to Nm. tau_motor = I * KT * GEAR.
         KT = np.array([0.067, 0.067, 0.0573, 0.0573, 0.056, 0.056])
@@ -847,30 +892,36 @@ class RealExecutor:
                 "contact_t_s": float(contact_t) if contact_t is not None else None,
                 "target": float(target_descend)}
 
-    def release(self, plan_result: PlanResult):
-        """Release object and return arm to init pose."""
+    def release(self, plan_result: PlanResult, slow_factor: float = 1.0):
+        """Release object and return arm to init pose.
+
+        slow_factor > 1.0 stretches the open ramp (e.g. 4.0 → 2s instead of 0.5s).
+        """
         if not plan_result.success:
             return
 
         pg_hand = self._convert(plan_result.pregrasp_pose)
         g_hand = self._convert(plan_result.grasp_pose)
-        self._release_auto(pg_hand, g_hand)
+        self._release_auto(pg_hand, g_hand, slow_factor=slow_factor)
 
-    def _release_auto(self, pg_hand, g_hand):
+    def _release_auto(self, pg_hand, g_hand, slow_factor: float = 1.0):
         """Reverse squeeze -> grasp -> pregrasp, then STOP.
         Hand opening to hand_init and arm retract back to init are intentionally
         skipped — user resets those manually after inspecting the placed object."""
         sl = self.squeeze_level
 
-        # Reverse squeeze
+        # Reverse squeeze (matches squeeze ramp speed: 0.02s per step).
         for i in range(sl * 5):
             s_hand = g_hand * (sl - i / 5) - pg_hand * (sl - 1 - i / 5)
             self._move_hand(s_hand)
-            time.sleep(0.01)
+            time.sleep(0.02 * slow_factor)
 
-        self._move_hand(g_hand)
-        time.sleep(0.01)
-        self._move_hand(pg_hand)
+        # Interpolated open ramp grasp → pregrasp (mirrors close ramp).
+        n_open_steps = 50
+        for i in range(1, n_open_steps + 1):
+            t = i / n_open_steps
+            self._move_hand(g_hand * (1 - t) + pg_hand * t)
+            time.sleep(0.01 * slow_factor)
 
     def reset(self, plan_result: PlanResult,
               planner, scene_cfg: dict) -> dict:
@@ -902,7 +953,27 @@ class RealExecutor:
         log["T_obj_in_wrist"] = T_obj_in_wrist.tolist()
         log["released_obj_pose_robot"] = released_obj_pose.tolist()
 
-        # 1. Re-plan retract — hand stays at pregrasp (real state).
+        # 1. Open hand pregrasp → openpose first (mirrors reset_hybrid step 0).
+        #    With fingers open, plan_js_to_init's trajopt has more clearance
+        #    around the placed obj, reducing TRAJOPT_FAIL rate.
+        op_raw = getattr(plan_result, "openpose_pose", None)
+        pg_raw = getattr(plan_result, "pregrasp_pose", None)
+        self._log_state("hand_open")
+        if op_raw is not None and pg_raw is not None:
+            pg = np.asarray(pg_raw, dtype=np.float64)
+            op = np.asarray(op_raw, dtype=np.float64)
+            for i in range(11):
+                a = i / 10.0
+                qpos = (1.0 - a) * pg + a * op
+                self._move_hand(self._convert(qpos))
+                time.sleep(0.05)
+            hold_hand_raw = op
+        else:
+            hold_hand_raw = (np.asarray(plan_result.pregrasp_pose, dtype=np.float64)
+                              if plan_result.pregrasp_pose is not None
+                              else self._hand_init)
+
+        # 2. Re-plan retract — hand at openpose (clearer from obj).
         self._log_state("arm_retract")
         t1 = time.time()
         new_scene = dict(scene_cfg)
@@ -910,14 +981,12 @@ class RealExecutor:
         new_scene["mesh"]["target"] = dict(scene_cfg["mesh"]["target"])
         new_scene["mesh"]["target"]["pose"] = se32cart(released_obj_pose).tolist()
         cur_qpos = self.arm.get_data()["qpos"]
-        # Goal arm = XARM_INIT but joint 0 rotated -60° so the arm parks out
-        # of the cameras' view (matches RSS_2026 run_auto_v2 clear_view_pose).
         clear_view_arm = self._xarm_init.copy()
-        clear_view_arm[0] -= np.deg2rad(60.0)
+        clear_view_arm[0] -= np.deg2rad(40.0)
         t_plan0 = time.time()
         retract_traj = planner.plan_js_to_init(
             new_scene, cur_qpos,
-            start_hand_qpos=plan_result.pregrasp_pose,
+            start_hand_qpos=hold_hand_raw,
             goal_arm_qpos=clear_view_arm[:6],
         )
         log["steps"]["replan_s"] = round(time.time() - t_plan0, 2)
@@ -954,6 +1023,118 @@ class RealExecutor:
             )
         return log
 
+    def reset_hybrid(self, plan_result: PlanResult,
+                      planner, scene_cfg: dict) -> dict:
+        """Hybrid retract: sequential [1, 2, 0] first (moves arm base/shoulder/
+        elbow away from the placed object — these are large, safe motions),
+        then cuRobo plans the remaining wrist joints (3, 4, 5) to clear_view
+        with collision-free self/world check.
+
+        Steps:
+          0. Open hand to hand_init.
+          1. Snapshot placed object pose (from current wrist + rigid grasp).
+          2. Sequential move on joints [1, 2, 0] to their clear_view values.
+          3. cuRobo plan_js_to_init from current full qpos → clear_view arm
+             goal. Hand stays at hand_init throughout. Collision world is
+             scene_cfg with the placed object's snapshot pose as obstacle.
+          4. Execute the planned trajectory.
+        """
+        t_start = time.time()
+        log = {"start": datetime.datetime.now().isoformat(), "steps": {}}
+        if not plan_result.success:
+            log["skipped"] = True
+            return log
+
+        from autodex.utils.conversion import cart2se3, se32cart
+
+        # 0. Slowly open fingers pregrasp → openpose (10 linear steps). Keep
+        #    openpose for the rest of retract (skip hand_init). If openpose
+        #    not given, fall back to single jump to hand_init (legacy path).
+        op_raw = getattr(plan_result, "openpose_pose", None)
+        pg_raw = getattr(plan_result, "pregrasp_pose", None)
+        self._log_state("hand_open")
+        t1 = time.time()
+        if op_raw is not None and pg_raw is not None:
+            pg = np.asarray(pg_raw, dtype=np.float64)
+            op = np.asarray(op_raw, dtype=np.float64)
+            for i in range(11):
+                a = i / 10.0
+                qpos = (1.0 - a) * pg + a * op
+                self._move_hand(self._convert(qpos))
+                time.sleep(0.05)
+            hold_hand_raw = op
+        else:
+            hold_hand_raw = self._hand_init
+            self._move_hand(self._convert(hold_hand_raw))
+            time.sleep(0.3)
+        log["steps"]["hand_open_s"] = round(time.time() - t1, 2)
+
+        # 1. Snapshot placed object pose under rigid grasp assumption.
+        T_obj_grasp = cart2se3(scene_cfg["mesh"]["target"]["pose"])
+        T_obj_in_wrist = np.linalg.inv(plan_result.wrist_se3) @ T_obj_grasp
+        T_wrist_now = self.arm.get_data()["position"] @ self._link6_to_wrist
+        released_obj_pose = T_wrist_now @ T_obj_in_wrist
+        log["released_obj_pose_robot"] = released_obj_pose.tolist()
+
+        # 2. Sequential on joints [1, 2, 0] only — coarse arm motion away from
+        #    the just-placed object, before wrist replanning.
+        clear_view = self._xarm_init.copy()
+        clear_view[0] -= np.deg2rad(40.0)
+        self._log_state("seq_base_shoulder")
+        t1 = time.time()
+        coarse_order = [1, 2, 0]
+        if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
+            coarse_order = [2, 1, 0]
+        self._move_joint_sequential(clear_view[:6], coarse_order,
+                                     threshold=0.06,
+                                     first_vel_limit=0.02)
+        log["steps"]["seq_arm_s"] = round(time.time() - t1, 2)
+
+        # 3. cuRobo plan_js for remaining wrist joints (3, 4, 5). plan_js_to_init
+        #    plans the full 22-DOF trajectory but joints 0/1/2 are already at
+        #    clear_view so only 3/4/5 actually change. Self/world collision
+        #    handled by cuRobo trajopt.
+        self._log_state("plan_wrist")
+        t1 = time.time()
+        new_scene = dict(scene_cfg)
+        new_scene["mesh"] = dict(scene_cfg.get("mesh", {}))
+        new_scene["mesh"]["target"] = dict(scene_cfg["mesh"]["target"])
+        new_scene["mesh"]["target"]["pose"] = se32cart(released_obj_pose).tolist()
+        cur_qpos = self.arm.get_data()["qpos"]
+        wrist_traj = planner.plan_js_to_init(
+            new_scene, cur_qpos,
+            start_hand_qpos=hold_hand_raw,
+            goal_arm_qpos=clear_view[:6],
+        )
+        log["steps"]["wrist_plan_s"] = round(time.time() - t1, 2)
+        if wrist_traj is None:
+            log["wrist_plan_mode"] = "failed"
+            log["retract_mode"] = "hybrid_wrist_failed"
+            self._log_state("reset_done")
+            log["total_s"] = round(time.time() - t_start, 2)
+            raise RuntimeError(
+                "reset_hybrid(): plan_js_to_init returned None — wrist retract "
+                "not safe. Inspect placed object pose / scene_cfg."
+            )
+        log["wrist_plan_mode"] = "planned"
+        t1 = time.time()
+        arm_traj = wrist_traj[:, :6]
+        hand_traj = np.array([self._convert(wrist_traj[i, 6:])
+                              for i in range(len(wrist_traj))])
+        self._move_joints(arm_traj, hand_traj)
+        log["steps"]["wrist_exec_s"] = round(time.time() - t1, 2)
+
+        final_qpos = self.arm.get_data()["qpos"]
+        err = float(np.linalg.norm(final_qpos - clear_view[:6]))
+        log["final_qpos_err"] = err
+        log["retract_mode"] = "hybrid"
+        self._log_state("reset_done")
+        log["total_s"] = round(time.time() - t_start, 2)
+        if err > 0.1:
+            print(f"[reset_hybrid] WARNING: final_qpos_err={err:.3f} > 0.1  "
+                  f"final={final_qpos.round(3)}  target={clear_view[:6].round(3)}")
+        return log
+
     def reset_fallback(self, plan_result: PlanResult) -> dict:
         """Reset path for failed grasps (approach contact or charuco fail).
         Open hand to hand_init, then sequentially move arm to clear_view
@@ -980,11 +1161,13 @@ class RealExecutor:
         self._log_state("clear_view")
         t1 = time.time()
         clear_view = self._xarm_init.copy()
-        clear_view[0] -= np.deg2rad(60.0)
+        clear_view[0] -= np.deg2rad(40.0)
         execute_order = [1, 2, 5, 0, 3, 4]
         if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
             execute_order = [2, 1, 5, 0, 3, 4]
-        self._move_joint_sequential(clear_view[:6], execute_order, threshold=0.06)
+        self._move_joint_sequential(clear_view[:6], execute_order,
+                                     threshold=0.06,
+                                     first_vel_limit=0.02)
         log["steps"]["arm_retract_s"] = round(time.time() - t1, 2)
 
         final_qpos = self.arm.get_data()["qpos"]

@@ -22,7 +22,7 @@ from itertools import product
 import numpy as np
 import tqdm
 
-from autodex.utils.path import obj_path as default_obj_path, repo_dir, project_dir
+from autodex.utils.path import obj_path as default_obj_path, repo_dir, project_dir, get_scene_dir
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
 import sys
@@ -102,9 +102,9 @@ def _adapt_gap(builder, scene_kwargs, planner, wrist_se3_list, pregrasp_list, ta
     return None
 
 
-def gen_wall(obj_name, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):
+def gen_wall(obj_name, hand, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):
     obj_dir = os.path.join(obj_root, obj_name)
-    out_dir = os.path.join(obj_dir, "scene", "wall")
+    out_dir = get_scene_dir(hand, obj_name, "wall")
     _backup_and_clear(out_dir)
 
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
@@ -138,9 +138,9 @@ def gen_wall(obj_name, obj_root, planner, wrist_se3_list, pregrasp_list, symmetr
     return scene_cnt, skipped
 
 
-def gen_shelf(obj_name, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):
+def gen_shelf(obj_name, hand, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):
     obj_dir = os.path.join(obj_root, obj_name)
-    out_dir = os.path.join(obj_dir, "scene", "shelf")
+    out_dir = get_scene_dir(hand, obj_name, "shelf")
     _backup_and_clear(out_dir)
 
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
@@ -186,9 +186,9 @@ def gen_shelf(obj_name, obj_root, planner, wrist_se3_list, pregrasp_list, symmet
     return scene_cnt, skipped
 
 
-def gen_packed(obj_name, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):  # noqa: ARG001
+def gen_packed(obj_name, hand, obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg):  # noqa: ARG001
     obj_dir = os.path.join(obj_root, obj_name)
-    out_dir = os.path.join(obj_dir, "scene", "packed")
+    out_dir = get_scene_dir(hand, obj_name, "packed")
     _backup_and_clear(out_dir)
 
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
@@ -277,7 +277,7 @@ if __name__ == "__main__":
         per_obj = {}
         for scene_type in args.scenes:
             kept, skipped = SCENE_GENS[scene_type](
-                obj_name, args.obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg,
+                obj_name, args.hand, args.obj_root, planner, wrist_se3_list, pregrasp_list, symmetry_reg,
             )
             per_obj[scene_type] = (kept, skipped)
             print(f"{obj_name}/{scene_type}: kept={kept}, skipped={skipped}")

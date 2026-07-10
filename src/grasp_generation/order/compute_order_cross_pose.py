@@ -24,7 +24,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 sys.path.insert(0, os.path.join(REPO_ROOT, "src", "grasp_generation", "order"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src", "grasp_generation", "sim_filter"))
 
-from autodex.utils.path import obj_path as default_obj_path, repo_dir, project_dir
+from autodex.utils.path import obj_path as default_obj_path, repo_dir, project_dir, get_scene_dir
 from autodex.utils.conversion import cart2se3
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
@@ -78,11 +78,11 @@ def load_candidates(candidate_root, obj_name):
     return cands
 
 
-def load_scenes(obj_root_dir, obj_name, scene_types):
+def load_scenes(hand, obj_root_dir, obj_name, scene_types):
     """Return list of dicts with scene info (parsed JSON + pose_idx + gravity_dir)."""
     scenes = []
     for st in scene_types:
-        d = os.path.join(obj_root_dir, obj_name, "scene", st)
+        d = get_scene_dir(hand, obj_name, st)
         if not os.path.isdir(d):
             continue
         for f in sorted(os.listdir(d)):
@@ -215,7 +215,7 @@ def main():
     for obj_name in tqdm(obj_list, desc="Objects"):
         print(f"\n=== {obj_name} ===")
         cands = load_candidates(candidate_root, obj_name)
-        scenes = load_scenes(args.obj_root, obj_name, args.scene_types)
+        scenes = load_scenes(args.hand, args.obj_root, obj_name, args.scene_types)
         print(f"  candidates: {len(cands)}, scenes: {len(scenes)}")
         if not cands or not scenes:
             print("  skip (no candidates or no scenes)")

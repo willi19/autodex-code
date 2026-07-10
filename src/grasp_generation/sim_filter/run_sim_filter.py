@@ -17,6 +17,7 @@ import mujoco
 from autodex.simulator.hand_object import MjHO
 from autodex.simulator.rot_util import np_get_delta_qpos
 from autodex.utils.conversion import se32cart, cart2se3
+from autodex.utils.path import get_scene_dir
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -265,7 +266,7 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
         n_coll_total = 0
 
         for (scene_type, scene_id), seeds in tqdm(scene_seeds.items(), desc=f"  coll check", leave=False):
-            scene_json = os.path.join(obj_data_path, obj_name, "scene", scene_type, f"{scene_id}.json")
+            scene_json = os.path.join(get_scene_dir(hand, obj_name, scene_type), f"{scene_id}.json")
             if not os.path.exists(scene_json):
                 for seed, sd in seeds:
                     coll_valid[sd] = False
@@ -336,7 +337,7 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
         n_contact_pass = 0
         n_contact_total = 0
         for (scene_type, scene_id), seeds in tqdm(scene_seeds.items(), desc="  squeeze check", leave=False):
-            scene_json = os.path.join(obj_data_path, obj_name, "scene", scene_type, f"{scene_id}.json")
+            scene_json = os.path.join(get_scene_dir(hand, obj_name, scene_type), f"{scene_id}.json")
             if not os.path.exists(scene_json):
                 for seed, sd in seeds:
                     contact_valid[sd] = False

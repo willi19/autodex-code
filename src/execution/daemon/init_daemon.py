@@ -243,30 +243,10 @@ class InitDaemon:
         # 1. snapshot
         t_snap = time.perf_counter()
         if self.mode == "live":
-            # Prefer latest available frame (fid > 0) instead of strictly waiting
-            # for a "new" frame, which can timeout when trigger cadence is slow.
-            frames = {}
-            latest = self.reader.get_images(copy=True)
-            for s, item in latest.items():
-                if item is None:
-                    frames[s] = (None, 0)
-                    continue
-                img, fid = item
-                if img is not None and int(fid) > 0:
-                    frames[s] = (img, int(fid))
-                else:
-                    frames[s] = (None, 0)
-            # Fallback: one short wait for missing cameras.
-            missing = [s for s, (img, _) in frames.items() if img is None]
-            if missing:
-                waited = self.reader.wait_for_new_frames(
-                    last_frame_ids={s: 0 for s in missing},
-                    timeout=0.8,
-                )
-                for s in missing:
-                    img, fid = waited.get(s, (None, 0))
-                    if img is not None and int(fid) > 0:
-                        frames[s] = (img, int(fid))
+            # Sync wait: every cam must advance to a NEW frame within timeout.
+            # Async per-cam latest grab caused random cams (still fid=0) to be
+            # skipped — reverted to single-shot wait_for_new_frames.
+            frames = self.reader.wait_for_new_frames(timeout=2.0)
         else:
             if not capture_dir:
                 logger.error(f"[run {req_id}] disk mode but no capture_dir")

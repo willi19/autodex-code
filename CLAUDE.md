@@ -140,7 +140,7 @@ Use `encode_depth_uint16()` / `decode_depth_uint16()` from `autodex.perception.d
 - **Candidates**: `{candidate_path}/{version}/{obj_name}/{scene_type}/{scene_id}/{grasp_name}/` — has `wrist_se3.npy`, `grasp_pose.npy`, `pregrasp_pose.npy`
 - **Setcover order**: `{code_path}/order/{version}/{obj_name}/setcover_order.json` — ranked grasp list (greedy set cover)
 - **Object meshes**: `{obj_path}/{obj_name}/raw_mesh/{obj_name}.obj`
-- **Object pose**: `{obj_path}/{obj_name}/scene/table/4.json`
+- **Object pose**: `get_scene_dir(hand, obj_name, "table")/4.json` (= `~/shared_data/AutoDex/scene/{hand}/{obj_name}/table/4.json`; scenes are hand-specific)
 - **Robot URDF**: `{urdf_path}/allegro_hand_description_right.urdf`
 
 Paths from `rsslib.path`: `candidate_path=/home/mingi/RSS_2026/candidates`, `code_path=/home/mingi/RSS_2026`, `obj_path=/home/mingi/shared_data/RSS2026_Mingi/object/paradex`.

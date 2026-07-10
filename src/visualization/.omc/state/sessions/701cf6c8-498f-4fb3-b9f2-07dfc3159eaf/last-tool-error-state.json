@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"SD=/tmp/claude-1000/-home-mingi-AutoDex/701cf6c8-498f-4fb3-b9f2-07dfc3159eaf/scratchpad\\nDST=~/AutoDex/src/dataset/exec_grasp\\nmkdir -p \\\"$DST\\\"\\nfor f in extract_exec build_exec_grasps re...",
+  "error": "Exit code 2\n복사: extract_exec.py\n복사: build_exec_grasps.py\n복사: refine_exec.py\n복사: save_states.py\n복사: detect_states.py\n복사: corl_exec.py\n복사: harmonize_merge.py\n복사: reclassify_plain.py\n--- 영구 위치 ---\nawk: 1: unexpected character '\\'\nawk: line 1: runaway string constant \"B\\\"} ...",
+  "timestamp": "2026-07-09T16:14:18.817Z",
+  "retry_count": 1
+}

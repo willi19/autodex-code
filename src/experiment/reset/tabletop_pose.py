@@ -11,8 +11,10 @@ import os
 from typing import Any, Dict, Optional
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from autodex.utils.path import obj_path
+from autodex.utils.symmetry import get_cyl_axis_local
 
 
 _CACHE: Dict[str, list] = {}
@@ -66,6 +68,31 @@ def _z_aligned_geodesic_deg(R_est: np.ndarray, R_tab: np.ndarray) -> float:
     return _rot_geodesic_deg(R_est, R_z @ R_tab)
 
 
+def _cyl_z_aligned_geodesic_deg(R_est: np.ndarray, R_tab: np.ndarray,
+                                  axis_local: np.ndarray,
+                                  n_cyl: int = 36) -> float:
+    """Aligned geodesic distance for cylinder-symmetric objects.
+
+    Two tabletop classes that differ by a rotation around the object's local
+    symmetry axis are physically identical (e.g. a pepsi can rolled around
+    its axis looks the same). Search optimal cyl_yaw around the axis (in
+    object/tabletop frame) AND world-z yaw (closed form), return minimum
+    residual geodesic.
+
+    R_aligned = R_z_world(*) @ R_tab @ R_axis_local(theta)
+    """
+    axis = np.asarray(axis_local, dtype=np.float64).reshape(3)
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    best = float("inf")
+    for theta in np.linspace(0.0, 2.0 * np.pi, n_cyl, endpoint=False):
+        R_cyl = Rotation.from_rotvec(axis * float(theta)).as_matrix()
+        R_tab_rot = R_tab @ R_cyl
+        d = _z_aligned_geodesic_deg(R_est, R_tab_rot)
+        if d < best:
+            best = d
+    return best
+
+
 def classify_tabletop_pose(pose_robot: np.ndarray,
                             obj_name: str) -> Optional[Dict[str, Any]]:
     """Find the closest tabletop pose to ``pose_robot`` by rotation.
@@ -83,7 +110,14 @@ def classify_tabletop_pose(pose_robot: np.ndarray,
     if not poses:
         return None
     R_est = pose_robot[:3, :3]
-    errs = [_z_aligned_geodesic_deg(R_est, T[:3, :3]) for _, T in poses]
+    # Cylinder-symmetric objects: also fold over the object's symmetry axis
+    # so a rolled-around-its-axis cylinder still matches its tabletop class.
+    axis_local = get_cyl_axis_local(obj_name)
+    if axis_local is not None:
+        errs = [_cyl_z_aligned_geodesic_deg(R_est, T[:3, :3], axis_local)
+                for _, T in poses]
+    else:
+        errs = [_z_aligned_geodesic_deg(R_est, T[:3, :3]) for _, T in poses]
     idx = int(np.argmin(errs))
     fname, _ = poses[idx]
     return {

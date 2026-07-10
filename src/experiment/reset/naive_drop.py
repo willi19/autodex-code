@@ -63,7 +63,7 @@ logging.getLogger("curobo").setLevel(logging.WARNING)
 
 # ── Hardcoded defaults (rarely changed across runs) ──────────────────────────
 GRASP_VERSION = "table_only"
-LIFT_HEIGHT_M = 0.20         # +20cm above grasp pose (naive_drop free-fall height)
+LIFT_HEIGHT_M = 0.15         # +15cm above grasp pose (matches reorient_drop)
 EXP_NAME = "reset_test/naive_drop"
 SCENE = "table"
 SUCCESS_ONLY = False
@@ -351,11 +351,23 @@ def main():
                 t0 = time.time()
                 scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
                 scene_cfg = add_obstacles(scene_cfg, SCENE)
+                pose_stem = tb_before["filename"].replace(".npy", "")
+                # Cylinder freedom (continuous-revolute objects only) — expand
+                # candidates by N_cyl rotations around the symmetry axis if
+                # the axis is not (nearly) world-vertical at the current pose.
+                from autodex.utils.symmetry import (
+                    get_cyl_axis_local, get_cyl_yaw_grid,
+                )
+                _cyl_axis = get_cyl_axis_local(args.obj)
+                _cyl_grid = get_cyl_yaw_grid(args.obj)
                 result = planner.plan(
                     scene_cfg, args.obj, GRASP_VERSION,
                     skip_done=False,
                     success_only=SUCCESS_ONLY, hand=args.hand,
                     scene_id=scene_id,
+                    openpose_pose_stem=pose_stem,
+                    cyl_axis_local=_cyl_axis,
+                    cyl_yaw_grid=_cyl_grid,
                 )
                 rec["timing"]["plan_s"] = round(time.time() - t0, 2)
                 print(f"    plan: {rec['timing']['plan_s']}s  success={result.success}")
@@ -483,7 +495,7 @@ def main():
                                @ executor._link6_to_wrist)
                 planned_obj_pose = T_wrist_now @ T_obj_in_wrist
 
-                # 6. Drop: release(pregrasp) -> hand=0 + sequential arm retract.
+                # 6. Drop: release(pregrasp) -> openpose -> hand=0 + sequential retract.
                 print(f"[cycle {cycle}] Drop: release -> hand=0 -> sequential retract...")
                 t0 = time.time()
                 try:
@@ -496,12 +508,13 @@ def main():
                     rec["timing"]["release_s"] = round(time.time() - t0, 2)
                     rec["progress"]["release"] = "ok"
 
+                # reset_hybrid now slow-interps pregrasp→openpose internally.
                 t1 = time.time()
                 try:
-                    fb_log = executor.reset_fallback(result)
+                    fb_log = executor.reset_hybrid(result, planner, scene_cfg)
                     rec["timing"]["retract_s"] = round(time.time() - t1, 2)
                     rec["reset"] = fb_log
-                    rec["progress"]["retract"] = "fallback_sequential"
+                    rec["progress"]["retract"] = "hybrid"
                     rec["states"] = executor.state_timestamps
                     print(f"    release={rec['timing'].get('release_s', '?')}s  "
                           f"retract={rec['timing']['retract_s']}s  "

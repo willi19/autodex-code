@@ -139,6 +139,9 @@ class SilhouetteOptimizer:
         debug_every: int = 1,
         debug_max_views: int = 4,
         frame_idx: int = 0,
+        outlier_filter: bool = True,
+        outlier_mult: float = 3.0,
+        outlier_min_keep: int = 3,
     ) -> np.ndarray:
         import nvdiffrast.torch as dr
         from Utils import projection_matrix_from_intrinsics, to_homo_torch, glcam_in_cvcam
@@ -197,6 +200,58 @@ class SilhouetteOptimizer:
         extrinsic_batch = torch.stack(extrinsic_list, dim=0)    # (N, 4, 4)
         proj_batch = torch.stack(proj_list, dim=0)              # (N, 4, 4)
         H, W = H_ref, W_ref
+
+        # ── per-view outlier filter ──────────────────────────────────────
+        # Render at the initial pose, compute per-view MSE, drop views whose
+        # loss is >= outlier_mult × median (bad mask / mis-aligned candidate
+        # / wrong segmentation). A few junk views can dominate the joint
+        # gradient and stall the optimization (loss barely moves). Keep at
+        # least ``outlier_min_keep`` views regardless of threshold.
+        if outlier_filter and N > outlier_min_keep:
+            with torch.no_grad():
+                pose_cam_batch0 = extrinsic_batch @ pose_world_init_t
+                alpha0 = self._render_silhouette_batched(
+                    H=H, W=W,
+                    ob_in_cams=pose_cam_batch0,
+                    glctx=self.glctx,
+                    mesh_tensors=self.mesh_tensors,
+                    pos_homo=self._pos_homo,
+                    proj_t=proj_batch,
+                    glcam_t=self._glcam_t,
+                    antialias=False,
+                )                                                       # (N, H, W, 1)
+                render0 = self._blur_mask_torch_batched(
+                    alpha0[..., 0], mask_blur_ksize, mask_blur_sigma)
+                per_view_mse = ((render0 - mask_batch) ** 2).mean(dim=(1, 2))   # (N,)
+            losses = per_view_mse.cpu().numpy()
+            median_loss = float(np.median(losses))
+            thr = outlier_mult * median_loss
+            keep_mask = losses <= thr
+            n_keep = int(keep_mask.sum())
+            if n_keep < outlier_min_keep:
+                # Threshold too strict — keep the best ``outlier_min_keep`` views.
+                order = np.argsort(losses)
+                keep_mask = np.zeros_like(keep_mask, dtype=bool)
+                keep_mask[order[:outlier_min_keep]] = True
+                n_keep = outlier_min_keep
+            dropped = [(cam_ids[i] or f"v{i}", float(losses[i]))
+                       for i in range(N) if not keep_mask[i]]
+            kept_losses = losses[keep_mask]
+            logging.info(
+                f"[sil filter] median_init_loss={median_loss:.5f}  "
+                f"thr={thr:.5f} (x{outlier_mult})  kept {n_keep}/{N}  "
+                f"kept_max={float(kept_losses.max()):.5f}")
+            if dropped:
+                logging.info(f"[sil filter] dropped: " + ", ".join(
+                    f"{cid}({l:.4f})" for cid, l in dropped))
+            keep_idx_t = torch.tensor(np.where(keep_mask)[0],
+                                       device=self.device, dtype=torch.long)
+            mask_batch       = mask_batch.index_select(0, keep_idx_t)
+            extrinsic_batch  = extrinsic_batch.index_select(0, keep_idx_t)
+            proj_batch       = proj_batch.index_select(0, keep_idx_t)
+            cam_ids          = [cam_ids[i] for i in np.where(keep_mask)[0]]
+            masks_raw        = [masks_raw[i] for i in np.where(keep_mask)[0]]
+            N = n_keep
 
         r6d_init = self._matrix_to_rotation_6d(pose_world_init_t[:3, :3].unsqueeze(0))[0]
         t_init = pose_world_init_t[:3, 3]

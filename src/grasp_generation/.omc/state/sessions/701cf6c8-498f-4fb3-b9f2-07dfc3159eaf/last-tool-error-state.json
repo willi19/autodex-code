@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"# 모든 inspire run/watcher/orchestrator/bodex 종료\\nfor p in 1321017 1319783 1319793 1320086 1320097; do\\n  for c in $(pgrep -P $p 2>/dev/null); do kill -TERM $c 2>/dev/null; done\\ndone\\npkill...",
+  "error": "Exit code 144",
+  "timestamp": "2026-07-09T12:48:07.676Z",
+  "retry_count": 1
+}

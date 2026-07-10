@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"sleep 20\\necho \\\"### 실행중 프로세스\\\"; pgrep -af \\\"gen_watch.sh|gen_backup.sh|generate.py\\\" | grep -v pgrep\\necho \\\"### 로그 tail\\\"; tail -15 ~/AutoDex/logging/grasp_generation/gen_backup_v8.log 2...",
+  "error": "Exit code 1\n### 실행중 프로세스\n30225 bash gen_watch.sh\n### 로그 tail",
+  "timestamp": "2026-07-03T09:40:44.553Z",
+  "retry_count": 1
+}

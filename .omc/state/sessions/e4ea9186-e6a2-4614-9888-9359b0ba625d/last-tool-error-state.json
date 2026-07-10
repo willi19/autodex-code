@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"echo \\\"=== jisoo drawer dir (via shared mount) ===\\\" && ls -la /home/mingi/shared_data/jisoo_test/articulated_object/drawer/ 2>/dev/null || echo \\\"NOT at /home/mingi/shared_data/...\\\"; ech...",
+  "error": "Exit code 2\n=== jisoo drawer dir (via shared mount) ===\ntotal 20\ndrwxrwxr-x 5 mingi  users 4096  5월 26 02:25 .\ndrwxrwxrwx 3 nobody users 4096  5월 25 19:01 ..\ndrwxrwxrwx 3 nobody users 4096  5월 25 19:25 drawer_urdf_mesh\ndrwxrwxr-x 4 mingi  users 4096  5월 25 18:36 state_0\ndrwxrwxr-x 4 mingi  users 4096  5월 25 23:39 state_1\n\n=== urdf_mesh subdir ===\ntotal 20\ndrwxrwxrwx 3 nobody users 4096  5월 25 19:25 .\ndrwxrwxr-x 5 mingi  users 4096  5월 26 02:25 ..\n-rw-rw-rw- 1 nobody users  998  5월 24 22:33 outpu...",
+  "timestamp": "2026-06-29T17:01:35.795Z",
+  "retry_count": 1
+}

@@ -88,25 +88,9 @@ class SnapshotDaemon:
             self.snap_event.clear()
             return
 
-        # One snapshot pass. Prefer latest available (fid>0); brief wait for
-        # any stragglers — mirrors init_daemon's logic so cadence matches.
-        frames = {}
-        latest = self.reader.get_images(copy=True)
-        for s, item in latest.items():
-            if item is None:
-                continue
-            img, fid = item
-            if img is not None and int(fid) > 0:
-                frames[s] = (img, int(fid))
-        missing = [s for s in self.reader.camera_names if s not in frames]
-        if missing:
-            waited = self.reader.wait_for_new_frames(
-                last_frame_ids={s: 0 for s in missing}, timeout=0.5,
-            )
-            for s in missing:
-                img, fid = waited.get(s, (None, 0))
-                if img is not None and int(fid) > 0:
-                    frames[s] = (img, int(fid))
+        # Sync wait: every cam must advance to a NEW frame within timeout.
+        # Mirrors init_daemon's logic.
+        frames = self.reader.wait_for_new_frames(timeout=2.0)
 
         params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         n_published = 0

@@ -24,10 +24,16 @@ output/
 
 # Video/media
 *.png
+*.jpg
+*.jpeg
 *.mp4
 *.avi
 *.webm
 *.mov
+
+# Contact snap dumps
+contact_snaps/
+contact_snaps_post/
 
 # Large model files
 *.ts

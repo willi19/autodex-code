@@ -17,8 +17,12 @@ import numpy as np
 import transforms3d
 import tqdm
 
+from autodex.utils.path import get_scene_dir
+
 obj_path = "/home/mingi/shared_data/AutoDex/object/paradex"
 # Override via --obj_path CLI flag (set in __main__).
+# Scenes are written per-hand (get_scene_dir); HAND is rebound in __main__.
+HAND = "allegro"
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +286,7 @@ def get_box_scene(obj_name, tabletop_pose, height_offset):
 
 def save_float_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     os.makedirs(os.path.join(out_path, "float"), exist_ok=True)
 
     scene_cfg = {
@@ -298,7 +302,7 @@ def save_float_scene(obj_name):
 
 def save_tabletop_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
     os.makedirs(os.path.join(out_path, "table"), exist_ok=True)
 
@@ -316,7 +320,7 @@ def save_tabletop_scene(obj_name):
 
 def save_packed_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
     os.makedirs(os.path.join(out_path, "packed"), exist_ok=True)
 
@@ -364,7 +368,7 @@ def save_packed_scene(obj_name):
 
 def save_wall_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
     os.makedirs(os.path.join(out_path, "wall"), exist_ok=True)
 
@@ -398,7 +402,7 @@ def save_wall_scene(obj_name):
 
 def save_shelf_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
     os.makedirs(os.path.join(out_path, "shelf"), exist_ok=True)
 
@@ -449,7 +453,7 @@ def save_shelf_scene(obj_name):
 
 def save_box_scene(obj_name):
     obj_dir = os.path.join(obj_path, obj_name)
-    out_path = os.path.join(obj_dir, "scene")
+    out_path = get_scene_dir(HAND, obj_name)
     tabletop_pose_path = os.path.join(obj_dir, "processed_data", "info", "tabletop")
     os.makedirs(os.path.join(out_path, "box"), exist_ok=True)
 
@@ -499,10 +503,15 @@ if __name__ == "__main__":
         "--obj_path", default=obj_path,
         help="Root dir containing object subdirs (default: paradex)",
     )
+    parser.add_argument(
+        "--hand", default="allegro",
+        help="Hand whose scene subtree these scenes are written under.",
+    )
     args = parser.parse_args()
     obj_path = args.obj_path
-    # Helpers reference obj_path at module scope; rebind it.
+    # Helpers reference obj_path / HAND at module scope; rebind them.
     globals()["obj_path"] = obj_path
+    globals()["HAND"] = args.hand
 
     if args.objects is None:
         obj_list = sorted([

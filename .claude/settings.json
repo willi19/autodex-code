@@ -3,7 +3,8 @@
     "allow": [
       "Bash(bash /home/robot/AutoDex/scripts/gotrack_daemons.sh log capture1)",
       "Bash(cd /home/mingi/object_processing/MeshProcess *)",
-      "Read(//home/mingi/object_processing/MeshProcess/**)"
+      "Read(//home/mingi/object_processing/MeshProcess/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/experiment/reset/edit_spheres.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ],
     "additionalDirectories": [
       "/home/robot/shared_data/AutoDex/content/assets/robot/allegro_description/xarm"

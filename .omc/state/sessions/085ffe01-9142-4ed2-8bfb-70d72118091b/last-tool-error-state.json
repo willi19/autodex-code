@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/home/mingi/AutoDex/src/grasp_generation/BODex/src/curobo/rollout/cost\"}",
+  "error": "EISDIR: illegal operation on a directory, read '/home/mingi/AutoDex/src/grasp_generation/BODex/src/curobo/rollout/cost'",
+  "timestamp": "2026-07-01T08:52:27.035Z",
+  "retry_count": 1
+}

@@ -31,7 +31,14 @@ def convert_inspire_raw(raw):
 
 
 def resample(src_time, src_values, target_time):
-    """Linear interpolate src_values to target_time. Clamps outside range."""
+    """Linear interpolate src_values to target_time. Clamps outside range.
+
+    Some captures truncate mid-write, leaving time and values off-by-one (e.g.
+    time has one fewer sample than position/action). Clip both to the common
+    length so interp1d gets equal-length axes.
+    """
+    n = min(len(src_time), len(src_values))
+    src_time, src_values = src_time[:n], src_values[:n]
     t = np.clip(target_time, float(src_time[0]), float(src_time[-1]))
     return interp1d(src_time, src_values, axis=0)(t)
 

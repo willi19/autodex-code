@@ -9,9 +9,15 @@ import torch
 os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
 
 
-def _snap_joint6(q: float, cur: float, lo: float = -np.pi, hi: float = np.pi) -> float:
+def _snap_joint6(q: float, cur: float,
+                  lo: float = -2.0 * np.pi, hi: float = 2.0 * np.pi) -> float:
     """Pick the equivalent angle (q + k*2π) inside [lo, hi] that is
-    closest to ``cur``. Falls back to wrap if cur itself is outside."""
+    closest to ``cur``. Falls back to wrap if cur itself is outside.
+
+    Defaults to ±2π bounds (matches widened xarm URDF limits for joint4/joint6)
+    so an IK goal returned in one wrap can snap to its 2π-equivalent if that
+    is closer to the start config — avoids 360° detours during trajopt.
+    """
     candidates = [q + k * 2.0 * np.pi for k in (-1, 0, 1)]
     valid = [c for c in candidates if lo - 1e-6 <= c <= hi + 1e-6]
     if valid:
@@ -27,6 +33,7 @@ from curobo.geom.types import WorldConfig
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 from curobo.rollout.rollout_base import Goal
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+from curobo.rollout.cost.pose_cost import PoseCostMetric
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 from curobo.geom.sdf.world import CollisionQueryBuffer
 from curobo.util.trajectory import InterpolateType
@@ -52,9 +59,51 @@ class PlanResult:
     grasp_pose: np.ndarray            # (16,) hand joints
     scene_info: list
     timing: Optional[dict] = None     # per-stage timing breakdown
+    openpose_pose: Optional[np.ndarray] = None  # (16,) hand joints; None if
+                                                # caller didn't request openpose
 
 
 # ── cuRobo format conversion (private) ───────────────────────────────────────
+
+def _expand_candidates_cyl(wrist_se3: np.ndarray,
+                            pregrasp: np.ndarray,
+                            grasp: np.ndarray,
+                            openpose_list,
+                            scene_info: list,
+                            obj_pose: np.ndarray,
+                            cyl_axis_local,
+                            cyl_yaw_grid):
+    """For cylinder objects, expand each candidate wrist by N_cyl rotations
+    around the object's symmetry axis (axis_local in object frame, axis
+    passes through object origin in world).
+
+    Returns (wrist_se3, pregrasp, grasp, openpose_list, scene_info) all
+    expanded to length N * N_cyl. Finger configs and scene_info entries are
+    replicated since the cylinder looks identical under cyl_yaw rotation.
+
+    Pass-through (no expansion) when ``cyl_axis_local`` or ``cyl_yaw_grid``
+    is None / single-element.
+    """
+    if (cyl_axis_local is None or cyl_yaw_grid is None
+            or len(cyl_yaw_grid) <= 1):
+        return wrist_se3, pregrasp, grasp, openpose_list, scene_info
+    axis = np.asarray(cyl_axis_local, dtype=np.float64).reshape(3)
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    obj_inv = np.linalg.inv(obj_pose)
+    out_w, out_p, out_g, out_op, out_si = [], [], [], [], []
+    for i in range(len(wrist_se3)):
+        for theta in cyl_yaw_grid:
+            R_cyl = Rotation.from_rotvec(axis * float(theta)).as_matrix()
+            R_4 = np.eye(4); R_4[:3, :3] = R_cyl
+            out_w.append(obj_pose @ R_4 @ obj_inv @ wrist_se3[i])
+            out_p.append(pregrasp[i])
+            out_g.append(grasp[i])
+            if openpose_list is not None:
+                out_op.append(openpose_list[i])
+            out_si.append(scene_info[i])
+    return (np.array(out_w), np.array(out_p), np.array(out_g),
+            (out_op if openpose_list is not None else None), out_si)
+
 
 def _se3_to_7vec(mat: np.ndarray) -> list:
     """4x4 SE3 -> [x, y, z, qx, qy, qz, qw]."""
@@ -107,12 +156,12 @@ class GraspPlanner:
 
     HAND_CONFIGS = {
         "allegro":      ("xarm_allegro.yml",      "allegro_floating.yml",      0.01,  32, InterpolateType.CUBIC),
-        "inspire":      ("xarm_inspire.yml",      "inspire_floating.yml",      0.002, 32, InterpolateType.LINEAR_CUDA),
-        "inspire_left": ("xarm_inspire_left.yml", "inspire_left_floating.yml", 0.002, 32, InterpolateType.LINEAR_CUDA),
+        "inspire":      ("xarm_inspire.yml",      "inspire_floating.yml",      0.005, 32, InterpolateType.LINEAR_CUDA),
+        "inspire_left": ("xarm_inspire_left.yml", "inspire_left_floating.yml", 0.005, 32, InterpolateType.LINEAR_CUDA),
     }
 
     def __init__(self, robot_cfg_path: Optional[str] = None, hand_cfg_path: Optional[str] = None,
-                 hand: str = "allegro"):
+                 hand: str = "allegro", use_cuda_graph: bool = True):
         if robot_cfg_path is None:
             robot_file, hand_file, self._collision_act_dist, self._num_trajopt_seeds, self._interpolation_type = self.HAND_CONFIGS.get(hand, self.HAND_CONFIGS["allegro"])
             robot_cfg_path = os.path.join(robot_configs_path, robot_file)
@@ -155,6 +204,7 @@ class GraspPlanner:
         # Precompute link6 y-axis in wrist frame for backward filter
         self._link6_y_in_wrist = np.linalg.inv(self._link6_to_wrist_rot) @ np.array([0, 1, 0])
         self._hand = hand
+        self._use_cuda_graph = use_cuda_graph
 
     # ── world setup ───────────────────────────────────────────────────────────
 
@@ -166,7 +216,7 @@ class GraspPlanner:
             num_trajopt_seeds=self._num_trajopt_seeds,
             num_graph_seeds=1,
             num_ik_seeds=32,
-            use_cuda_graph=use_cuda_graph,
+            use_cuda_graph=self._use_cuda_graph,
             interpolation_dt=0.01,
             interpolation_type=self._interpolation_type,
             collision_cache={"obb": self.N_CUBOIDS, "mesh": self.N_MESHES},
@@ -174,6 +224,7 @@ class GraspPlanner:
             grad_trajopt_iters=200,
             trajopt_tsteps=64,
             collision_activation_distance=self._collision_act_dist,
+            store_debug_in_result=True,
         )
         self._motion_gen = MotionGen(config)
         self._motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
@@ -366,13 +417,17 @@ class GraspPlanner:
             num_seeds=32,
             collision_cache={"obb": self.N_CUBOIDS, "mesh": self.N_MESHES},
             collision_activation_distance=self._collision_act_dist,
-            use_cuda_graph=use_cuda_graph,
+            use_cuda_graph=self._use_cuda_graph,
         )
         self._ik_solver = IKSolver(config)
 
     def solve_ik(self, scene_cfg: dict, obj_name: str, grasp_version: str,
                  seed: Optional[int] = None, hand: str = "allegro",
-                 scene_id: Optional[str] = None):
+                 scene_id: Optional[str] = None,
+                 cyl_axis_local: Optional[np.ndarray] = None,
+                 cyl_yaw_grid: Optional[np.ndarray] = None,
+                 scene_type_filter: Optional[str] = None,
+                 skip_scenes_with_success: bool = False):
         """
         IK-only reachability check for all grasp candidates.
 
@@ -381,6 +436,13 @@ class GraspPlanner:
 
         ``scene_id`` (str) restricts loaded candidates to the matching tabletop
         scene_id (sorted index), same convention as ``planner.plan``.
+
+        ``cyl_axis_local`` + ``cyl_yaw_grid`` (optional): for continuous-revolute
+        objects (e.g. lying cylinder), expand each candidate wrist into N_cyl
+        rotated variants around the object's symmetry axis. The same finger
+        config (pregrasp/grasp/openpose) is shared across variants because the
+        cylinder looks identical under that rotation. Multiplies candidate
+        pool by ``len(cyl_yaw_grid)``.
 
         Returns:
             dict with per-candidate success, qpos, and timing.
@@ -394,7 +456,13 @@ class GraspPlanner:
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, scene_info = load_candidate(
-            obj_name, obj_pose, grasp_version, hand=hand, scene_id=scene_id)
+            obj_name, obj_pose, grasp_version, hand=hand, scene_id=scene_id,
+            scene_type_filter=scene_type_filter,
+            skip_scenes_with_success=skip_scenes_with_success)
+        # Expand by cyl_yaw around object symmetry axis (cylinder objects only).
+        wrist_se3, pregrasp, grasp, _, scene_info = _expand_candidates_cyl(
+            wrist_se3, pregrasp, grasp, None, scene_info,
+            obj_pose, cyl_axis_local, cyl_yaw_grid)
         t_load = _time.time() - t0
 
         t0 = _time.time()
@@ -456,6 +524,7 @@ class GraspPlanner:
                         arm_q = q_sol[i, :6].copy()
                         # Snap joint 6 to nearest equivalent angle to init_state
                         # IK can return any angle in [-2π, 2π]; pick closest to start
+                        arm_q[3] = _snap_joint6(arm_q[3], self._init_state[3])
                         arm_q[5] = _snap_joint6(arm_q[5], self._init_state[5])
                         ik_qpos[idx, :6] = arm_q
                         ik_qpos[idx, 6:] = pregrasp[idx]
@@ -464,7 +533,7 @@ class GraspPlanner:
         # Lift IK check: verify z+10cm pose is reachable — mirrors
         # planner.plan() so candidates that would hit joint limit during a
         # short lift are filtered out here.
-        LIFT_HEIGHT_CHECK = 0.10
+        LIFT_HEIGHT_CHECK = 0.05
         ik_valid_pre = np.where(ik_success)[0]
         if len(ik_valid_pre) > 0:
             lift_poses = wrist_se3[ik_valid_pre].copy()
@@ -675,6 +744,7 @@ class GraspPlanner:
             if not succ[i]:
                 continue
             arm_q = q_sol[i, :6].copy()
+            arm_q[3] = _snap_joint6(arm_q[3], current_qpos[3])
             arm_q[5] = _snap_joint6(arm_q[5], current_qpos[5])
             dist = float(np.linalg.norm(arm_q - cur_arm))
             feasible_arms.append((i, arm_q, dist))
@@ -730,6 +800,7 @@ class GraspPlanner:
                             yaw_grid: np.ndarray,
                             y_grid: np.ndarray = None,
                             cyl_yaw_grid: np.ndarray = None,
+                            cyl_axis_local: np.ndarray = None,
                             skip_plan: bool = False,
                             ) -> tuple:
         """Search (x, yaw) for an IK-feasible placement and plan to it.
@@ -850,8 +921,13 @@ class GraspPlanner:
                     [chunk_poses, np.tile(chunk_poses[:1], (pad, 1, 1))],
                     axis=0)
             goal = _to_curobo_pose(chunk_poses, device)
+            # Use current_qpos as retract seed so IK starts near the arm's
+            # current config — important for descent-from-extended where
+            # INIT_STATE (folded) is far from the feasible solution.
+            retract_qpos = np.asarray(
+                current_qpos, dtype=np.float32)[:len(self._init_state)]
             retract = torch.tensor(
-                self._init_state, dtype=torch.float32, device=device,
+                retract_qpos, dtype=torch.float32, device=device,
             ).unsqueeze(0).repeat(self.BATCH_SIZE, 1)
             res = self._ik_solver.solve_batch(
                 goal, retract_config=retract)
@@ -863,6 +939,7 @@ class GraspPlanner:
                 if succ[i]:
                     ik_success_all[idx] = True
                     arm_q = q_sol[i, :6].copy()
+                    arm_q[3] = _snap_joint6(arm_q[3], current_qpos[3])
                     arm_q[5] = _snap_joint6(arm_q[5], current_qpos[5])
                     ik_arm_qpos[idx] = arm_q
 
@@ -942,6 +1019,245 @@ class GraspPlanner:
         info["n_plan_attempts"] = n_plan_attempts
         return None, info
 
+    def plan_pose_constrained(
+        self,
+        start_full_qpos: np.ndarray,
+        target_wrist_pose: np.ndarray,
+        hold_vec_weight,
+        scene_cfg: Optional[dict] = None,
+        include_obj_obstacle: bool = False,
+        debug_dump_dir: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
+        """Plan ``start_full_qpos -> target_wrist_pose`` with a cuRobo
+        ``PoseCostMetric`` constraining selected pose components.
+
+        Args:
+            start_full_qpos: (22,) current joint state — arm (6) + hand.
+            target_wrist_pose: (4, 4) wrist (cuRobo ``ee_link = base_link``)
+                pose in robot frame. NOTE: cuRobo's FK / IK are both wrist-
+                anchored, so callers MUST convert link6 → wrist upstream
+                (``link6 @ link6_to_wrist``) before passing here. Mixing
+                link6 and wrist frames in this function silently introduces
+                an offset of ``link6_to_wrist`` translation (~3.5cm for
+                inspire_left).
+            hold_vec_weight: 6-vec ``[rx, ry, rz, x, y, z]`` — 1 = hold to
+                the trajectory's initial value, 0 = free. E.g. ``[1,1,1,1,1,0]``
+                for a pure +z lift, ``[0,0,0,0,0,1]`` to translate xy while
+                holding z.
+            scene_cfg: optional; if given, rebuilds world. If None, uses
+                cached world from the previous call.
+            include_obj_obstacle: if False, drops the target mesh from the
+                world (e.g. obj is held in hand and shouldn't self-collide).
+
+        Returns interpolated traj ``(T, dof)`` or ``None`` on failure.
+        """
+        # Optional snapshot dump for offline reproduction.
+        if debug_dump_dir is not None:
+            import time as _time, json as _json
+            os.makedirs(debug_dump_dir, exist_ok=True)
+            stem = str(int(_time.time() * 1000))
+            np.savez(
+                os.path.join(debug_dump_dir, f"{stem}.npz"),
+                start_full_qpos=np.asarray(start_full_qpos),
+                target_wrist_pose=np.asarray(target_wrist_pose),
+                hold_vec_weight=np.asarray(hold_vec_weight),
+                include_obj_obstacle=np.asarray(include_obj_obstacle),
+            )
+            if scene_cfg is not None:
+                with open(os.path.join(debug_dump_dir, f"{stem}_scene.json"), "w") as _f:
+                    _json.dump(scene_cfg, _f, indent=2, default=str)
+            print(f"    [plan_pose_constrained] snapshot → "
+                  f"{debug_dump_dir}/{stem}.npz")
+
+        if scene_cfg is not None:
+            world_cfg = _to_curobo_world(scene_cfg)
+            if not include_obj_obstacle:
+                world_cfg = dict(world_cfg)
+                world_cfg["mesh"] = {}
+            if self._motion_gen is None:
+                self._init_motion_gen(world_cfg)
+            elif self._world_structure_changed(world_cfg):
+                self._update_world(world_cfg)
+            else:
+                self._update_target_pose_only(world_cfg)
+            self._cached_world = world_cfg
+            # Also (re)init / update ik_solver with the same no-obj world.
+            if self._ik_solver is None:
+                self._init_ik_solver(world_cfg)
+            else:
+                self._ik_solver.update_world(WorldConfig.from_dict(world_cfg))
+        elif self._motion_gen is None:
+            raise RuntimeError(
+                "plan_pose_constrained: motion_gen not initialized; "
+                "pass scene_cfg on first call."
+            )
+        else:
+            # No scene_cfg given but motion_gen already initialized.
+            # Cached world still has the target mesh as obstacle, which is
+            # wrong when the obj is held in hand (start state collides with
+            # obj). Rebuild a no-obj world from cached.
+            cached_no_obj = dict(self._cached_world)
+            cached_no_obj["mesh"] = {} if not include_obj_obstacle else self._cached_world.get("mesh", {})
+            if cached_no_obj != self._cached_world:
+                self._update_world(cached_no_obj)
+                self._cached_world = cached_no_obj
+
+        from scipy.spatial.transform import Rotation as _R
+        device = self._tensor_args.device
+
+        start = JointState.from_position(
+            torch.tensor(start_full_qpos, dtype=torch.float32,
+                         device=device).unsqueeze(0)
+        )
+
+        # Compute cuRobo's own FK for the start state so we can project
+        # held components of the goal pose onto the start values exactly.
+        kin_state = self._motion_gen.kinematics.get_state(start.position)
+        start_pos = kin_state.ee_position[0].detach().cpu().numpy()        # (3,)
+        start_quat_wxyz = kin_state.ee_quaternion[0].detach().cpu().numpy() # (4,) wxyz
+
+        goal_pos = np.array(target_wrist_pose[:3, 3], dtype=np.float32).copy()
+        goal_R = np.array(target_wrist_pose[:3, :3], dtype=np.float32).copy()
+
+        # Project HELD position axes onto start FK.
+        for i, comp in enumerate([3, 4, 5]):   # x, y, z
+            if hold_vec_weight[comp]:
+                goal_pos[i] = float(start_pos[i])
+        # Project HELD orientation. Full-hold only (all three rotation axes).
+        if hold_vec_weight[0] and hold_vec_weight[1] and hold_vec_weight[2]:
+            goal_R = _R.from_quat(
+                [start_quat_wxyz[1], start_quat_wxyz[2],
+                 start_quat_wxyz[3], start_quat_wxyz[0]]
+            ).as_matrix().astype(np.float32)
+
+        quat_xyzw = _R.from_matrix(goal_R).as_quat()
+        quat_wxyz = np.array(
+            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]],
+            dtype=np.float32,
+        )
+        goal_pose = Pose(
+            position=torch.tensor(goal_pos,
+                                   dtype=torch.float32, device=device).unsqueeze(0),
+            quaternion=torch.tensor(quat_wxyz,
+                                     dtype=torch.float32, device=device).unsqueeze(0),
+        )
+
+        # cuRobo PoseCostMetric API consistently IK_FAIL'd for our cases
+        # (start joint 4 wrap, etc). Skipped. Approximate the hold via:
+        #  - goal pose held axes projected onto start FK (above),
+        #  - IK biased with start_qpos as both seed_config and retract,
+        #  - MAX_IK_DELTA reject for far-branch IK solutions,
+        #  - plan_single_js joint interp between near-equal qpos.
+        if self._ik_solver is None:
+            raise RuntimeError(
+                "plan_pose_constrained: ik_solver not initialized; "
+                "call plan() or solve_ik() once first."
+            )
+        start_arm = np.asarray(start_full_qpos[:6], dtype=np.float32)
+        start_full = np.asarray(start_full_qpos, dtype=np.float32)
+        # retract / seed use full-DOF (arm+hand) to match cuRobo IK's
+        # internal joint dimension.
+        retract_tensor = torch.tensor(
+            start_full, dtype=torch.float32, device=device
+        ).unsqueeze(0).repeat(self.BATCH_SIZE, 1)
+        # seed_config wants (batch, n_seeds_extra, dof). Match batch size.
+        seed_tensor = torch.tensor(
+            start_full, dtype=torch.float32, device=device
+        ).unsqueeze(0).unsqueeze(0).repeat(self.BATCH_SIZE, 1, 1)
+        #     → (BATCH_SIZE, 1, full_dof)
+        ik_pos = goal_pose.position.repeat(self.BATCH_SIZE, 1)
+        ik_quat = goal_pose.quaternion.repeat(self.BATCH_SIZE, 1)
+        ik_goal = Pose(position=ik_pos, quaternion=ik_quat)
+        ik_result = self._ik_solver.solve_batch(
+            ik_goal, retract_config=retract_tensor, seed_config=seed_tensor
+        )
+        succ_arr = ik_result.success.cpu().numpy().reshape(-1)
+        if not bool(succ_arr.any()):
+            print("    [plan_pose_constrained] IK to goal FAILED")
+            return None
+        q_sol = ik_result.solution.cpu().numpy()
+        if q_sol.ndim == 3:
+            q_sol = q_sol[:, 0, :]
+        # cuRobo IK can return many local minima; even with seed=start it
+        # sometimes picks a far branch (joint 4/6 wrap), making the
+        # subsequent plan_single_js trajectory swing wide through air.
+        # Pick the successful solution that's *closest* to start in joint
+        # space — that's the one whose trajopt path will be shortest.
+        candidates = []
+        for k in range(len(succ_arr)):
+            if not succ_arr[k]:
+                continue
+            cand = q_sol[k, :6].copy()
+            cand[3] = _snap_joint6(cand[3], float(start_arm[3]))
+            cand[5] = _snap_joint6(cand[5], float(start_arm[5]))
+            candidates.append(cand)
+        if not candidates:
+            print("    [plan_pose_constrained] IK to goal FAILED")
+            return None
+        deltas = [float(np.linalg.norm(c - start_arm)) for c in candidates]
+        best = int(np.argmin(deltas))
+        target_arm = candidates[best]
+        delta = deltas[best]
+        print(f"    [plan_pose_constrained] IK delta {delta:.2f} rad "
+              f"(best of {len(candidates)} feasible)")
+        target_full = np.concatenate([
+            target_arm.astype(np.float32),
+            np.asarray(start_full_qpos[6:], dtype=np.float32),
+        ])
+        ok, traj = self._refine_fingers(
+            np.asarray(start_full_qpos, dtype=np.float32), target_full
+        )
+        if not ok:
+            print("    [plan_pose_constrained] plan_single_js FAILED")
+            return None
+        return traj
+
+    def ik_pose_batch(self, target_link6_poses: np.ndarray) -> np.ndarray:
+        """Batched IK reachability check for ``N`` arbitrary link6 poses.
+
+        Requires ``self._ik_solver`` already to be initialized (call ``plan()``
+        or ``solve_ik()`` for the current scene at least once first; world
+        update follows that solver's cached state).
+
+        Args:
+            target_link6_poses: ``(N, 4, 4)`` link6 poses in robot frame.
+
+        Returns:
+            ``(N,)`` bool array — True where IK succeeded.
+        """
+        if self._ik_solver is None:
+            raise RuntimeError(
+                "ik_pose_batch: _ik_solver not initialized. "
+                "Call planner.plan() or planner.solve_ik() first."
+            )
+        from scipy.spatial.transform import Rotation as _R
+        device = self._tensor_args.device
+        N = target_link6_poses.shape[0]
+        succ = np.zeros(N, dtype=bool)
+        for chunk_start in range(0, N, self.BATCH_SIZE):
+            chunk = target_link6_poses[chunk_start: chunk_start + self.BATCH_SIZE]
+            B = len(chunk)
+            if B < self.BATCH_SIZE:
+                pad = self.BATCH_SIZE - B
+                chunk = np.concatenate(
+                    [chunk, np.tile(chunk[:1], (pad, 1, 1))], axis=0)
+            positions = chunk[:, :3, 3].astype(np.float32)
+            quats_xyzw = _R.from_matrix(chunk[:, :3, :3]).as_quat()
+            quats_wxyz = np.concatenate(
+                [quats_xyzw[:, 3:4], quats_xyzw[:, :3]], axis=1
+            ).astype(np.float32)
+            goal = Pose(
+                position=torch.tensor(positions, dtype=torch.float32, device=device),
+                quaternion=torch.tensor(quats_wxyz, dtype=torch.float32, device=device),
+            )
+            retract = torch.tensor(
+                self._init_state, dtype=torch.float32, device=device
+            ).unsqueeze(0).repeat(self.BATCH_SIZE, 1)
+            result = self._ik_solver.solve_batch(goal, retract_config=retract)
+            succ_chunk = result.success.cpu().numpy().reshape(-1)[:B]
+            succ[chunk_start: chunk_start + B] = succ_chunk
+        return succ
+
     def plan_js_to_init(self, scene_cfg: dict,
                         start_arm_qpos: np.ndarray,
                         start_hand_qpos: Optional[np.ndarray] = None,
@@ -1000,7 +1316,7 @@ class GraspPlanner:
         if not result.success.item():
             if hasattr(result, 'status') and result.status is not None:
                 print(f"    [plan_single_js] status={result.status} (act_dist={self._collision_act_dist})")
-            # Ask cuRobo directly which constraint each state violates.
+# Ask cuRobo directly which constraint each state violates.
             try:
                 jl = self._motion_gen.kinematics.get_joint_limits()
                 jl_lo = jl.position[0].cpu().numpy()
@@ -1385,20 +1701,51 @@ class GraspPlanner:
 
     def get_candidates(self, scene_cfg: dict, obj_name: str, grasp_version: str,
                         success_only: bool = False, skip_done: bool = False, hand: str = "allegro",
-                        scene_id: Optional[str] = None):
+                        scene_id: Optional[str] = None, run_ik: bool = False,
+                        cyl_axis_local: Optional[np.ndarray] = None,
+                        cyl_yaw_grid: Optional[np.ndarray] = None,
+                        scene_type_filter: Optional[str] = None,
+                        skip_scenes_with_success: bool = False,
+                        tabletop_pose_stem: Optional[str] = None,
+                        candidate_order: Optional[list] = None):
         """
         Return all grasp candidates with collision filter applied (no motion planning).
 
-        Returns:
+        Args:
+            run_ik: if True, also IK-solve each non-filtered candidate so the
+                    caller can distinguish IK-failed from filtered-out from
+                    fully-valid. Returns ``ik_failed`` mask as 5th value when
+                    set; otherwise returns the original 4-tuple.
+
+        Returns (4-tuple by default, 5-tuple if run_ik=True):
             wrist_se3  (N, 4, 4)
             pregrasp   (N, 16)
             grasp_pose (N, 16)
-            collision  (N,) bool  — True if filtered out (collision OR backward)
+            filtered   (N,) bool — collision OR backward filtered
+            ik_failed  (N,) bool — passed filter but IK couldn't reach
+                                   (only when run_ik=True)
         """
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, _ = load_candidate(obj_name, obj_pose, grasp_version,
-                                                         skip_done=skip_done, success_only=success_only, hand=hand,
-                                                         scene_id=scene_id)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(
+            obj_name, obj_pose, grasp_version,
+            skip_done=skip_done, success_only=success_only, hand=hand,
+            scene_id=scene_id, scene_type_filter=scene_type_filter,
+            skip_scenes_with_success=skip_scenes_with_success,
+            tabletop_pose_stem=tabletop_pose_stem,
+            candidate_order=candidate_order)
+        # Apply cyl expansion so the viewer sees the same candidate pool the
+        # planner actually IKs against (otherwise "valid=N" mismatches).
+        wrist_se3, pregrasp, grasp, _, scene_info = _expand_candidates_cyl(
+            wrist_se3, pregrasp, grasp, None, scene_info,
+            obj_pose, cyl_axis_local, cyl_yaw_grid)
+
+        # Early return if no candidates (collision check would crash on empty).
+        if len(wrist_se3) == 0:
+            print(f"[planner] get_candidates: no candidates loaded (filters too tight)")
+            empty_filtered = np.zeros(0, dtype=bool)
+            if run_ik:
+                return wrist_se3, pregrasp, grasp, empty_filtered, empty_filtered
+            return wrist_se3, pregrasp, grasp, empty_filtered
 
         world_cfg = _to_curobo_world(scene_cfg)
         if self._motion_gen is None:
@@ -1410,7 +1757,61 @@ class GraspPlanner:
         backward  = np.zeros(len(wrist_se3), dtype=bool)
         filtered  = collision | backward
         print(f"[planner] total={len(wrist_se3)}  collision={collision.sum()}  backward={backward.sum()}  valid={(~filtered).sum()}")
-        return wrist_se3, pregrasp, grasp, filtered
+
+        if not run_ik:
+            return wrist_se3, pregrasp, grasp, filtered
+
+        # Also IK-check the non-filtered candidates — BOTH the grasp pose AND
+        # the grasp+5cm lift pose (mirrors planner.plan()'s funnel). A candidate
+        # only counts as "valid" if it passes both, otherwise viewer shows it
+        # yellow (IK_FAIL).
+        ik_failed = np.zeros(len(wrist_se3), dtype=bool)
+        valid_idx = np.where(~filtered)[0]
+        if len(valid_idx) > 0:
+            world_no_target = dict(world_cfg)
+            world_no_target["mesh"] = {}
+            if self._ik_solver is None:
+                self._init_ik_solver(world_no_target)
+            else:
+                self._ik_solver.update_world(WorldConfig.from_dict(world_no_target))
+
+            def _run_ik(poses):
+                """Returns success bool array of length len(poses)."""
+                out = np.zeros(len(poses), dtype=bool)
+                for cs in range(0, len(poses), self.BATCH_SIZE):
+                    chunk = poses[cs : cs + self.BATCH_SIZE]
+                    B = len(chunk)
+                    if B < self.BATCH_SIZE:
+                        pad = self.BATCH_SIZE - B
+                        chunk = np.concatenate(
+                            [chunk, np.tile(chunk[:1], (pad, 1, 1))], axis=0)
+                    goal = _to_curobo_pose(chunk, self._tensor_args.device)
+                    retract = torch.tensor(
+                        self._init_state, dtype=torch.float32,
+                        device=self._tensor_args.device,
+                    ).unsqueeze(0).repeat(self.BATCH_SIZE, 1)
+                    r = self._ik_solver.solve_batch(goal, retract_config=retract)
+                    succ = r.success.cpu().numpy()
+                    if succ.ndim > 1:
+                        succ = succ.reshape(-1)
+                    out[cs : cs + B] = succ[:B]
+                return out
+
+            # Grasp pose IK
+            grasp_succ = _run_ik(wrist_se3[valid_idx])
+            # Lift pose IK (z + 5cm, matches planner.plan() lift check)
+            lift_poses = wrist_se3[valid_idx].copy()
+            lift_poses[:, 2, 3] += 0.05
+            lift_succ = _run_ik(lift_poses)
+            for j, idx in enumerate(valid_idx):
+                if not (grasp_succ[j] and lift_succ[j]):
+                    ik_failed[idx] = True
+            n_grasp_fail = int((~grasp_succ).sum())
+            n_lift_fail = int((grasp_succ & ~lift_succ).sum())
+            print(f"[planner] IK-fail among valid: "
+                  f"{int(ik_failed.sum())}/{len(valid_idx)} "
+                  f"(grasp_fail={n_grasp_fail}, lift_fail_only={n_lift_fail})")
+        return wrist_se3, pregrasp, grasp, filtered, ik_failed
 
     def plan_all(self, scene_cfg: dict, obj_name: str, grasp_version: str,
                  stop_on_first: bool = True, hand: str = "allegro"):
@@ -1509,7 +1910,24 @@ class GraspPlanner:
              mode: str = "batch", seed: Optional[int] = None,
              skip_done: bool = True, success_only: bool = False,
              hand: str = "allegro",
-             scene_id: Optional[str] = None) -> PlanResult:
+             scene_id: Optional[str] = None,
+             openpose_pose_stem: Optional[str] = None,
+             cyl_axis_local: Optional[np.ndarray] = None,
+             cyl_yaw_grid: Optional[np.ndarray] = None,
+             scene_type_filter: Optional[str] = None,
+             skip_scenes_with_success: bool = False,
+             tabletop_pose_stem: Optional[str] = None,
+             candidate_order: Optional[list] = None,
+             priority_map: Optional[dict] = None) -> PlanResult:
+        """If ``openpose_pose_stem`` is given (e.g. ``"002"``), loads
+        ``openpose_{stem}.npy`` per candidate and uses it as the approach-end
+        finger config (instead of pregrasp). Candidates without that openpose
+        file fall back to pregrasp.
+
+        If ``cyl_axis_local`` + ``cyl_yaw_grid`` are given, expand each
+        candidate by N_cyl rotations around the object's symmetry axis
+        (multiplies candidate pool for cylinder objects).
+        """
         import time as _time
 
         if seed is not None:
@@ -1519,7 +1937,33 @@ class GraspPlanner:
         # 1. Load candidates
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, skip_done=skip_done, success_only=success_only, hand=hand, scene_id=scene_id)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(
+            obj_name, obj_pose, grasp_version,
+            skip_done=skip_done, success_only=success_only,
+            hand=hand, scene_id=scene_id,
+            scene_type_filter=scene_type_filter,
+            skip_scenes_with_success=skip_scenes_with_success,
+            tabletop_pose_stem=tabletop_pose_stem,
+            candidate_order=candidate_order)
+        if openpose_pose_stem is not None:
+            from autodex.utils.path import load_openpose_for_candidates
+            openpose_list = load_openpose_for_candidates(
+                obj_name, scene_info, hand, grasp_version, openpose_pose_stem)
+        else:
+            openpose_list = [None] * len(pregrasp)
+        # Expand candidates by cyl_yaw (cylinder objects only). Pregrasp/grasp/
+        # openpose finger configs are replicated since the cylinder is invariant
+        # under symmetry-axis rotation.
+        wrist_se3, pregrasp, grasp, openpose_list, scene_info = (
+            _expand_candidates_cyl(wrist_se3, pregrasp, grasp, openpose_list,
+                                    scene_info, obj_pose,
+                                    cyl_axis_local, cyl_yaw_grid))
+        # Use openpose for the approach-end finger config; fall back to
+        # pregrasp where openpose is missing.
+        approach_fingers = np.array([
+            (op if op is not None else pg)
+            for op, pg in zip(openpose_list, pregrasp)
+        ])
         t_load = _time.time() - t0
 
         if len(wrist_se3) == 0:
@@ -1605,15 +2049,25 @@ class GraspPlanner:
                 q_sol = q_sol[:, 0, :]
             for i, idx in enumerate(chunk_idx):
                 if succ[i]:
-                    ik_success[idx] = True
                     arm_q = q_sol[i, :6].copy()
+                    arm_q[3] = _snap_joint6(arm_q[3], self._init_state[3])
                     arm_q[5] = _snap_joint6(arm_q[5], self._init_state[5])
+                    # Reject IK whose any arm joint sits outside ±π — those
+                    # extreme configs are on a far IK branch where the
+                    # constrained lift (PoseCostMetric hold xy+rotation) has
+                    # no near-start solution. plan_pose_constrained reliably
+                    # hits IK_FAIL for them, dropping us to cartesian.
+                    if np.any(np.abs(arm_q) > np.pi):
+                        continue
+                    ik_success[idx] = True
                     ik_qpos[idx, :6] = arm_q
-                    ik_qpos[idx, 6:] = pregrasp[idx]
+                    ik_qpos[idx, 6:] = approach_fingers[idx]
         t_ik = _time.time() - t0
 
-        # Lift IK check: verify z+12cm pose is reachable (avoids joint limit errors during lift)
-        LIFT_HEIGHT = 0.10
+        # Lift IK check: verify the wrist can rise a bit (avoids candidates
+        # already at joint limit). Only checks small +z — exact lift height
+        # is handled by executor; we just need monotonic-up to be possible.
+        LIFT_HEIGHT = 0.03
         ik_valid_pre = np.where(ik_success)[0]
         if len(ik_valid_pre) > 0:
             lift_poses = wrist_se3[ik_valid_pre].copy()
@@ -1647,9 +2101,17 @@ class GraspPlanner:
             return _fail_result({**base_timing, "plan_single_js_s": 0.0})
 
         # 5. plan_single_js for each IK-reachable candidate until success.
-        # Shuffle order so repeated calls explore different candidates
-        # instead of always hitting the lowest-index candidate first.
-        np.random.shuffle(ik_valid)
+        # Ordering priority:
+        #   priority_map > candidate_order > random shuffle.
+        # priority_map: dict[(type, sid, gid) → score]. Sort ik_valid desc
+        # by score so the IK-passing candidate with highest coverage tries first.
+        if priority_map is not None:
+            def _score(idx):
+                key = tuple(str(x) for x in scene_info[idx])
+                return -priority_map.get(key, 0)   # negative for desc sort
+            ik_valid = np.array(sorted(ik_valid, key=_score), dtype=ik_valid.dtype)
+        elif candidate_order is None:
+            np.random.shuffle(ik_valid)
         t0 = _time.time()
         n_attempts = 0
         for idx in ik_valid:
@@ -1668,6 +2130,7 @@ class GraspPlanner:
                     timing={**base_timing, "plan_single_js_s": round(t_plan, 3),
                             "n_plan_attempts": n_attempts,
                             "candidate_idx": int(idx)},
+                    openpose_pose=openpose_list[idx],
                 )
 
         t_plan = _time.time() - t0

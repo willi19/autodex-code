@@ -56,7 +56,7 @@ from paradex.io.camera_system.timestamp_monitor import TimestampMonitor
 from paradex.utils.system import network_info, get_pc_ip, get_camera_list
 from paradex.calibration.utils import save_current_camparam, save_current_C2R, load_c2r
 
-from autodex.utils.path import project_dir, obj_path
+from autodex.utils.path import project_dir, obj_path, load_openpose_for_candidates
 from autodex.utils.conversion import cart2se3
 from autodex.planner import GraspPlanner
 from autodex.planner.planner import PlanResult, _to_curobo_world
@@ -66,7 +66,8 @@ from autodex.executor.real import RealExecutor
 from autodex.perception.init_orchestrator import InitOrchestrator
 from autodex.perception.snapshot_orchestrator import SnapshotOrchestrator
 
-from src.execution.scene_cfg import pose_world_to_scene_cfg, CYLINDER_OBJECTS
+from src.execution.scene_cfg import pose_world_to_scene_cfg
+from autodex.utils.symmetry import get_cyl_axis_local
 from src.execution.run_auto import (
     DEFAULT_PC_LIST, ASSETS_BASE, MESH_BASE, CAM_PARAM_ROOT, _load_calib,
 )
@@ -104,7 +105,7 @@ logging.getLogger("curobo").setLevel(logging.WARNING)
 # ── Hardcoded defaults (rarely changed across runs) ──────────────────────────
 GRASP_VERSION = "table_only"
 LIFT_HEIGHT_M = 0.25         # +25cm above grasp pose
-RELEASE_HEIGHT_M = 0.15      # release while object hovers ~15cm above grasp z
+RELEASE_HEIGHT_M = 0.25      # release at same height as lift (no descent)
 TABLE_SURFACE_Z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2  # 0.039
 EXP_NAME = "reset_test/reorient_drop"
 SCENE = "table"
@@ -630,13 +631,46 @@ def main():
                     planner._motion_gen.reset_seed()
 
                 # solve_ik (retract + lift IK check now matches plan()).
+                # Cylinder freedom for approach IK — expand candidates by
+                # cyl_yaw rotations around the object's symmetry axis when the
+                # axis is not (nearly) world-vertical. For a lying pepsi this
+                # turns 30 candidates → 30×8 = 240 candidates → much higher
+                # chance of finding an IK-feasible grasp from current arm INIT.
+                start_cyl_axis = get_cyl_axis_local(args.obj)
+                if start_cyl_axis is not None:
+                    _pose_robot_start = np.linalg.inv(c2r) @ pose_world
+                    _axis_world_start = _pose_robot_start[:3, :3] @ start_cyl_axis
+                    if abs(_axis_world_start[2]) >= 0.95:
+                        start_cyl_grid = None   # standing — degenerate
+                    else:
+                        start_cyl_grid = np.linspace(
+                            0, 2 * np.pi, 8, endpoint=False)
+                else:
+                    start_cyl_grid = None
                 ik_res = planner.solve_ik(
                     scene_cfg, args.obj, GRASP_VERSION,
-                    hand=args.hand, scene_id=start_scene_id)
+                    hand=args.hand, scene_id=start_scene_id,
+                    cyl_axis_local=start_cyl_axis,
+                    cyl_yaw_grid=start_cyl_grid)
                 ik_ok = list(np.where(ik_res["ik_success"])[0])
                 np.random.shuffle(ik_ok)
                 n_grasp_total = ik_res["n_total"]
                 planner._ik_solver = None  # rebuild for next plan_obj_placement
+                # Load openpose (wider-open finger config) for each candidate,
+                # keyed by the observed start tabletop pose. Used for the
+                # approach IK goal so the hand is more open during approach.
+                openpose_pose_stem = (
+                    tb_before["filename"].replace(".npy", "")
+                    if tb_before is not None else None)
+                if openpose_pose_stem is not None:
+                    openpose_list = load_openpose_for_candidates(
+                        args.obj, ik_res["scene_info"], args.hand,
+                        GRASP_VERSION, openpose_pose_stem)
+                    n_op = sum(1 for op in openpose_list if op is not None)
+                    print(f"    openpose: {n_op}/{n_grasp_total} candidates "
+                          f"have openpose_{openpose_pose_stem}.npy")
+                else:
+                    openpose_list = [None] * n_grasp_total
                 print(f"    grasp IK: {len(ik_ok)}/{n_grasp_total} feasible")
                 if len(ik_ok) == 0:
                     rec["progress"]["plan"] = (
@@ -667,18 +701,28 @@ def main():
                       f"LIFT_HEIGHT_M={LIFT_HEIGHT_M:.4f})")
                 scene_lift_pre = {"mesh": {},
                                   "cuboid": dict(scene_cfg["cuboid"])}
-                X_GRID_PRE = np.arange(0.35, 0.55, 0.05)
+                # Target x range fixed to [0.40, 0.45] — placing zone in front
+                # of robot. If IK infeasible there, fall back to in-place
+                # release (skip reorient+descent stages).
+                X_GRID_PRE = np.array([0.40, 0.45])
                 YAW_GRID_PRE = np.linspace(0, 2 * np.pi, 8, endpoint=False)
-                # Cylinder-symmetric objects: free DoF about the object's
-                # local +Y (symmetry) axis applied IN OBJECT FRAME. Final
-                # target rotation is Rz(world_yaw) @ R_target @ Ry_local(cyl).
-                if args.obj in CYLINDER_OBJECTS:
-                    CYL_YAW_GRID_PRE = np.linspace(
-                        0, 2 * np.pi, 8, endpoint=False)
-                    CYL_AXIS_LOCAL = np.array([0.0, 1.0, 0.0])
-                else:
-                    CYL_YAW_GRID_PRE = None
-                    CYL_AXIS_LOCAL = None
+                # Continuous-revolute objects: free DoF about the object's
+                # local symmetry axis (from src/scene_generation/symmetry.json,
+                # via get_cyl_axis_local), applied IN OBJECT FRAME. Final
+                # target rotation is Rz(world_yaw) @ R_target @ R_local(cyl).
+                # If the symmetry axis ends up (nearly) world-vertical at the
+                # target, R_local(axis, cyl) is degenerate with the world yaw
+                # — collapse cyl grid to a single point to avoid wasted IK.
+                from autodex.utils.symmetry import get_cyl_yaw_grid
+                CYL_AXIS_LOCAL = get_cyl_axis_local(args.obj)
+                CYL_YAW_GRID_PRE = get_cyl_yaw_grid(args.obj)
+                # Standing case (axis ≈ world z) collapses cyl with world yaw
+                # — keep single-point grid for placement IK if so.
+                if (CYL_AXIS_LOCAL is not None
+                        and CYL_YAW_GRID_PRE is not None
+                        and abs((R_target_obj_world_pre @ CYL_AXIS_LOCAL)[2])
+                            >= 0.95):
+                    CYL_YAW_GRID_PRE = np.array([0.0])
 
                 # Init motion_gen with obj-world for approach planning.
                 world_approach = _to_curobo_world(scene_cfg)
@@ -728,12 +772,16 @@ def main():
 
                     # (a) approach — restore obj-world if a previous cand's
                     # plan_wrist_reorient/plan_obj_placement switched to
-                    # table-only.
+                    # table-only. Use openpose (wider hand) for the approach-
+                    # end finger config if available; fall back to pregrasp.
                     if planner._world_structure_changed(world_approach):
                         planner._update_world(world_approach)
                         planner._cached_world = world_approach
+                    approach_goal = ik_res["ik_qpos"][cand_idx].copy()
+                    if openpose_list[cand_idx] is not None:
+                        approach_goal[6:] = openpose_list[cand_idx]
                     ok_ap, approach_traj_cand = planner._refine_fingers(
-                        planner._init_state, ik_res["ik_qpos"][cand_idx])
+                        planner._init_state, approach_goal)
                     if not ok_ap:
                         n_approach_fail += 1
                         cand_log.append({
@@ -798,7 +846,9 @@ def main():
                     descent_info_cand = None
                     last_reorient_fail = None
                     last_descent_fail = None
-                    for sc in sorted_cands:
+                    print(f"  [dbg] cand#{cand_idx}: inner sc loop "
+                          f"len(sorted_cands)={len(sorted_cands)}")
+                    for sc_i, sc in enumerate(sorted_cands):
                         sx, syaw, scyl = sc["x"], sc["yaw"], sc["cyl_yaw"]
                         x1 = np.array([sx]); y1 = np.array([syaw])
                         cyl1 = (np.array([scyl])
@@ -812,6 +862,11 @@ def main():
                             cyl_yaw_grid=cyl1,
                             cyl_axis_local=CYL_AXIS_LOCAL,
                             skip_plan=False)
+                        print(f"    [dbg] sc#{sc_i} x={sx:.3f} yaw={syaw:.3f} "
+                              f"reorient={'OK' if r_traj is not None else 'FAIL'} "
+                              f"reason={r_info.get('reason')} "
+                              f"n_feas={r_info.get('n_feasible')} "
+                              f"n_attempts={r_info.get('n_plan_attempts')}")
                         if r_traj is None:
                             last_reorient_fail = (sc, r_info)
                             continue
@@ -825,8 +880,44 @@ def main():
                             cyl_yaw_grid=cyl1,
                             cyl_axis_local=CYL_AXIS_LOCAL,
                             skip_plan=False)
+                        print(f"    [dbg] sc#{sc_i} descent="
+                              f"{'OK' if d_traj is not None else 'FAIL'} "
+                              f"reason={d_info.get('reason')} "
+                              f"n_feas={d_info.get('n_feasible')} "
+                              f"n_attempts={d_info.get('n_plan_attempts')}")
                         if d_traj is None:
-                            last_descent_fail = (sc, d_info)
+                            last_descent_fail = (sc, d_info,
+                                                 cur_qpos_descent.copy())
+                            # Per-sc viz entry: reorient OK + descent FAIL.
+                            # Use reorient-end qpos so viz shows the IK that
+                            # succeeded just before descent failed.
+                            cy_p, sy_p = (np.cos(syaw), np.sin(syaw))
+                            Rz_p = np.array([[cy_p, -sy_p, 0.0],
+                                             [sy_p,  cy_p, 0.0],
+                                             [0.0,   0.0,  1.0]])
+                            if CYL_AXIS_LOCAL is not None:
+                                R_cyl_p = R.from_rotvec(
+                                    CYL_AXIS_LOCAL * float(scyl)
+                                ).as_matrix()
+                            else:
+                                R_cyl_p = np.eye(3)
+                            T_obj_descent_p = np.eye(4)
+                            T_obj_descent_p[:3, :3] = (
+                                Rz_p @ R_target_obj_world_pre @ R_cyl_p)
+                            T_obj_descent_p[0, 3] = float(sx)
+                            T_obj_descent_p[1, 3] = float(
+                                obj_target_pos_descent[1])
+                            T_obj_descent_p[2, 3] = float(
+                                obj_target_pos_descent[2])
+                            cand_log.append({
+                                "cand_idx": cand_idx,
+                                "stage": f"descent_sc{sc_i}",
+                                "reason": d_info.get("reason"),
+                                "T_wrist_target": d_info.get("T_wrist_target"),
+                                "T_obj_at_fail": T_obj_descent_p,
+                                "last_qpos": cur_qpos_descent.copy(),
+                                "grasp_qpos": grasp_cand,
+                            })
                             continue
                         reorient_traj_cand = r_traj
                         descent_traj_cand = d_traj
@@ -839,34 +930,7 @@ def main():
                         # latest fail stage seen.
                         if last_descent_fail is not None:
                             n_descent_fail += 1
-                            sc, info_d = last_descent_fail
-                            chosen_yaw_d = sc["yaw"]
-                            cy_d, sy_d = np.cos(chosen_yaw_d), np.sin(chosen_yaw_d)
-                            Rz_d = np.array([[cy_d, -sy_d, 0.0],
-                                             [sy_d,  cy_d, 0.0],
-                                             [0.0,   0.0,  1.0]])
-                            if CYL_AXIS_LOCAL is not None:
-                                R_cyl_d = R.from_rotvec(
-                                    CYL_AXIS_LOCAL * float(sc["cyl_yaw"])
-                                ).as_matrix()
-                            else:
-                                R_cyl_d = np.eye(3)
-                            T_obj_reorient_end = np.eye(4)
-                            T_obj_reorient_end[:3, :3] = (
-                                Rz_d @ R_target_obj_world_pre @ R_cyl_d)
-                            T_obj_reorient_end[0, 3] = float(sc["x"])
-                            T_obj_reorient_end[1, 3] = 0.0
-                            T_obj_reorient_end[2, 3] = (
-                                float(target_tabletop_robot[2, 3])
-                                + TABLE_SURFACE_Z + LIFT_HEIGHT_M)
-                            cand_log.append({
-                                "cand_idx": cand_idx, "stage": "descent",
-                                "reason": info_d.get("reason"),
-                                "T_wrist_target": info_d.get("T_wrist_target"),
-                                "T_obj_at_fail": T_obj_reorient_end,
-                                "last_qpos": cur_qpos_reorient.copy(),
-                                "grasp_qpos": grasp_cand,
-                            })
+                            # Per-sc entries already appended inside sc loop.
                             print(f"  cand#{cand_idx}: descent FAIL on every "
                                   f"reorient-feasible (x, yaw) "
                                   f"({len(sorted_cands)} tried)")
@@ -927,6 +991,7 @@ def main():
                     T_wrist_descent_chosen = descent_info_cand.get("T_wrist_target")
                     grasp_chosen = grasp_cand
                     pregrasp_chosen = pregrasp_cand
+                    openpose_chosen = openpose_list[cand_idx]
                     scene_info_chosen = ik_res["scene_info"][cand_idx]
                     result = PlanResult(
                         success=True, traj=approach_traj_cand,
@@ -934,6 +999,7 @@ def main():
                         pregrasp_pose=pregrasp_cand,
                         grasp_pose=grasp_cand,
                         scene_info=scene_info_chosen,
+                        openpose_pose=openpose_chosen,
                         timing={"candidate_idx": cand_idx,
                                 "n_approach_fail": n_approach_fail,
                                 "n_lift_fail": n_lift_fail,
@@ -992,6 +1058,14 @@ def main():
                 np.save(cdir / "plan" / "wrist_se3.npy", result.wrist_se3)
                 np.save(cdir / "plan" / "pregrasp_pose.npy", result.pregrasp_pose)
                 np.save(cdir / "plan" / "grasp_pose.npy", result.grasp_pose)
+                np.save(cdir / "plan" / "lift_traj.npy", lift_traj_chosen)
+                np.save(cdir / "plan" / "reorient_traj.npy", reorient_traj_chosen)
+                np.save(cdir / "plan" / "descent_traj.npy", descent_traj_chosen)
+                np.save(cdir / "plan" / "T_obj_in_wrist.npy", T_obj_in_wrist_chosen)
+                np.save(cdir / "plan" / "T_wrist_lift.npy", T_wrist_lift_chosen)
+                if T_wrist_descent_chosen is not None:
+                    np.save(cdir / "plan" / "T_wrist_descent.npy",
+                            T_wrist_descent_chosen)
 
                 if args.viz:
                     # Phase-by-phase viser viz (mirrors view_reorient.py) —
@@ -1044,7 +1118,7 @@ def main():
                                                          axis=1)
                         xarm_init = planner._init_state[:6].astype(np.float32)
                         clear_view = xarm_init.copy()
-                        clear_view[0] -= np.deg2rad(60.0)
+                        clear_view[0] -= np.deg2rad(40.0)
                         cur_arm = descent_traj_chosen[-1, :6].astype(np.float32).copy()
                         joint_order = ([1, 2, 5, 0, 3, 4]
                                        if cur_arm[1] >= xarm_init[1]
@@ -1319,13 +1393,14 @@ def main():
                     rec["timing"]["release_s"] = round(time.time() - t0, 2)
                     rec["progress"]["release"] = "ok"
 
-                # 11. Reset_fallback: open hand to hand_init + sequential arm retract.
+                # 11. Reset_hybrid: slow pregrasp→openpose interp internally,
+                #     then sequential [1,2,0] + cuRobo wrist(3,4,5).
                 t1 = time.time()
                 try:
-                    fb_log = executor.reset_fallback(result)
+                    fb_log = executor.reset_hybrid(result, planner, scene_cfg)
                     rec["timing"]["retract_s"] = round(time.time() - t1, 2)
                     rec["reset"] = fb_log
-                    rec["progress"]["retract"] = "fallback_sequential"
+                    rec["progress"]["retract"] = "hybrid"
                     rec["states"] = executor.state_timestamps
                     print(f"    release={rec['timing'].get('release_s', '?')}s  "
                           f"retract={rec['timing']['retract_s']}s  "

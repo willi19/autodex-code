@@ -12,7 +12,7 @@ import transforms3d
 from scipy.spatial.transform import Rotation as R
 import shapely.geometry as geom
 
-from autodex.utils.path import obj_path
+from autodex.utils.path import obj_path, get_scene_dir
 from autodex.utils.conversion import cart2se3
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -323,7 +323,7 @@ def add_obb(parent_frame, obb_extents, obb_transform, axis_len):
 
 
 def get_scene_files(obj_name, scene_type):
-    scene_dir = os.path.join(obj_path, obj_name, "scene", scene_type)
+    scene_dir = get_scene_dir("allegro", obj_name, scene_type)
     if not os.path.isdir(scene_dir):
         return []
     return sorted(
@@ -460,7 +460,7 @@ def load_grid():
 
 def update_scene_types():
     obj_name = obj_dropdown.value
-    scene_root = os.path.join(obj_path, obj_name, "scene")
+    scene_root = get_scene_dir("allegro", obj_name)
     if os.path.isdir(scene_root):
         types = sorted(
             d for d in os.listdir(scene_root)
@@ -488,7 +488,7 @@ def _main():
 
     available_objects = sorted([
         d for d in os.listdir(obj_path)
-        if os.path.isdir(os.path.join(obj_path, d, "scene"))
+        if os.path.isdir(get_scene_dir("allegro", d))
     ])
     print(f"Found {len(available_objects)} objects with scenes")
 

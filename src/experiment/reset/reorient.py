@@ -73,7 +73,8 @@ from autodex.perception.snapshot_orchestrator import SnapshotOrchestrator
 
 from curobo.geom.types import WorldConfig
 
-from src.execution.scene_cfg import pose_world_to_scene_cfg, CYLINDER_OBJECTS
+from src.execution.scene_cfg import pose_world_to_scene_cfg
+from autodex.utils.symmetry import get_cyl_axis_local
 from src.execution.run_auto import (
     DEFAULT_PC_LIST, ASSETS_BASE, MESH_BASE, CAM_PARAM_ROOT, _load_calib,
 )
@@ -136,6 +137,116 @@ class _SoftSkip(Exception):
     """Perception/plan/lift/charuco failure: log the cycle and continue."""
 
 
+def _yaw_search_and_print_cmd(planner, scene_cfg, seeds, args, prev_n_ok=0):
+    """Search (x, yaw) over a grid for an obj pose that improves IK count.
+
+    Why x too: xarm6's joint 0 only rotates around vertical, so obj position
+    in xy reduces (under j0 freedom) to the radial distance — sweeping x
+    along y=0 explores that radius. Yaw is the obj's world-z rotation.
+
+    Returns ``(target_yaw_deg, target_x, n_ok)`` for the best pose whose
+    IK-feasible count STRICTLY exceeds ``prev_n_ok``. Prints the
+    ``rotate_obj_yaw.py`` command on success. Returns ``(None, None, prev_n_ok)``
+    if nothing improves.
+    """
+    from autodex.utils.conversion import cart2se3 as _cart2se3
+    from autodex.utils.conversion import se32cart as _se32cart
+    _obj_pose_now = _cart2se3(scene_cfg["mesh"]["target"]["pose"])
+    _orig_wrist = seeds["wrist_se3"]
+    _obj_inv = np.linalg.inv(_obj_pose_now)
+    _yaw_grid = np.deg2rad(np.arange(0, 360, 30))
+    _x_grid = np.arange(0.30, 0.70, 0.05)   # y fixed = 0 (j0 covers angle)
+    _found_yaw_deg = None
+    _found_x = None
+    _found_n_ok = prev_n_ok
+    for _x in _x_grid:
+        for _θ in _yaw_grid:
+            _c, _s = np.cos(_θ), np.sin(_θ)
+            _Rz4 = np.eye(4)
+            _Rz4[:3, :3] = np.array([[_c, -_s, 0], [_s, _c, 0], [0, 0, 1]])
+            _new_obj = _obj_pose_now.copy()
+            _new_obj[:3, :3] = _Rz4[:3, :3] @ _obj_pose_now[:3, :3]
+            _new_obj[0, 3] = float(_x)
+            _new_obj[1, 3] = 0.0
+            # _obj_pose_now[2,3] (z) preserved via .copy().
+            # Wrist follows the new obj rigidly:
+            #   T_wrist_new = T_obj_new @ inv(T_obj_now) @ T_wrist_now
+            _new_wrist = np.einsum("ij,jk,Nkl->Nil",
+                                   _new_obj, _obj_inv, _orig_wrist)
+            _rot_seeds = dict(seeds)
+            _rot_seeds["wrist_se3"] = _new_wrist
+            _rot_scene = dict(scene_cfg)
+            _rot_scene["mesh"] = dict(scene_cfg["mesh"])
+            _rot_scene["mesh"]["target"] = dict(scene_cfg["mesh"]["target"])
+            _rot_scene["mesh"]["target"]["pose"] = _se32cart(_new_obj).tolist()
+            try:
+                _r = _ik_check_seeds(planner, _rot_scene, _rot_seeds)
+                _n = int(_r["ik_success"].sum())
+            except Exception:
+                _n = 0
+            if _n > _found_n_ok:
+                _found_n_ok = _n
+                _found_yaw_deg = float(np.degrees(_θ))
+                _found_x = float(_x)
+                if _n == len(_orig_wrist):
+                    break
+        if _found_n_ok == len(_orig_wrist):
+            break
+    if _found_yaw_deg is not None:
+        # Verify approach plan_single_js succeeds at this (x, yaw) for at
+        # least one IK-feasible candidate. yaw_search only proves the GRASP
+        # IK reaches; the trajectory from INIT_STATE to grasp_qpos can still
+        # collide / hit joint limits. Re-run _ik_check_seeds at the best
+        # pose to recover IK qpos, then plan_single_js for each feasible
+        # candidate and keep the suggestion only if at least one passes.
+        from autodex.utils.conversion import se32cart as _se32cart_v
+        _θ_best = np.deg2rad(_found_yaw_deg)
+        _cb, _sb = np.cos(_θ_best), np.sin(_θ_best)
+        _Rz_best = np.array([[_cb, -_sb, 0], [_sb, _cb, 0], [0, 0, 1]])
+        _best_obj = _obj_pose_now.copy()
+        _best_obj[:3, :3] = _Rz_best @ _obj_pose_now[:3, :3]
+        _best_obj[0, 3] = float(_found_x); _best_obj[1, 3] = 0.0
+        _best_wrist = np.einsum("ij,jk,Nkl->Nil",
+                                 _best_obj, _obj_inv, _orig_wrist)
+        _best_seeds = dict(seeds)
+        _best_seeds["wrist_se3"] = _best_wrist
+        _best_scene = dict(scene_cfg)
+        _best_scene["mesh"] = dict(scene_cfg["mesh"])
+        _best_scene["mesh"]["target"] = dict(scene_cfg["mesh"]["target"])
+        _best_scene["mesh"]["target"]["pose"] = _se32cart_v(_best_obj).tolist()
+        _best_ik = _ik_check_seeds(planner, _best_scene, _best_seeds)
+        _ok_idx = np.where(_best_ik["ik_success"])[0]
+        approach_ok = False
+        for _ci in _ok_idx:
+            try:
+                _ok_ap, _ = planner._refine_fingers(
+                    planner._init_state, _best_ik["ik_qpos"][int(_ci)])
+            except Exception:
+                _ok_ap = False
+            if _ok_ap:
+                approach_ok = True
+                break
+        if approach_ok:
+            print(f"    [pose_search] move obj to (x={_found_x:.2f}, y=0) "
+                  f"+ rotate {_found_yaw_deg:.0f}° → "
+                  f"{_found_n_ok}/{len(_orig_wrist)} IK-feasible "
+                  f"(prev={prev_n_ok}, approach OK)")
+            print(f"    [run this]")
+            print(f"      python src/execution/rotate_obj_yaw.py "
+                  f"--obj {args.obj} --hand {args.hand} "
+                  f"--target_yaw_deg {_found_yaw_deg:.0f} "
+                  f"--target_x {_found_x:.2f}")
+        else:
+            print(f"    [pose_search] (x={_found_x:.2f}, yaw={_found_yaw_deg:.0f}°)"
+                  f" is IK-feasible but approach trajopt failed for all "
+                  f"{len(_ok_idx)} candidates — NOT suggesting.")
+            _found_yaw_deg = None  # suppress as if not found
+    else:
+        print(f"    [pose_search] no (x, yaw) in grid improves on "
+              f"prev={prev_n_ok}/{len(_orig_wrist)}")
+    return _found_yaw_deg, _found_x, _found_n_ok
+
+
 def _now() -> str:
     return datetime.datetime.now().isoformat()
 
@@ -158,8 +269,10 @@ def _pose_int_from_filename(filename: str) -> int:
     return int(filename.replace(".npy", ""))
 
 
-def _autoselect_h_cm(hand: str, obj: str) -> int | None:
-    """Pick the smallest ``reorient_{h_cm}`` folder available for (hand, obj)."""
+def _autoselect_h_cm(hand: str, obj: str, target_j: int | None = None) -> int | None:
+    """Pick the smallest ``reorient_{h_cm}`` folder that contains at least one
+    ``*_{target_j}`` cell. If ``target_j`` is None, fall back to the smallest
+    ``reorient_{h_cm}`` folder regardless of cell contents."""
     reset_root = Path(project_dir) / "candidates" / hand / "reset" / obj
     if not reset_root.exists():
         return None
@@ -168,9 +281,18 @@ def _autoselect_h_cm(hand: str, obj: str) -> int | None:
         if not p.is_dir() or not p.name.startswith("reorient_"):
             continue
         try:
-            cands.append((int(p.name.split("_", 1)[1]), p))
+            h = int(p.name.split("_", 1)[1])
         except ValueError:
             continue
+        if target_j is not None:
+            has_target = any(
+                c.is_dir() and c.name.endswith(f"_{target_j}")
+                and c.name.split("_", 1)[0].isdigit()
+                for c in p.iterdir()
+            )
+            if not has_target:
+                continue
+        cands.append((h, p))
     if not cands:
         return None
     return sorted(cands, key=lambda kv: kv[0])[0][0]
@@ -204,23 +326,52 @@ def _load_reset_seeds(hand: str, obj: str, h_cm: int, i_int: int, j_int: int,
     via ``T_wrist_world = T_obj_world @ wrist_se3_obj``. Returns ``None`` if
     the cell directory does not exist or has no grasp subfolders.
 
-    Output dict keys mirror ``GraspPlanner.solve_ik``'s candidate-related
-    fields: ``wrist_se3, pregrasp, grasp, scene_info, n_total``.
+    Also loads ``openpose_{i_int:03d}.npy`` (start-pose-matched openpose) and
+    ``openpose_{j_int:03d}.npy`` (target-pose-matched openpose) per grasp.
+
+    Output dict mirrors ``GraspPlanner.solve_ik``'s candidate-related
+    fields plus ``openpose_start`` and ``openpose_target``.
     """
     cell_dir = (Path(project_dir) / "candidates" / hand / "reset" / obj
                 / f"reorient_{h_cm}" / f"{i_int}_{j_int}")
     if not cell_dir.exists():
         return None
-    grasp_dirs = sorted(
-        [p for p in cell_dir.iterdir() if p.is_dir()],
-        key=lambda p: int(p.name),
-    )
-    if not grasp_dirs:
+    # Order by stats.json priority desc (Laplace-smoothed success rate),
+    # tie-break by numeric grasp_id asc — same scheme as
+    # table_only_grasp_order_by_stats. Falls back to numeric order if
+    # stats.json missing (read_grasp_stats returns (0, 0)).
+    from autodex.utils.coverage import read_grasp_stats, grasp_priority_score
+    # Drop dirs that lack the required candidate files (e.g. "pA_*" preview
+    # dirs that only ship openpose images).
+    raw_dirs = [p for p in cell_dir.iterdir()
+                if p.is_dir() and (p / "wrist_se3.npy").exists()]
+    if not raw_dirs:
         return None
+    def _name_key(p):
+        # Numeric names sort numerically; alphanumeric (e.g. "pA_15") fall
+        # back to lexicographic — placed after numeric to keep historic
+        # order for purely-numeric cells.
+        try:
+            return (0, int(p.name))
+        except ValueError:
+            return (1, p.name)
+    grasp_dirs = sorted(
+        raw_dirs,
+        key=lambda p: (
+            -grasp_priority_score(*read_grasp_stats(str(p))),
+            _name_key(p),
+        ),
+    )
     wrist_obj = np.stack([np.load(g / "wrist_se3.npy")     for g in grasp_dirs])
     pregrasp  = np.stack([np.load(g / "pregrasp_pose.npy") for g in grasp_dirs])
     grasp     = np.stack([np.load(g / "grasp_pose.npy")    for g in grasp_dirs])
-    # (N, 4, 4) — broadcasted (1, 4, 4) @ (N, 4, 4) = (N, 4, 4)
+    op_start = []
+    op_target = []
+    for g in grasp_dirs:
+        op_s_path = g / f"openpose_{i_int:03d}.npy"
+        op_t_path = g / f"openpose_{j_int:03d}.npy"
+        op_start.append(np.load(op_s_path) if op_s_path.exists() else None)
+        op_target.append(np.load(op_t_path) if op_t_path.exists() else None)
     wrist_world = T_obj_world[None] @ wrist_obj
     scene_info = [{
         "grasp_idx": int(g.name),
@@ -232,6 +383,8 @@ def _load_reset_seeds(hand: str, obj: str, h_cm: int, i_int: int, j_int: int,
         "wrist_se3": wrist_world,
         "pregrasp": pregrasp,
         "grasp": grasp,
+        "openpose_start": op_start,
+        "openpose_target": op_target,
         "scene_info": scene_info,
         "n_total": len(grasp_dirs),
     }
@@ -257,10 +410,11 @@ def _ik_check_seeds(planner: GraspPlanner, scene_cfg: dict, seeds: dict) -> dict
     t0 = _time.time()
     world_cfg_no_target = _to_curobo_world(scene_cfg)
     world_cfg_no_target["mesh"] = {}
-    if planner._ik_solver is None:
-        planner._init_ik_solver(world_cfg_no_target)
-    else:
-        planner._ik_solver.update_world(WorldConfig.from_dict(world_cfg_no_target))
+    # Lower collision activation distance to 0 — reset candidates intentionally
+    # bring fingers close to table/obj surface; default ~2mm rejects valid IK.
+    planner._collision_act_dist = 0.0
+    planner._ik_solver = None
+    planner._init_ik_solver(world_cfg_no_target)
     t_world = _time.time() - t0
 
     t0 = _time.time()
@@ -295,21 +449,62 @@ def _ik_check_seeds(planner: GraspPlanner, scene_cfg: dict, seeds: dict) -> dict
                 device=planner._tensor_args.device,
             ).unsqueeze(0).repeat(B_padded, 1)
             result = planner._ik_solver.solve_batch(goal, retract_config=retract)
-            succ = result.success.cpu().numpy()[:B]
+            succ = result.success.cpu().numpy()[:B].reshape(-1)
             q_sol = result.solution.cpu().numpy()[:B]
             if q_sol.ndim == 3:
                 q_sol = q_sol[:, 0, :]
+            try:
+                pos_err = result.position_error.cpu().numpy()[:B].reshape(-1)
+                rot_err = result.rotation_error.cpu().numpy()[:B].reshape(-1)
+            except Exception:
+                pos_err = [None] * B
+                rot_err = [None] * B
+
+            # Diagnostic: for fails with tiny pos_err/rot_err but succ=False,
+            # rerun IK with NO obstacles in world to test if collision is the
+            # cause. If succ=True without obstacles, the rejection was from
+            # collision_activation_distance, not unreachability.
+            need_diag = False
+            for i in range(B):
+                if not succ[i] and pos_err[i] is not None and pos_err[i] < 1e-3:
+                    need_diag = True
+            diag_succ_noworld = None
+            if need_diag:
+                try:
+                    from curobo.geom.types import WorldConfig as _WC
+                    empty_world = {"mesh": {}, "cuboid": {}}
+                    saved_world_cfg = world_cfg_no_target
+                    planner._ik_solver.update_world(_WC.from_dict(empty_world))
+                    result2 = planner._ik_solver.solve_batch(
+                        goal, retract_config=retract)
+                    diag_succ_noworld = result2.success.cpu().numpy()[:B].reshape(-1)
+                    planner._ik_solver.update_world(_WC.from_dict(saved_world_cfg))
+                except Exception as _de:
+                    print(f"      [diag noworld] failed: {_de!r}")
+
             for i, idx in enumerate(chunk_idx):
+                wp = wrist_se3[idx][:3, 3]
+                dist = float(np.linalg.norm(wp))
                 if succ[i]:
                     ik_success[idx] = True
                     arm_q = q_sol[i, :6].copy()
                     arm_q[5] = _snap_joint6(arm_q[5], planner._init_state[5])
                     ik_qpos[idx, :6] = arm_q
                     ik_qpos[idx, 6:] = pregrasp[idx]
+                else:
+                    noworld_tag = ""
+                    if diag_succ_noworld is not None:
+                        noworld_tag = (f"  noworld_succ={bool(diag_succ_noworld[i])}"
+                                       f" ← {'collision was cause' if diag_succ_noworld[i] else 'unreachable (not collision)'}")
+                    print(f"      [ik fail] cand {idx}: wrist pos={wp.round(3)} "
+                          f"|pos|={dist:.3f}m  pos_err={pos_err[i]}  "
+                          f"rot_err={rot_err[i]}{noworld_tag}")
     t_ik = _time.time() - t0
 
     # Lift IK pre-check (z + 10 cm reachable).
-    LIFT_HEIGHT_CHECK = 0.10
+    # Just need lift to go UP a bit, not all the way to LIFT_HEIGHT_M.
+    # Executor handles "as far as feasible" at runtime.
+    LIFT_HEIGHT_CHECK = 0.03
     ik_valid_pre = np.where(ik_success)[0]
     if len(ik_valid_pre) > 0:
         lift_poses = wrist_se3[ik_valid_pre].copy()
@@ -454,11 +649,11 @@ def main():
     if not (assets_root / "object_repre/v1" / args.obj / "1/repre.pth").exists():
         sys.exit(f"repre.pth missing for {args.obj}")
 
-    # Auto-select smallest reorient_{h_cm} folder.
-    h_cm = _autoselect_h_cm(args.hand, args.obj)
+    # Auto-select smallest reorient_{h_cm} folder containing target_j cells.
+    h_cm = _autoselect_h_cm(args.hand, args.obj, args.target_j)
     if h_cm is None:
         sys.exit(
-            f"no reset/reorient_*/ candidate folder found at "
+            f"no reset/reorient_*/ folder with target_j={args.target_j} cells at "
             f"{project_dir}/candidates/{args.hand}/reset/{args.obj}/"
         )
     RELEASE_HEIGHT_M = h_cm / 100.0
@@ -710,6 +905,37 @@ def main():
                     raise _SoftSkip
                 print(f"    loaded {seeds['n_total']} seeds from cell "
                       f"{i_int}_{args.target_j}")
+                # Cylinder freedom for approach IK — expand seeds by cyl_yaw
+                # rotations around the object's symmetry axis when not (nearly)
+                # vertical at the start pose.
+                _start_cyl_axis = get_cyl_axis_local(args.obj)
+                if _start_cyl_axis is not None:
+                    _axis_world = pose_robot_before[:3, :3] @ _start_cyl_axis
+                    if abs(_axis_world[2]) >= 0.95:
+                        _start_cyl_grid = None
+                    else:
+                        _start_cyl_grid = np.linspace(
+                            0, 2 * np.pi, 8, endpoint=False)
+                else:
+                    _start_cyl_grid = None
+                if _start_cyl_grid is not None:
+                    from autodex.planner.planner import _expand_candidates_cyl
+                    w, p, g, op_list_pair, si = _expand_candidates_cyl(
+                        seeds["wrist_se3"], seeds["pregrasp"], seeds["grasp"],
+                        # zip start+target openposes into a tuple per cand so they
+                        # ride along the expansion
+                        list(zip(seeds["openpose_start"],
+                                  seeds["openpose_target"])),
+                        seeds["scene_info"], pose_robot_before,
+                        _start_cyl_axis, _start_cyl_grid)
+                    seeds = {
+                        "wrist_se3": w, "pregrasp": p, "grasp": g,
+                        "openpose_start": [t[0] for t in op_list_pair],
+                        "openpose_target": [t[1] for t in op_list_pair],
+                        "scene_info": si, "n_total": len(w),
+                    }
+                    print(f"    cyl_yaw expanded: {len(w)} candidates "
+                          f"({len(_start_cyl_grid)}x)")
 
                 # 4. Plan — IK check + candidate enumerate (approach → lift →
                 #    reorient → descent) on reset seeds.
@@ -724,13 +950,46 @@ def main():
                 np.random.shuffle(ik_ok)
                 n_grasp_total = ik_res["n_total"]
                 planner._ik_solver = None  # rebuild for next plan_obj_placement
+                # Openpose lookup: seeds["openpose_start"] = openpose matching
+                # the START tabletop pose (i_int). Used for approach IK so the
+                # hand is wider open during approach.
+                openpose_start_list = seeds.get(
+                    "openpose_start", [None] * n_grasp_total)
+                openpose_target_list = seeds.get(
+                    "openpose_target", [None] * n_grasp_total)
+                n_op_s = sum(1 for op in openpose_start_list if op is not None)
+                n_op_t = sum(1 for op in openpose_target_list if op is not None)
+                print(f"    openpose: start({i_int:03d})={n_op_s}/{n_grasp_total}  "
+                      f"target({args.target_j:03d})={n_op_t}/{n_grasp_total}")
                 print(f"    grasp IK: {len(ik_ok)}/{n_grasp_total} feasible "
                       f"(backward={ik_res['n_backward']}, "
                       f"collision={ik_res['n_table_collision']})")
                 if len(ik_ok) == 0:
+                    # Phase 1: search world-z yaw rotation of obj that would
+                    # make at least one reset candidate IK-feasible.
+                    _found_yaw_deg, _found_x, _found_n_ok = _yaw_search_and_print_cmd(
+                        planner, scene_cfg, seeds, args)
                     rec["progress"]["plan"] = (
-                        f"no_ik_feasible_grasp ({n_grasp_total} total)")
+                        f"no_ik_feasible_grasp ({n_grasp_total} total)"
+                        + (f"; suggested yaw={_found_yaw_deg:.0f}°"
+                           if _found_yaw_deg is not None else ""))
+                    rec["yaw_suggestion_deg"] = _found_yaw_deg
                     rec["status"] = "plan_failed"
+                    # Viz: launch ScenePlanVisualizer showing candidates
+                    # colored by IK status (green=ok, yellow=ik_fail, red=filtered).
+                    try:
+                        from autodex.planner.visualizer import ScenePlanVisualizer
+                        _filtered = np.zeros(n_grasp_total, dtype=bool)
+                        _ik_failed = ~ik_res["ik_success"]
+                        fv = ScenePlanVisualizer(scene_cfg, None,
+                                                  port=8080, hand=args.hand)
+                        fv.add_candidates(seeds["wrist_se3"], seeds["grasp"],
+                                          _filtered, ik_failed=_ik_failed)
+                        fv.start_viewer(use_thread=True)
+                        print(f"    [viz] http://localhost:8080  "
+                              f"(yellow=IK fail, slider 0..{n_grasp_total-1})")
+                    except Exception as _ve:
+                        print(f"    [viz] launch failed: {_ve!r}")
                     raise _SoftSkip
 
                 T_obj_grasp_world_full = cart2se3(scene_cfg["mesh"]["target"]["pose"])
@@ -743,17 +1002,33 @@ def main():
                 scene_lift_pre = {"mesh": {}, "cuboid": dict(scene_cfg["cuboid"])}
                 X_GRID_PRE = np.arange(0.35, 0.55, 0.05)
                 YAW_GRID_PRE = np.linspace(0, 2 * np.pi, 8, endpoint=False)
-                # Cylinder-symmetric objects: free DoF about object's +Y axis
-                # applied IN OBJECT FRAME: Rz(world_yaw) @ R_target @ Ry_local(cyl).
-                if args.obj in CYLINDER_OBJECTS:
-                    CYL_YAW_GRID_PRE = np.linspace(
-                        0, 2 * np.pi, 8, endpoint=False)
-                    CYL_AXIS_LOCAL = np.array([0.0, 1.0, 0.0])
-                else:
-                    CYL_YAW_GRID_PRE = None
-                    CYL_AXIS_LOCAL = None
+                # Continuous-revolute objects: free DoF about object's
+                # symmetry axis (from src/scene_generation/symmetry.json),
+                # applied IN OBJECT FRAME:
+                # Rz(world_yaw) @ R_target @ R_local(cyl).
+                # When the symmetry axis ends up (nearly) world-vertical at
+                # the target, R_local is degenerate with the world yaw —
+                # collapse cyl grid to a single point to avoid wasted IK.
+                from autodex.utils.symmetry import get_cyl_yaw_grid
+                CYL_AXIS_LOCAL = get_cyl_axis_local(args.obj)
+                CYL_YAW_GRID_PRE = get_cyl_yaw_grid(args.obj)
+                if (CYL_AXIS_LOCAL is not None
+                        and CYL_YAW_GRID_PRE is not None
+                        and abs((R_target_obj_world_pre @ CYL_AXIS_LOCAL)[2])
+                            >= 0.95):
+                    CYL_YAW_GRID_PRE = np.array([0.0])
 
                 world_approach = _to_curobo_world(scene_cfg)
+                # Restore default collision activation distance for trajopt —
+                # IK was forced to 0 above so it accepts close-to-surface
+                # candidates, but plan_single_js with act_dist=0 has no
+                # margin and finetune_trajopt fails. The default (per-hand,
+                # e.g. inspire_left=0.005) gives the trajectory enough
+                # clearance to avoid jitter-triggered collisions.
+                _hand_cfg = planner.HAND_CONFIGS.get(
+                    args.hand, planner.HAND_CONFIGS["allegro"])
+                planner._collision_act_dist = _hand_cfg[2]
+                planner._motion_gen = None
                 planner._init_motion_gen(world_approach)
                 planner._cached_world = world_approach
 
@@ -774,6 +1049,7 @@ def main():
                 pre_info = None
                 pregrasp_chosen = None
                 grasp_chosen = None
+                openpose_target_chosen = None    # for release-side wider open
                 scene_info_chosen = None
                 wrist_grasp_chosen = None
                 result = None
@@ -791,12 +1067,16 @@ def main():
                     T_obj_in_wrist_cand = (
                         np.linalg.inv(wrist_grasp_cand) @ T_obj_grasp_world_full)
 
-                    # (a) approach
+                    # (a) approach — use openpose_start (wider hand) as the
+                    # approach-end finger config if available; else pregrasp.
                     if planner._world_structure_changed(world_approach):
                         planner._update_world(world_approach)
                         planner._cached_world = world_approach
+                    approach_goal = ik_res["ik_qpos"][cand_idx].copy()
+                    if openpose_start_list[cand_idx] is not None:
+                        approach_goal[6:] = openpose_start_list[cand_idx]
                     ok_ap, approach_traj_cand = planner._refine_fingers(
-                        planner._init_state, ik_res["ik_qpos"][cand_idx])
+                        planner._init_state, approach_goal)
                     if not ok_ap:
                         n_approach_fail += 1
                         cand_log.append({
@@ -947,6 +1227,7 @@ def main():
                     T_wrist_descent_chosen = descent_info_cand.get("T_wrist_target")
                     grasp_chosen = grasp_cand
                     pregrasp_chosen = pregrasp_cand
+                    openpose_target_chosen = openpose_target_list[cand_idx]
                     wrist_grasp_chosen = wrist_grasp_cand
                     scene_info_chosen = ik_res["scene_info"][cand_idx]
                     result = PlanResult(
@@ -976,6 +1257,14 @@ def main():
                           f"lift_fail={n_lift_fail}/{len(ik_ok)}  "
                           f"reorient_fail={n_reorient_fail}/{len(ik_ok)}  "
                           f"descent_fail={n_descent_fail}/{len(ik_ok)})")
+                    # Only approach is yaw-sensitive — once lifted, yaw is
+                    # free. So suggest a yaw rotation only when approach is
+                    # contributing to the failure.
+                    if n_approach_fail > 0:
+                        _found_yaw_deg, _found_x, _found_n_ok = _yaw_search_and_print_cmd(
+                            planner, scene_cfg, seeds, args,
+                            prev_n_ok=len(ik_ok))
+                        rec["yaw_suggestion_deg"] = _found_yaw_deg
                     if args.viz:
                         vis = _viz_cand_failures(
                             cand_log, args.obj, args.port_viser, args.hand,
@@ -1053,7 +1342,7 @@ def main():
                                                          axis=1)
                         xarm_init = planner._init_state[:6].astype(np.float32)
                         clear_view = xarm_init.copy()
-                        clear_view[0] -= np.deg2rad(60.0)
+                        clear_view[0] -= np.deg2rad(40.0)
                         cur_arm = descent_traj_chosen[-1, :6].astype(np.float32).copy()
                         joint_order = ([1, 2, 5, 0, 3, 4]
                                        if cur_arm[1] >= xarm_init[1]
@@ -1308,13 +1597,20 @@ def main():
                     rec["timing"]["release_s"] = round(time.time() - t0, 2)
                     rec["progress"]["release"] = "ok"
 
-                # 10. Reset_fallback: open hand + sequential arm retract.
+                # 9b. Swap result.openpose_pose to the TARGET-side openpose so
+                #     reset_hybrid's slow pregrasp→openpose interp uses the
+                #     pose-correct config for releasing at the target tabletop.
+                if openpose_target_chosen is not None:
+                    result.openpose_pose = openpose_target_chosen
+
+                # 10. Reset_hybrid: slow pregrasp→openpose interp internally,
+                #     then sequential [1,2,0] + cuRobo wrist(3,4,5).
                 t1 = time.time()
                 try:
-                    fb_log = executor.reset_fallback(result)
+                    fb_log = executor.reset_hybrid(result, planner, scene_cfg)
                     rec["timing"]["retract_s"] = round(time.time() - t1, 2)
                     rec["reset"] = fb_log
-                    rec["progress"]["retract"] = "fallback_sequential"
+                    rec["progress"]["retract"] = "hybrid"
                     rec["states"] = executor.state_timestamps
                     print(f"    release={rec['timing'].get('release_s', '?')}s  "
                           f"retract={rec['timing']['retract_s']}s  "
@@ -1410,7 +1706,19 @@ def main():
                           f"rot={rot_err:.1f}°  z={z_drop*1000:.1f}mm")
 
             except _SoftSkip:
-                pass
+                # Stop the whole cycle loop on first plan fail so user can
+                # inspect/copy log instead of letting noise scroll past.
+                print(f"\n[cycle {cycle}] plan_failed — stopping cycle loop "
+                      f"(was: continue → next cycle).")
+                try:
+                    cmd = input("    Press Enter to retry same cycle, "
+                                "'q' to quit: ").strip().lower()
+                except KeyboardInterrupt:
+                    cmd = "q"
+                if cmd == "q":
+                    break
+                else:
+                    continue
             except Exception as e:
                 rec["status"] = "aborted"
                 rec["error"] = repr(e)

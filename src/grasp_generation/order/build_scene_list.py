@@ -17,7 +17,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 
-from autodex.utils.path import obj_path, repo_dir, project_dir
+from autodex.utils.path import obj_path, repo_dir, project_dir, get_scene_dir
 from autodex.utils.conversion import cart2se3
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
@@ -61,7 +61,7 @@ def build(obj_name, hand, version):
     hand_cfg = os.path.join(project_dir, "content", "configs", "robot", f"{hand}_floating.yml")
     planner = GraspPlanner(hand_cfg_path=hand_cfg)
 
-    scene_root = os.path.join(obj_path, obj_name, "scene")
+    scene_root = get_scene_dir(hand, obj_name)
     if not os.path.isdir(scene_root):
         print(f"  No scene dir: {scene_root} — skipping")
         return

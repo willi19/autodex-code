@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"echo \\\"=== candidate 저장소 후보 위치 ===\\\"\\nfor p in ~/RSS_2026/candidates ~/AutoDex/candidates ~/shared_data/AutoDex/candidates; do [ -d \\\"$p\\\" ] && echo \\\"EXIST: $p -> $(ls \\\"$p\\\" 2>/dev/null|...",
+  "error": "Exit code 1\n=== candidate 저장소 후보 위치 ===\nEXIST: /home/mingi/RSS_2026/candidates -> baseline revalidate scene_cover_float scene_cover_obs scene_cover_obs_ordered scene_cover_obs_tmp scene_cover_table selected_100 selected_v3_100 tselected_100 v2 v3 visualization \nEXIST: /home/mingi/AutoDex/candidates -> allegro inspire inspire_f1 inspire_f1_left inspire_left \nEXIST: /home/mingi/shared_data/AutoDex/candidates -> allegro inspire inspire_f1 inspire_f1_left inspire_left \n\n=== scene_info=[shelf,43,9] 인...",
+  "timestamp": "2026-06-30T06:39:35.900Z",
+  "retry_count": 1
+}

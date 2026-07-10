@@ -232,7 +232,7 @@ def main():
             continue
         if s not in intrinsics_full or s not in extrinsics_full:
             continue
-        K = np.asarray(intrinsics_full[s]["intrinsics_undistort"], dtype=np.float64)
+        K = np.asarray(intrinsics_full[s]["K_undist"], dtype=np.float64)
         T_cam_world = np.asarray(extrinsics_full[s], dtype=np.float64)
         if T_cam_world.shape == (3, 4):
             T_cam_world = np.vstack([T_cam_world, [0, 0, 0, 1]])

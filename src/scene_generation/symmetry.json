@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-object rotational symmetry. axis is in object frame; type=revolute means continuous rotation around axis leaves geometry invariant.",
+  "_comment": "Per-object rotational symmetry. axis in object frame. type=revolute means continuous rotation. type=discrete + order=N means N-fold discrete symmetry (e.g. order=2 → 180° flip).",
   "pepper_tuna":       {"axis": "y", "type": "revolute"},
   "pepper_tuna_light": {"axis": "y", "type": "revolute"},
   "pepsi":             {"axis": "y", "type": "revolute"},

@@ -73,17 +73,9 @@ class ScenePlanVisualizer(ViserViewer):
         for name, data in self.scene_cfg.get("mesh", {}).items():
             pose_se3 = self._pose7d_to_se3(data["pose"])
             mesh_path = data["file_path"]
-            # For the target object, prefer the raw textured mesh over the
-            # planning simplified.obj so we see the actual color/texture.
-            # raw_mesh path: {obj_root}/raw_mesh/{obj}.obj where obj_root is
-            # the parent of processed_data/.
-            if name == "target" and "processed_data" in mesh_path:
-                obj_root_dir = mesh_path.split("/processed_data/")[0]
-                obj_name_guess = os.path.basename(obj_root_dir)
-                raw = os.path.join(obj_root_dir, "raw_mesh",
-                                   f"{obj_name_guess}.obj")
-                if os.path.exists(raw):
-                    mesh_path = raw
+            # NOTE: do NOT substitute raw_mesh — its origin may differ from
+            # the planning simplified.obj, making the obj appear offset from
+            # where the planner thinks it is. Use scene_cfg's mesh as-is.
             # process=False preserves materials/texture in trimesh load.
             try:
                 mesh = trimesh.load(mesh_path, process=False)
@@ -156,26 +148,35 @@ class ScenePlanVisualizer(ViserViewer):
                     return
                 raise
 
-    def add_candidates(self, wrist_se3, grasp_pose, filtered):
-        """Show candidate hands with slider. Red = filtered, Green = valid."""
+    def add_candidates(self, wrist_se3, grasp_pose, filtered, ik_failed=None):
+        """Show candidate hands with slider.
+        Red = filtered (backward/collision), Yellow = IK-failed (passed filter
+        but wrist unreachable), Green = fully valid (filter+IK ok).
+        ``ik_failed`` is optional; if None, treated as all-False (= 2-color)."""
         self._cand_wrist = wrist_se3
         self._cand_grasp = grasp_pose
         self._cand_filtered = filtered
+        n = len(wrist_se3)
+        if ik_failed is None:
+            import numpy as _np
+            ik_failed = _np.zeros(n, dtype=bool)
+        self._cand_ik_failed = ik_failed
 
         urdf_hand = self._urdf_hand
         self.add_robot("cand_hand", urdf_hand)
         self.robot_dict["cand_hand"].set_visibility(False)
 
-        n = len(wrist_se3)
-        valid_idx = [i for i in range(n) if not filtered[i]]
-        filtered_idx = [i for i in range(n) if filtered[i]]
-        n_valid = len(valid_idx)
-        n_filtered = len(filtered_idx)
+        n_filtered = int(sum(1 for i in range(n) if filtered[i]))
+        n_ikfail = int(sum(1 for i in range(n)
+                            if (not filtered[i]) and ik_failed[i]))
+        n_valid = n - n_filtered - n_ikfail
 
         with self.server.gui.add_folder("Candidates"):
             self.server.gui.add_text(
                 "Stats",
-                initial_value=f"Valid: {n_valid} | Filtered: {n_filtered} | Total: {n}",
+                initial_value=(f"Green(valid+IK ok): {n_valid} | "
+                               f"Yellow(IK fail): {n_ikfail} | "
+                               f"Red(filtered): {n_filtered} | Total: {n}"),
                 disabled=True,
             )
             self._cand_slider = self.server.gui.add_slider(
@@ -198,8 +199,15 @@ class ScenePlanVisualizer(ViserViewer):
         self.robot_dict["cand_hand"]._visual_root_frame.wxyz = R.from_matrix(pose[:3, :3]).as_quat()[[3, 0, 1, 2]]
         self.robot_dict["cand_hand"].update_cfg(self._cand_grasp[idx])
 
-        status = "FILTERED" if self._cand_filtered[idx] else "VALID"
-        color = [1, 0, 0, 0.6] if self._cand_filtered[idx] else [0, 1, 0, 0.6]
+        if self._cand_filtered[idx]:
+            status = "FILTERED"
+            color = [1, 0, 0, 0.6]            # red
+        elif self._cand_ik_failed[idx]:
+            status = "IK_FAIL"
+            color = [1, 1, 0, 0.6]            # yellow
+        else:
+            status = "VALID"
+            color = [0, 1, 0, 0.6]            # green
         self.change_color("cand_hand", color)
         self._cand_label.value = f"#{idx}: {status}"
 

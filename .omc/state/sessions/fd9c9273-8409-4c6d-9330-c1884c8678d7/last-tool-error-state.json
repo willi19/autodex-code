@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls -1 /home/mingi/autodex-gallery/scripts/ 2>/dev/null; echo \\\"=== CLAUDE.md? ===\\\"; ls /home/mingi/autodex-gallery/scripts/CLAUDE.md /home/mingi/autodex-gallery/CLAUDE.md 2>/dev/null\",\"de...",
+  "error": "Exit code 2\nbatch_merged.py\nbatch_overlay_all.py\nbatch_overlay.py\ncompute_errors.py\ncompute_stereo_depth.py\nfix_video_undistort.py\noverlay_from_gotrack.py\noverlay_grasp_frame.py\noverlay_grasp_video.py\noverlay_robot.py\n__pycache__\ntrack_object_video.py\nupload_experiments.py\nupload_missing_parallel.py\nupload_missing.py\nupload_turntable.py\n=== CLAUDE.md? ===\n/home/mingi/autodex-gallery/CLAUDE.md",
+  "timestamp": "2026-06-30T08:15:11.196Z",
+  "retry_count": 1
+}

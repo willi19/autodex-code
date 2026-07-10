@@ -173,6 +173,7 @@ if __name__ == "__main__":
         output_dir=save_dir_parent,
         obj_root_dir=args.obj_root_dir,
         scene_filter=scene_filter,
+        hand=robot_name,
     )
 
     logger.info(f"START config={args.manip_cfg_file} exp={exp_name} parallel={args.parallel_world} output={save_dir}")

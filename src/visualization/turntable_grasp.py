@@ -31,7 +31,7 @@ import trimesh
 
 from autodex.utils.conversion import cart2se3
 from autodex.utils.path import obj_path, urdf_path
-from autodex.utils.path import repo_dir
+from autodex.utils.path import repo_dir, get_scene_dir
 from paradex.visualization.robot import RobotModule
 
 
@@ -172,21 +172,33 @@ def trimesh_to_o3d(mesh: trimesh.Trimesh, color=None) -> o3d.geometry.TriangleMe
 
 
 def _pick_standing_pose(obj_name: str, root: str) -> np.ndarray:
-    """Pick the scene/table/*.json with the highest z translation (standing pose)."""
-    table_dir = os.path.join(root, obj_name, "scene", "table")
-    if not os.path.isdir(table_dir):
-        return np.eye(4)
+    """Pick the scene JSON with the highest z translation (standing pose).
+
+    Prefer the ``table`` scenes. Some hands (e.g. inspire) have no ``table``
+    scene type -- the object's resting pose is identical across scene types
+    (they differ only in obstacles), so fall back to every available scene type.
+    """
+    table_dir = get_scene_dir(CURRENT_HAND, obj_name, "table")
+    if os.path.isdir(table_dir):
+        scene_dirs = [table_dir]
+    else:
+        obj_root = get_scene_dir(CURRENT_HAND, obj_name)
+        if not os.path.isdir(obj_root):
+            return np.eye(4)
+        scene_dirs = [os.path.join(obj_root, st) for st in sorted(os.listdir(obj_root))
+                      if os.path.isdir(os.path.join(obj_root, st))]
     best_z = -np.inf
     best_pose = np.eye(4)
-    for fn in os.listdir(table_dir):
-        if not fn.endswith(".json"):
-            continue
-        with open(os.path.join(table_dir, fn)) as f:
-            cfg = json.load(f)
-        pose = cfg['scene']['mesh']['target']['pose']
-        if pose[2] > best_z:
-            best_z = pose[2]
-            best_pose = cart2se3(pose)
+    for sd in scene_dirs:
+        for fn in os.listdir(sd):
+            if not fn.endswith(".json"):
+                continue
+            with open(os.path.join(sd, fn)) as f:
+                cfg = json.load(f)
+            pose = cfg['scene']['mesh']['target']['pose']
+            if pose[2] > best_z:
+                best_z = pose[2]
+                best_pose = cart2se3(pose)
     return best_pose
 
 

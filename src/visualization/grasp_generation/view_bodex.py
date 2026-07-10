@@ -14,7 +14,7 @@ from scipy.spatial.transform import Rotation as Rot
 from shapely import geometry as geom
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH
+from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH, get_scene_dir
 
 obj_path = DEFAULT_OBJ_PATH  # rebound from CLI in __main__
 from autodex.utils.conversion import cart2se3
@@ -389,7 +389,7 @@ class BODexBrowser(ViserViewer):
         # Scene types from candidate data (what scenes have grasps)
         candidate_scene_types = self._list_dirs(os.path.join(self._data_root(), self.current_obj))
         # Also check object scene data for JSON availability
-        obj_scene_types = self._list_dirs(os.path.join(self.obj_root, self.current_obj, "scene"))
+        obj_scene_types = self._list_dirs(get_scene_dir(self.current_hand, self.current_obj))
         # Use candidate scene types (what actually has data), but only if scene JSON exists
         scene_types = [s for s in candidate_scene_types if s in obj_scene_types]
         if not scene_types:
@@ -444,8 +444,8 @@ class BODexBrowser(ViserViewer):
     def _load_scene(self):
         self.clear_scene()
         scene_json_path = os.path.join(
-            self.obj_root, self.current_obj, "scene",
-            self.current_scene_type, f"{self.current_scene_idx}.json",
+            get_scene_dir(self.current_hand, self.current_obj, self.current_scene_type),
+            f"{self.current_scene_idx}.json",
         )
 
         if not os.path.exists(scene_json_path):

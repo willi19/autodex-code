@@ -18,7 +18,7 @@ from scipy.spatial.transform import Rotation
 
 TABLE_CUBOID = {
     "dims": [2, 3, 0.2],
-    "pose": [1.1, 0, -0.1 + 0.037, 1, 0, 0, 0],
+    "pose": [1.1, 0, -0.1 + 0.035, 1, 0, 0, 0],
 }
 
 

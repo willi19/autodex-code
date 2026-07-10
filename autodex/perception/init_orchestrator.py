@@ -16,6 +16,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -256,6 +257,156 @@ class InitOrchestrator:
             self._sil._obj_name = obj_name
             logger.info(f"[orch] sil optimizer loaded in {time.perf_counter()-t0:.1f}s")
 
+    def collect_payloads(
+        self,
+        prompt: str = "object",
+        request_id: Optional[int] = None,
+        n_expected_serials: Optional[int] = None,
+        timeout_s: float = 15.0,
+        capture_dir: Optional[str] = None,
+        save_capture_dir: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Trigger one capture across all capture PCs and return raw payloads.
+
+        Returns (masks, poses, timing). Each masks/poses key is a serial.
+        """
+        if request_id is None:
+            request_id = int(time.time() * 1000) & 0x7fffffff
+        n_expected = n_expected_serials or len(self.intrinsics_undist)
+
+        for buf in (self.mask_buf, self.pose_buf):
+            with buf._lock:
+                buf._d.clear()
+
+        t_dispatch = time.perf_counter()
+        run_info = {"request_id": int(request_id), "prompt": prompt}
+        if capture_dir is not None:
+            run_info["capture_dir"] = _to_home_relative(capture_dir)
+        if save_capture_dir is not None:
+            run_info["save_capture_dir"] = _to_home_relative(save_capture_dir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cmd.send_command("run", wait=False, cmd_info=run_info)
+
+        deadline = time.perf_counter() + timeout_s
+        first_mask_t = None; first_pose_t = None
+        last_print = 0.0
+        last_n_mask = -1; last_n_pose = -1
+        while time.perf_counter() < deadline:
+            masks_now = self.mask_buf.get(request_id)
+            poses_now = self.pose_buf.get(request_id)
+            if first_mask_t is None and masks_now:
+                first_mask_t = time.perf_counter()
+            if first_pose_t is None and poses_now:
+                first_pose_t = time.perf_counter()
+            now = time.perf_counter()
+            if (now - last_print > 0.5
+                    or len(masks_now) != last_n_mask
+                    or len(poses_now) != last_n_pose):
+                elapsed = now - t_dispatch
+                print(f"  ... [{elapsed:5.1f}s] masks {len(masks_now)}/{n_expected}  "
+                      f"poses {len(poses_now)}/{n_expected}", flush=True)
+                last_print = now
+                last_n_mask = len(masks_now); last_n_pose = len(poses_now)
+            if len(masks_now) >= n_expected and len(poses_now) >= n_expected:
+                break
+            time.sleep(0.01)
+        masks = self.mask_buf.get(request_id)
+        poses = self.pose_buf.get(request_id)
+        t_collected = time.perf_counter()
+        self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
+        timing = {
+            "request_id": request_id,
+            "dispatch_to_collected_s": t_collected - t_dispatch,
+            "first_mask_arrived_s": (first_mask_t - t_dispatch) if first_mask_t else None,
+            "first_pose_arrived_s": (first_pose_t - t_dispatch) if first_pose_t else None,
+            "n_masks_recv": len(masks),
+            "n_poses_recv": len(poses),
+        }
+        return masks, poses, timing
+
+    def refine_from_payloads(
+        self,
+        masks: Dict[str, Any],
+        poses: Dict[str, Any],
+        subset_serials: Optional[List[str]] = None,
+        sil_iters: int = 100,
+        sil_lr: float = 0.002,
+        sil_loss_threshold: float = 0.003,
+        save_capture_dir: Optional[str] = None,
+        sil_debug: bool = False,
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """IoU + sil refine on already-collected payloads, restricted to subset.
+
+        subset_serials=None → use every serial known to the orchestrator.
+        """
+        from autodex.perception.pose_select import select_best_pose_by_iou
+
+        if subset_serials is None:
+            subset = set(self.intrinsics_undist.keys())
+        else:
+            subset = set(subset_serials) & set(self.intrinsics_undist.keys())
+
+        candidates: Dict[str, np.ndarray] = {}
+        for s, p in poses.items():
+            if s not in subset:
+                continue
+            if p.get("ok") and "pose_world" in p:
+                candidates[s] = p["pose_world"]
+        masks_bool: Dict[str, np.ndarray] = {
+            s: m["mask"] for s, m in masks.items()
+            if s in subset and m.get("mask") is not None and m["mask"].any()
+        }
+        if not candidates or not masks_bool:
+            return None, {"reason": "no_candidates_or_masks",
+                          "n_candidates": len(candidates),
+                          "n_masks": len(masks_bool)}
+
+        t_iou0 = time.perf_counter()
+        intr_subset = {s: self.intrinsics_undist[s] for s in masks_bool}
+        extr_subset = {s: self.extrinsics[s] for s in masks_bool}
+        best_serial, best_pose, best_iou, per_cand = select_best_pose_by_iou(
+            candidates=candidates, masks=masks_bool,
+            intrinsics=intr_subset, extrinsics=extr_subset,
+            H=self.H, W=self.W,
+            glctx=self._sil.glctx, mesh_tensors=self._sil.mesh_tensors,
+        )
+        t_iou = time.perf_counter() - t_iou0
+        if best_pose is None:
+            return None, {"reason": "iou_select_failed", "per_cand": per_cand}
+
+        t_sil0 = time.perf_counter()
+        views = [
+            {"mask": (m.astype(np.uint8) * 255),
+             "K": intr_subset[s], "extrinsic": extr_subset[s]}
+            for s, m in masks_bool.items()
+        ]
+        sil_debug_dir = None
+        if sil_debug and save_capture_dir is not None:
+            sil_debug_dir = os.path.join(save_capture_dir, "sil_debug")
+            os.makedirs(sil_debug_dir, exist_ok=True)
+        refined, sil_loss = self._sil.optimize(
+            initial_pose_world=best_pose,
+            views=views,
+            iters=sil_iters, lr=sil_lr,
+            antialias=True,
+            debug=sil_debug_dir is not None,
+            debug_dir=sil_debug_dir,
+            debug_every=10, debug_max_views=4,
+        )
+        t_sil = time.perf_counter() - t_sil0
+        timing = {
+            "iou_select_s": t_iou, "sil_refine_s": t_sil,
+            "n_candidates": len(candidates), "n_masks": len(masks_bool),
+            "best_serial": best_serial, "best_iou": float(best_iou),
+            "sil_loss": float(sil_loss),
+            "pre_sil_pose": np.asarray(best_pose, dtype=np.float64).tolist(),
+        }
+        if sil_loss > sil_loss_threshold:
+            timing["sil_reject"] = True
+            timing["reason"] = f"sil_loss_too_high ({sil_loss:.6f})"
+            return None, timing
+        return np.asarray(refined, dtype=np.float64), timing
+
     def trigger_init(
         self,
         prompt: str = "object",
@@ -266,6 +417,7 @@ class InitOrchestrator:
         sil_lr: float = 0.002,
         capture_dir: Optional[str] = None,
         save_capture_dir: Optional[str] = None,
+        sil_loss_threshold: float = 0.003,
     ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
         """Trigger one init across all capture PCs and refine on robot.
 
@@ -322,6 +474,15 @@ class InitOrchestrator:
         logger.info(f"[orch] req={request_id} collected: "
                     f"{len(masks)} masks / {len(poses)} poses in "
                     f"{t_collected-t_dispatch:.2f}s")
+        expected_serials = set(self.intrinsics_undist.keys())
+        missing_mask = sorted(expected_serials - set(masks.keys()))
+        missing_pose = sorted(expected_serials - set(poses.keys()))
+        if missing_mask:
+            print(f"  [orch] missing masks ({len(missing_mask)}): "
+                  f"{missing_mask}", flush=True)
+        if missing_pose:
+            print(f"  [orch] missing poses ({len(missing_pose)}): "
+                  f"{missing_pose}", flush=True)
 
         # Build candidates: serial -> pose_world (only OK ones).
         candidates: Dict[str, np.ndarray] = {}
@@ -371,11 +532,16 @@ class InitOrchestrator:
                 "K": intr_subset[s],
                 "extrinsic": extr_subset[s],
             })
+        sil_debug_dir = None
         refined, sil_loss = self._sil.optimize(
             initial_pose_world=best_pose,
             views=views,
             iters=sil_iters, lr=sil_lr,
             antialias=True,
+            debug=False,
+            debug_dir=sil_debug_dir,
+            debug_every=10,
+            debug_max_views=4,
         )
         t_sil = time.perf_counter() - t_sil0
         logger.info(f"[orch] sil refine: {t_sil:.2f}s ({sil_iters} iters, loss={sil_loss:.6f})")
@@ -396,10 +562,10 @@ class InitOrchestrator:
         }
         self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
 
-        # Threshold: silhouette matching loss > 0.003 means the refined pose is
-        # unreliable. Carried over from legacy perception_pipeline.py:320-322.
-        if sil_loss > 0.003:
-            logger.warning(f"[orch] sil loss {sil_loss:.6f} > 0.003 — pose unreliable, skipping")
+        # Threshold: silhouette matching loss above threshold means the refined
+        # pose is unreliable. Set to float('inf') to disable.
+        if sil_loss > sil_loss_threshold:
+            logger.warning(f"[orch] sil loss {sil_loss:.6f} > {sil_loss_threshold} — pose unreliable, skipping")
             timing["sil_reject"] = True
             timing["reason"] = f"sil_loss_too_high ({sil_loss:.6f})"
             return None, timing

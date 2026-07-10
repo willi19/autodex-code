@@ -18,6 +18,7 @@ sys.path.insert(0, REPO_ROOT)
 
 from autodex.simulator.hand_object import MjHO
 from autodex.utils.conversion import se32cart, cart2se3
+from autodex.utils.path import get_scene_dir
 
 # Inline copies to avoid importing run_sim_filter (which pulls cuRobo and uses GPU).
 HAND_PATHS = {
@@ -90,7 +91,7 @@ def main():
     grasp_active = np.load(os.path.join(seed_dir, "grasp_pose.npy"))
 
     # Apply scene object pose
-    scene_json = os.path.join(args.obj_root, args.obj, "scene", args.scene, f"{args.scene_id}.json")
+    scene_json = os.path.join(get_scene_dir(args.hand, args.obj, args.scene), f"{args.scene_id}.json")
     import json
     scene_cfg = json.load(open(scene_json))["scene"]
     obj_se3 = cart2se3(scene_cfg["mesh"]["target"]["pose"])

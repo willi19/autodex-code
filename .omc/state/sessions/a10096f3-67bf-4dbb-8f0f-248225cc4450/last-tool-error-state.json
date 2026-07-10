@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /home/mingi/AutoDex\\nPYTORCH_CUDA_ALLOC_CONF=expandable_segments:True EGL_PLATFORM=surfaceless \\\\\\n~/miniconda3/envs/gotrack/bin/python - <<'EOF' 2>&1 | grep -iE \\\"^\\\\[test\\\\]|OutOfMemo...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s",
+  "timestamp": "2026-07-09T06:26:44.958Z",
+  "retry_count": 1
+}

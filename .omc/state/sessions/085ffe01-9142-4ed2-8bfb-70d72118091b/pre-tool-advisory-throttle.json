@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "entries": {
+    "79a93d4a2f8f50b95f852280616242fee1855dc99a3c75211917f55e72e95fae": {
+      "last_emitted_at_ms": 1782898064484,
+      "message": "Use parallel execution for independent tasks. Use run_in_background for long operations (npm install, builds, tests)."
+    },
+    "466399dafa2d20f60587180bad0a07358eb7f2bce724df0ff682f038ad33f5ad": {
+      "last_emitted_at_ms": 1782898009233,
+      "message": "Read multiple files in parallel when possible for faster analysis."
+    },
+    "2be23b6e20c56a08f74ac08787d163b93c63191cbd6bb4e46c3520a3ca517884": {
+      "last_emitted_at_ms": 1782897442759,
+      "message": "Spawning agent: Explore (inherit) | Task: Investigate C2R and URDF change"
+    },
+    "5c879d85571e6b0dfc4697c7d98a4c1bd2628f168ddaf30c0ee75215d0912feb": {
+      "last_emitted_at_ms": 1782895928637,
+      "message": "Spawning agent: Explore (inherit) | Task: Explore grasp generation code"
+    }
+  },
+  "updated_at": "2026-07-01T09:27:44.484Z"
+}

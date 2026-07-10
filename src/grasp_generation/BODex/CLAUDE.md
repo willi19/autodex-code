@@ -95,12 +95,16 @@ CUDA_VISIBLE_DEVICES=0 /home/mingi/miniconda3/envs/bodex/bin/python generate.py 
 
 ## Object Data
 
-Object meshes and scene configs live at `~/shared_data/RSS2026_Mingi/object/paradex/{obj_name}/`:
+Object meshes live under the object root (`--obj_root_dir`, e.g. `~/shared_data/object_processing/{obj_name}/`):
 - `raw_mesh/{obj_name}.obj` — Object mesh
 - `processed_data/info/simplified.json` — OBB, gravity center
 - `processed_data/mesh/simplified.obj` — Simplified mesh for planning
 - `processed_data/urdf/coacd.urdf` — Convex decomposition for collision
-- `scene/{box,shelf,wall,table,float}/*.json` — Scene placement configs
+
+Scene placement configs are **hand-specific** (the obstacle gap is adapted per hand) and live SEPARATELY under the AutoDex NAS, resolved via `autodex.utils.path.get_scene_dir(hand, obj, scene_type)`:
+- `~/shared_data/AutoDex/scene/{hand}/{obj_name}/{box,shelf,wall,table,float}/*.json`
+
+`generate.py` derives `hand` from the config's `robot_file` (e.g. `sim_allegro` → `allegro`) and `ParadexDataset` loads scenes from that per-hand path; mesh/OBB info still comes from `--obj_root_dir`.
 
 ## Adding a New Robot Hand (e.g. Inspire)
 

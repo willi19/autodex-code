@@ -29,7 +29,7 @@ import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 from scipy.spatial.transform import Rotation as Rot
 
-from autodex.utils.path import obj_path, repo_dir
+from autodex.utils.path import obj_path, repo_dir, get_scene_dir
 
 REPO_ROOT = repo_dir
 CANDIDATES_ROOT = os.path.join(REPO_ROOT, "candidates")
@@ -241,7 +241,7 @@ class SceneGraspViewer:
         # excluding stale "*_prev" geometry (see project_stale_shelf_candidates).
         cand_types = [t for t in list_dirs(os.path.join(CANDIDATES_ROOT, hand, version, obj))
                       if not t.endswith("_prev")]
-        json_types = set(list_dirs(os.path.join(obj_path, obj, "scene")))
+        json_types = set(list_dirs(get_scene_dir(hand, obj)))
         types = [t for t in cand_types if t in json_types] or cand_types
         for t in types:
             self.scene_type_cb.add_item(t)
@@ -310,7 +310,7 @@ class SceneGraspViewer:
 
         Geometry is in world frame (object at its tabletop pose); the caller
         applies any grid offset. Returns (geoms, center) or (None, None)."""
-        scene_json = os.path.join(obj_path, obj, "scene", st, f"{sid}.json")
+        scene_json = os.path.join(get_scene_dir(hand, obj, st), f"{sid}.json")
         if not os.path.exists(scene_json):
             return None, None
         with open(scene_json) as f:

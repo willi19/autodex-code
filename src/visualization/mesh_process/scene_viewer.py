@@ -7,7 +7,7 @@ import trimesh
 from scipy.spatial.transform import Rotation as Rot
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from autodex.utils.path import obj_path
+from autodex.utils.path import obj_path, get_scene_dir
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -33,7 +33,7 @@ LINE_WIDTH_AXIS  = 3.0
 
 available_objects = sorted([
     d for d in os.listdir(obj_path)
-    if os.path.isdir(os.path.join(obj_path, d, "scene", "table"))
+    if os.path.isdir(get_scene_dir("allegro", d, "table"))
 ])
 
 print(f"Found {len(available_objects)} objects with scenes")
@@ -110,7 +110,7 @@ def add_obb(parent_frame, obb_extents, obb_transform, axis_len):
 
 
 def get_scene_files(obj_name, scene_type):
-    scene_dir = os.path.join(obj_path, obj_name, "scene", scene_type)
+    scene_dir = get_scene_dir("allegro", obj_name, scene_type)
     if not os.path.isdir(scene_dir):
         return []
     return sorted(
@@ -180,7 +180,7 @@ def load_scene():
 def update_scene_types():
     """Update scene type dropdown for current object."""
     obj_name = obj_dropdown.value
-    scene_root = os.path.join(obj_path, obj_name, "scene")
+    scene_root = get_scene_dir("allegro", obj_name)
     if os.path.isdir(scene_root):
         types = sorted(
             d for d in os.listdir(scene_root)

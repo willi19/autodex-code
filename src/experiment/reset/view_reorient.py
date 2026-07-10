@@ -423,7 +423,7 @@ def main():
     # a time while others stay fixed.
     xarm_init = planner._init_state[:6].astype(np.float32)
     clear_view = xarm_init.copy()
-    clear_view[0] -= np.deg2rad(60.0)
+    clear_view[0] -= np.deg2rad(40.0)
     cur_arm = descent_traj[-1, :6].astype(np.float32).copy()
     joint_order = ([1, 2, 5, 0, 3, 4] if cur_arm[1] >= xarm_init[1]
                    else [2, 1, 5, 0, 3, 4])
