@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /home/mingi/AutoDex; pkill -f \\\"view_reset.py --plan_dir\\\" 2>/dev/null; L=/tmp/claude-1000/-home-mingi-AutoDex/c80fe137-8ef1-45fe-b90e-23fe18a66fb6/scratchpad; /home/mingi/miniconda3/en...",
+  "error": "Exit code 144",
+  "timestamp": "2026-07-21T08:10:27.496Z",
+  "retry_count": 1
+}

@@ -91,7 +91,7 @@ def main():
         recompute_loss = json.load(open(rp)).get("sil_loss") if os.path.exists(rp) else None
         rows.append({"obj": obj, "ts": ts, "legacy_sil_loss": loss,
                      "recompute_sil_loss": recompute_loss, "in_outlier": in_outlier})
-        odir = os.path.join(td, "overlay")
+        odir = os.path.join(td, "pose_sil")
         os.makedirs(odir, exist_ok=True)
         json.dump({"legacy_sil_loss": loss, "recompute_sil_loss": recompute_loss,
                    "threshold": THRESHOLD, "legacy_ok": loss <= THRESHOLD},

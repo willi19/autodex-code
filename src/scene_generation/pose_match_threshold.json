@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-object gravity-angle threshold (deg) for deciding a captured grasp is 'at' a tabletop pose (coverage matching). Default 25. Higher = removed/near poses absorb into the kept nearest pose. Must stay below the min separation of the KEPT poses.",
+  "_default": 25,
+  "baby_beaker": 76,
+  "clock": 25,
+  "white_clock": 25,
+  "white_soap_dish": 11,
+  "toothbrush_holder": 32,
+  "wateringcan": 11
+}

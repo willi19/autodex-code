@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"python -c \\\"\\nimport numpy as np, os\\nDS='/home/mingi/shared_data/autodex_dataset'\\ndef score(d, pos_thr=0.05):\\n    try:\\n        hp=np.load(f'{d}/raw/hand/position.npy'); ha=np.load(f'{d...",
+  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 26, in <module>\n  File \"<string>\", line 23, in dist\nUnboundLocalError: local variable 'np' referenced before assignment",
+  "timestamp": "2026-07-13T15:22:00.076Z",
+  "retry_count": 1
+}

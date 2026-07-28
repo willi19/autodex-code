@@ -74,13 +74,37 @@ def load_symmetry_registry():
     return reg
 
 
-def z_rots_for_pose(obj_name, tabletop_pose, symmetry_reg):
-    info = symmetry_reg.get(obj_name)
-    if info is None or info.get("type") != "revolute":
-        return Z_ROTS_DEFAULT
-    axis_world = tabletop_pose[:3, :3] @ AXIS_VEC[info["axis"]]
-    if abs(axis_world[2]) >= VERTICAL_THRESH:
-        return [0]
+_SYM_CACHE = {}
+
+
+def _obj_sym_axes(obj_name, obj_root):
+    """Rotational-symmetry axes from the object_processing detector's output
+    ({obj}/processed_data/info/symmetry.json). Returns a list of
+    (axis_unit_vec (3,), fold) where fold is an int or 'inf' (continuous)."""
+    key = (obj_name, obj_root)
+    if key not in _SYM_CACHE:
+        p = os.path.join(obj_root, obj_name, "processed_data", "info", "symmetry.json")
+        axes = []
+        if os.path.isfile(p):
+            for a in json.load(open(p)).get("axes", []):
+                v = np.asarray(a["axis"], float)
+                axes.append((v / np.linalg.norm(v), a["fold"]))
+        _SYM_CACHE[key] = axes
+    return _SYM_CACHE[key]
+
+
+def z_rots_for_pose(obj_name, tabletop_pose, obj_root):
+    """Fold redundant scene z_rotations using the object's detected symmetry:
+      - isotropic (>=3 independent continuous axes, i.e. a sphere) -> [0]
+      - a continuous (revolute) axis that is VERTICAL in this pose -> [0]
+      - otherwise the default 5-way z_rot sweep."""
+    axes = _obj_sym_axes(obj_name, obj_root)
+    inf = [v for v, fold in axes if fold == "inf"]
+    if len(inf) >= 3 and np.linalg.matrix_rank(np.array(inf), tol=0.1) >= 3:
+        return [0]                          # sphere: every z_rotation identical
+    for v in inf:
+        if abs((tabletop_pose[:3, :3] @ v)[2]) >= VERTICAL_THRESH:
+            return [0]                      # revolute axis stands vertical
     return Z_ROTS_DEFAULT
 
 
@@ -107,7 +131,7 @@ def enumerate_scene_configs(obj_name, scene_type, obj_root, symmetry_reg, pose_f
         pose = np.load(os.path.join(tabletop_dir, fname))
         include = pose_filter is None or pose_idx in pose_filter
         if scene_type == "wall":
-            for z_rot in z_rots_for_pose(obj_name, pose, symmetry_reg):
+            for z_rot in z_rots_for_pose(obj_name, pose, obj_root):
                 if include:
                     out.append({"id": str(sid), "pose_idx": pose_idx, "pose": pose,
                                 "z_rot": z_rot})
@@ -115,7 +139,7 @@ def enumerate_scene_configs(obj_name, scene_type, obj_root, symmetry_reg, pose_f
         elif scene_type == "shelf":
             face_combos = [(up, side, True) for up, side in product([True, False], repeat=2)
                            if (up or side)]
-            for z_rot in z_rots_for_pose(obj_name, pose, symmetry_reg):
+            for z_rot in z_rots_for_pose(obj_name, pose, obj_root):
                 for up, side, back in face_combos:
                     if include:
                         out.append({"id": str(sid), "pose_idx": pose_idx, "pose": pose,

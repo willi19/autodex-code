@@ -36,6 +36,30 @@ DATASET_ROOTS = [
 ]
 MESH_BASE = Path.home() / "shared_data/AutoDex/object/paradex"
 ASSETS_BASE = Path.home() / "shared_data/AutoDex/foundpose_assets"
+OP_MESH_BASE = Path.home() / "shared_data/object_processing"
+
+# Active mesh source, overridable via CLI (--op_mesh + --assets_base). When
+# op_mesh is set, the object pose is estimated in the object_processing mesh
+# frame (the one that defines tabletop/scene/canon) instead of the paradex mesh.
+_USE_OP_MESH = False
+_ASSETS_BASE = ASSETS_BASE
+# Render resolution scale for the IoU-select + silhouette-refine steps only
+# (FoundPose init still runs at full res). <1.0 cuts refine GPU memory ~1/scale^2,
+# needed to fit alongside a concurrent GPU job. Refine at half res is ample.
+_REFINE_SCALE = 1.0
+
+
+def _mesh_path(obj):
+    if _USE_OP_MESH:
+        return OP_MESH_BASE / obj / "processed_data" / "mesh" / "simplified.obj"
+    return MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"
+
+
+def _scale_K(K, sx, sy):
+    K = np.asarray(K, dtype=np.float64).copy()
+    K[0, 0] *= sx; K[0, 2] *= sx
+    K[1, 1] *= sy; K[1, 2] *= sy
+    return K
 
 SIL_ITERS = 100
 SIL_LR = 0.002
@@ -65,8 +89,12 @@ def load_cam_param(trial_dir):
 
 
 def load_images(trial_dir):
-    """Return {serial: rgb} from init_capture/images (fallback: source images/)."""
+    """Return {serial: rgb} from init_capture/images. Fallbacks: the trial's own
+    ``raw/images`` (corl trials store undistorted init frames there), then the
+    legacy source ``images/`` dir."""
     d = os.path.join(trial_dir, "init_capture", "images")
+    if not os.path.isdir(d):
+        d = os.path.join(trial_dir, "raw", "images")
     if not os.path.isdir(d):
         obj = os.path.basename(os.path.dirname(trial_dir))
         ts = os.path.basename(trial_dir)
@@ -134,10 +162,20 @@ def recompute_trial(trial_dir, fp, sil, select_fn, write=False):
 
     intr_subset = {s: K_all[s] for s in masks_bool}
     extr_subset = {s: ext_all[s] for s in masks_bool}
+
+    # Optionally downscale the render resolution for select + refine (memory).
+    Hr, Wr = H, W
+    if _REFINE_SCALE < 1.0:
+        Hr, Wr = int(round(H * _REFINE_SCALE)), int(round(W * _REFINE_SCALE))
+        intr_subset = {s: _scale_K(K, Wr / W, Hr / H) for s, K in intr_subset.items()}
+        masks_bool = {s: cv2.resize(m.astype(np.uint8), (Wr, Hr),
+                                    interpolation=cv2.INTER_NEAREST) > 0
+                      for s, m in masks_bool.items()}
+
     best_serial, best_pose, best_iou, _ = select_fn(
         candidates=candidates, masks=masks_bool,
         intrinsics=intr_subset, extrinsics=extr_subset,
-        H=H, W=W, glctx=sil.glctx, mesh_tensors=sil.mesh_tensors,
+        H=Hr, W=Wr, glctx=sil.glctx, mesh_tensors=sil.mesh_tensors,
     )
     if best_pose is None:
         info["reject"] = True
@@ -181,8 +219,8 @@ def iter_trials(roots, obj_filter=None):
 def build_models_for_obj(obj, sil, fp_cache):
     """(Re)build FoundPose + point silhouette at this object's mesh."""
     from autodex.perception.foundpose_init import FoundPoseInit
-    mesh_path = MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"
-    assets_root = ASSETS_BASE / obj
+    mesh_path = _mesh_path(obj)
+    assets_root = _ASSETS_BASE / obj
     repre = assets_root / "object_repre/v1" / obj / "1/repre.pth"
     if not mesh_path.exists() or not repre.exists():
         return None
@@ -201,7 +239,22 @@ def main():
     ap.add_argument("--roots", nargs="+", default=DATASET_ROOTS)
     ap.add_argument("--write", action="store_true", help="save pose_world.npy + recompute_pose.json")
     ap.add_argument("--overwrite", action="store_true", help="redo even if recompute_pose.json exists")
+    ap.add_argument("--op_mesh", action="store_true",
+                    help="estimate pose in the object_processing mesh frame "
+                         "(processed_data/mesh/simplified.obj) instead of paradex raw_mesh")
+    ap.add_argument("--assets_base", default=None,
+                    help="FoundPose repre root (defaults to the paradex foundpose_assets; "
+                         "use a separate dir when onboarding from --op_mesh)")
+    ap.add_argument("--refine_scale", type=float, default=1.0,
+                    help="render-resolution scale for IoU-select + silhouette-refine "
+                         "(<1.0 cuts GPU memory; e.g. 0.5 to fit alongside another GPU job)")
     args = ap.parse_args()
+
+    global _USE_OP_MESH, _ASSETS_BASE, _REFINE_SCALE
+    _USE_OP_MESH = args.op_mesh
+    if args.assets_base:
+        _ASSETS_BASE = Path(args.assets_base)
+    _REFINE_SCALE = args.refine_scale
 
     from autodex.perception.silhouette import SilhouetteOptimizer
     from autodex.perception.pose_select import select_best_pose_by_iou
@@ -227,7 +280,7 @@ def main():
         if obj != cur_obj:
             if sil is None:
                 # init silhouette with first available mesh, then reset per object
-                sil = SilhouetteOptimizer(str(MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"))
+                sil = SilhouetteOptimizer(str(_mesh_path(obj)))
             fp = build_models_for_obj(obj, sil, fp_cache)
             cur_obj = obj
         if fp is None:

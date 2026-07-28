@@ -1,6 +1,0 @@
-AutoDex collects physically validated grasps at 80 grasps/hr with only [X] min of human involvement per grasp (object placement and reset), 
-as the entire grasp execution, recording, and success detection are fully automated. By contrast, teleoperation requires continuous operator presence (body suit, 22-DoF real-time control), 
-achieving [X] grasps/hr with practical sessions limited to [X] hours due to operator fatigue and Xsens suit charging. 
-As shown in Fig.~R-1 (d, left), this gap widens with scale: AutoDex runs unattended overnight while teleop cost grows linearly with operator hours. Beyond throughput, 
-AutoDex provides grasp diversity that teleop cannot: operator demonstrations are biased toward collision-free approach paths, 
-whereas our pipeline evaluates grasps under procedural environmental constraints (wall, shelf, box) that are impractical to physically construct during teleop sessions.

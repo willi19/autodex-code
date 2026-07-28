@@ -23,6 +23,7 @@ from paradex.visualization.visualizer.viser import ViserViewer
 
 ROOTS = {
     "clean": "/home/mingi/shared_data/autodex_dataset/selected_100",
+    "corl": "/home/mingi/shared_data/autodex_dataset/corl_selected_100",
     "wireout": "/home/mingi/shared_data/autodex_dataset/selected_100_wireout",
 }
 SRC_ROOT = "/home/mingi/shared_data/RSS2026_Mingi/experiment/selected_100"
@@ -108,7 +109,12 @@ class EpisodeViewer(ViserViewer):
             self.info.value = f"{obj}/{ts}: no synced arm/hand (run sync_arm_hand)"
             return
 
-        arm_act = np.load(os.path.join(trial, "arm", "action.npy"))   # commanded (F,6)
+        # arm/action.npy is the cartesian command (lift frames = wrist_se3, |q|>2pi);
+        # arm/action_qpos.npy is the IK-fixed joint qpos (lift converted to joints)
+        # -- read that so the action robot shows the real commanded lift.
+        aq_path = os.path.join(trial, "arm", "action_qpos.npy")
+        arm_act = np.load(aq_path if os.path.exists(aq_path)
+                          else os.path.join(trial, "arm", "action.npy"))   # commanded (F,6)
         arm_pos = np.load(os.path.join(trial, "arm", "state.npy"))    # measured  (F,6)
         h_act = np.load(os.path.join(trial, "hand", "action.npy"))    # commanded (F,16) URDF order
         h_pos = np.load(os.path.join(trial, "hand", "state.npy"))     # measured  (F,16) URDF order

@@ -227,12 +227,14 @@ def main():
         stat.value = f"{obj}: recovering executed grasps (FK)..."
         st["idx"] = scenes_by_pose(obj)
         st["exec"] = extract_executed(obj)
-        st["byp"] = {}; st["unc"] = []
+        st["byp"] = {}; st["unc"] = []; st["nopose"] = 0
         for g in st["exec"]:
             if g["pose_id"] is not None:   # coverable is DERIVED from pose_id (the
                 st["byp"].setdefault(g["pose_id"], []).append(g)  # coverable flag gets
             elif g["objT"] is not None:    # stripped by harmonize's 17-key schema)
                 st["unc"].append(g)   # no matching tabletop pose
+            else:
+                st["nopose"] += 1   # missing C2R/pose_world -> unclassifiable, NOT uncoverable
         # idx already keyed by CURRENT tabletop pose (scenes generated fresh)
         poses = sorted(st["idx"].keys())
         if st["unc"]:
@@ -242,7 +244,8 @@ def main():
             pose_dd.value = poses[0]
         cap = sorted(st["byp"].keys())
         stat.value = (f"{obj}: {len(st['exec'])} executed grasps · coverable at {cap} · "
-                      f"{len(st['unc'])} uncoverable")
+                      f"{len(st['unc'])} uncoverable"
+                      + (f" · {st['nopose']} no-pose (missing C2R/pose_world)" if st['nopose'] else ""))
 
     def load_grid():
         sg.clear_all()

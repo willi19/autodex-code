@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd ~/AutoDex\\necho \\\"=== soaptray summary.json 구조 (scene별 최종 gap) ===\\\"\\n/home/mingi/miniconda3/envs/mingi/bin/python -c \\\"\\nimport json\\nd=json.load(open('/home/mingi/AutoDex/logging/adap...",
-  "error": "Exit code 2\n=== soaptray summary.json 구조 (scene별 최종 gap) ===\n--- wall ---\n  scene 0: {\"final\": {\"status\": \"success\", \"gap\": 0.0, \"N\": 200, \"valid\": 45, \"via\": \"bonus\"}, \"best_valid\": 45, \"history\": [{\"gap\": 0.02, \"N\": 200, \"valid_cum\": 45}, {\"gap\": 0.0, \"N\": 200, \"valid_cum\": 45, \"pha\n  scene 1: {\"final\": {\"status\": \"success\", \"gap\": 0.02, \"N\": 200, \"valid\": 7}, \"best_valid\": 7, \"history\": [{\"gap\": 0.02, \"N\": 200, \"valid_cum\": 7}, {\"gap\": 0.0, \"N\": 200, \"valid_cum\": 0, \"phase\": \"bonus_rejecte\n  ...",
-  "timestamp": "2026-07-10T05:08:10.214Z",
+  "tool_input_preview": "{\"command\":\"cd ~\\necho \\\"=== github.com/willi19/AutoDex repo 존재? ===\\\"\\ngit ls-remote https://github.com/willi19/AutoDex.git HEAD 2>&1 | head -2\\necho \\\"=== autodex-gallery repo 구조 (index.html + AutoD...",
+  "error": "Exit code 2\n=== github.com/willi19/AutoDex repo 존재? ===\n350b1b12b6cbb5832849e2d2e2583e5d34c6676c\tHEAD\n=== autodex-gallery repo 구조 (index.html + AutoDex 사이트도 여기?) ===\nCLAUDE.md\ndocs\nscripts\ntest_output\n=== autodex-gallery에 dataset 섹션 index.html 있나 ===",
+  "timestamp": "2026-07-15T22:55:45.148Z",
   "retry_count": 1
 }

@@ -1,12 +1,107 @@
 {
-  "_comment": "Per-object rotational symmetry. axis in object frame. type=revolute means continuous rotation. type=discrete + order=N means N-fold discrete symmetry (e.g. order=2 → 180° flip).",
-  "pepper_tuna":       {"axis": "y", "type": "revolute"},
-  "pepper_tuna_light": {"axis": "y", "type": "revolute"},
-  "pepsi":             {"axis": "y", "type": "revolute"},
-  "pepsi_light":       {"axis": "y", "type": "revolute"},
-  "donut":             {"axis": "y", "type": "revolute"},
-  "servingbowl_small": {"axis": "y", "type": "revolute"},
-  "beige_brush":       {"axis": "y", "type": "revolute"},
-  "blue_alarm":        {"axis": [0.535245, -0.127493, -0.83502], "pivot": [0.0, 0.0, 0.0], "type": "discrete", "order": 2},
-  "brown_ramen":       {"axis": "y", "type": "revolute"}
+  "_comment": "Per-object rotational symmetry. axis in object frame. type=revolute means continuous rotation. type=discrete + order=N means N-fold discrete symmetry (e.g. order=2 \u2192 180\u00b0 flip).",
+  "pepper_tuna": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "pepper_tuna_light": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "pepsi": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "pepsi_light": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "donut": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "servingbowl_small": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "beige_brush": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "blue_alarm": {
+    "axis": [
+      0.535245,
+      -0.127493,
+      -0.83502
+    ],
+    "pivot": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "type": "discrete",
+    "order": 2
+  },
+  "brown_ramen": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "baseball": {
+    "type": "sphere"
+  },
+  "black_kitchen_roll_holder": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "brass_pot": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "lemon": {
+    "axis": "z",
+    "type": "revolute"
+  },
+  "lemon_squeezer": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "open_short_pringles": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "orange": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "pingpong": {
+    "type": "sphere"
+  },
+  "plant_pot": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "pringles": {
+    "axis": "z",
+    "type": "revolute"
+  },
+  "smallbowl": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "spicemill": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "tennis_ball": {
+    "axis": "z",
+    "type": "revolute"
+  },
+  "white_table_lamp": {
+    "axis": "y",
+    "type": "revolute"
+  },
+  "yellow_funnel": {
+    "axis": "y",
+    "type": "revolute"
+  }
 }

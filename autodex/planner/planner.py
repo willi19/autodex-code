@@ -43,8 +43,9 @@ setup_curobo_logger("warning")
 from autodex.utils.path import robot_configs_path, load_candidate, project_dir
 from autodex.utils.conversion import se32action, cart2se3
 from autodex.utils.robot_config import (
-    INIT_STATE, XARM_INIT, INSPIRE_INIT,
+    INIT_STATE, XARM_INIT, INSPIRE_INIT, FR3_INIT,
     ALLEGRO_LINK6_TO_WRIST, INSPIRE_LINK6_TO_WRIST, INSPIRE_LEFT_LINK6_TO_WRIST,
+    FR3_INSPIRE_LINK_TO_WRIST,
 )
 
 
@@ -158,6 +159,9 @@ class GraspPlanner:
         "allegro":      ("xarm_allegro.yml",      "allegro_floating.yml",      0.01,  32, InterpolateType.CUBIC),
         "inspire":      ("xarm_inspire.yml",      "inspire_floating.yml",      0.005, 32, InterpolateType.LINEAR_CUDA),
         "inspire_left": ("xarm_inspire_left.yml", "inspire_left_floating.yml", 0.005, 32, InterpolateType.LINEAR_CUDA),
+        # FR3 (Franka) arm + inspire right hand. Same hand as "inspire", so the
+        # floating-hand cfg and numerics are shared; only the arm differs.
+        "fr3_inspire":  ("fr3_inspire.yml",       "inspire_floating.yml",      0.005, 32, InterpolateType.LINEAR_CUDA),
     }
 
     def __init__(self, robot_cfg_path: Optional[str] = None, hand_cfg_path: Optional[str] = None,
@@ -193,18 +197,39 @@ class GraspPlanner:
         # only mesh poses changed across plan() calls.
         self._cached_world: Optional[dict] = None
 
-        # Init state: same arm position for all hands, hand-specific finger init
-        if hand.startswith("inspire"):
+        # Init state: same arm position for all hands, hand-specific finger init.
+        # FR3 is 7-DOF, so it must branch before the 6-DOF xarm cases.
+        if hand == "fr3_inspire":
+            self._init_state = np.concatenate([FR3_INIT, INSPIRE_INIT]).astype(np.float32)
+            self._link6_to_wrist_rot = FR3_INSPIRE_LINK_TO_WRIST[:3, :3]
+            self._n_arm = len(FR3_INIT)
+        elif hand.startswith("inspire"):
             self._init_state = np.concatenate([XARM_INIT, INSPIRE_INIT]).astype(np.float32)
             self._link6_to_wrist_rot = INSPIRE_LINK6_TO_WRIST[:3, :3]
+            self._n_arm = len(XARM_INIT)
         else:
             self._init_state = INIT_STATE.astype(np.float32)
             self._link6_to_wrist_rot = ALLEGRO_LINK6_TO_WRIST[:3, :3]
+            self._n_arm = len(XARM_INIT)
+        # Arm joints whose URDF limits were widened to ±2π, so an IK solution may
+        # come back a full turn away from the start config. Only the xarm has
+        # these (joint4 / joint6); the FR3's limits are all inside ±2π, so
+        # snapping there would be a no-op at best and a limit violation at worst.
+        self._wrap_joints = (3, 5) if self._n_arm == 6 else ()
 
         # Precompute link6 y-axis in wrist frame for backward filter
         self._link6_y_in_wrist = np.linalg.inv(self._link6_to_wrist_rot) @ np.array([0, 1, 0])
         self._hand = hand
         self._use_cuda_graph = use_cuda_graph
+
+    def _snap_arm(self, arm_q: np.ndarray, ref) -> np.ndarray:
+        """In-place ±2π snap of the wide-limit arm joints toward ``ref``.
+
+        No-op on arms without ±2π joints (FR3). Returns ``arm_q``.
+        """
+        for j in self._wrap_joints:
+            arm_q[j] = _snap_joint6(arm_q[j], float(ref[j]))
+        return arm_q
 
     # ── world setup ───────────────────────────────────────────────────────────
 
@@ -427,7 +452,8 @@ class GraspPlanner:
                  cyl_axis_local: Optional[np.ndarray] = None,
                  cyl_yaw_grid: Optional[np.ndarray] = None,
                  scene_type_filter: Optional[str] = None,
-                 skip_scenes_with_success: bool = False):
+                 skip_scenes_with_success: bool = False,
+                 candidates_root: Optional[str] = None):
         """
         IK-only reachability check for all grasp candidates.
 
@@ -458,7 +484,8 @@ class GraspPlanner:
         wrist_se3, pregrasp, grasp, scene_info = load_candidate(
             obj_name, obj_pose, grasp_version, hand=hand, scene_id=scene_id,
             scene_type_filter=scene_type_filter,
-            skip_scenes_with_success=skip_scenes_with_success)
+            skip_scenes_with_success=skip_scenes_with_success,
+            candidates_root=candidates_root)
         # Expand by cyl_yaw around object symmetry axis (cylinder objects only).
         wrist_se3, pregrasp, grasp, _, scene_info = _expand_candidates_cyl(
             wrist_se3, pregrasp, grasp, None, scene_info,
@@ -521,13 +548,12 @@ class GraspPlanner:
                 for i, idx in enumerate(chunk_idx):
                     if succ[i]:
                         ik_success[idx] = True
-                        arm_q = q_sol[i, :6].copy()
-                        # Snap joint 6 to nearest equivalent angle to init_state
-                        # IK can return any angle in [-2π, 2π]; pick closest to start
-                        arm_q[3] = _snap_joint6(arm_q[3], self._init_state[3])
-                        arm_q[5] = _snap_joint6(arm_q[5], self._init_state[5])
-                        ik_qpos[idx, :6] = arm_q
-                        ik_qpos[idx, 6:] = pregrasp[idx]
+                        arm_q = q_sol[i, :self._n_arm].copy()
+                        # Snap the ±2π joints to the equivalent angle nearest
+                        # init_state; IK can return any angle in [-2π, 2π].
+                        self._snap_arm(arm_q, self._init_state)
+                        ik_qpos[idx, :self._n_arm] = arm_q
+                        ik_qpos[idx, self._n_arm:] = pregrasp[idx]
         t_ik = _time.time() - t0
 
         # Lift IK check: verify z+10cm pose is reachable — mirrors
@@ -715,8 +741,8 @@ class GraspPlanner:
         if len(cur_full) != len(self._init_state):
             info["reason"] = (
                 f"current_qpos DOF {len(cur_full)} != expected "
-                f"{len(self._init_state)} (arm 6 + hand "
-                f"{len(self._init_state) - 6})"
+                f"{len(self._init_state)} (arm {self._n_arm} + hand "
+                f"{len(self._init_state) - self._n_arm})"
             )
             return None, info
         B_padded = cand_padded.shape[0]
@@ -738,14 +764,13 @@ class GraspPlanner:
         info["ik_solve_s"] = round(_time.time() - t0, 3)
 
         # 4. Sort IK-feasible yaw solutions by closeness to current arm.
-        cur_arm = np.asarray(current_qpos[:6])
+        cur_arm = np.asarray(current_qpos[:self._n_arm])
         feasible_arms = []   # list of (yaw_idx, arm_q, dist)
         for i in range(B):
             if not succ[i]:
                 continue
-            arm_q = q_sol[i, :6].copy()
-            arm_q[3] = _snap_joint6(arm_q[3], current_qpos[3])
-            arm_q[5] = _snap_joint6(arm_q[5], current_qpos[5])
+            arm_q = q_sol[i, :self._n_arm].copy()
+            self._snap_arm(arm_q, current_qpos)
             dist = float(np.linalg.norm(arm_q - cur_arm))
             feasible_arms.append((i, arm_q, dist))
         feasible_arms.sort(key=lambda t: t[2])
@@ -760,7 +785,7 @@ class GraspPlanner:
         # 5. plan_single_js: try yaw candidates in order until one succeeds.
         t1 = _time.time()
         start_full = np.asarray(current_qpos, dtype=np.float32)
-        n_hand = len(self._init_state) - 6
+        n_hand = len(self._init_state) - self._n_arm
         hand_held = np.asarray(hold_hand_qpos, dtype=np.float32)
         if len(hand_held) != n_hand:
             info["reason"] = (
@@ -812,7 +837,7 @@ class GraspPlanner:
         ``(x, obj_target_pos_world[1], obj_target_pos_world[2])`` (y/z fixed),
         computes the required wrist pose via ``inv(T_obj_in_wrist)``, and
         batch-IKs all candidates. Picks the IK-feasible candidate whose arm
-        config is closest to ``current_qpos[:6]`` in joint space, then runs
+        config is closest to the current arm config in joint space, then runs
         ``plan_single_js`` from ``current_qpos`` to that arm config holding
         ``hold_hand_qpos`` throughout.
 
@@ -909,7 +934,7 @@ class GraspPlanner:
         # 3. Batch IK over the grid.
         device = self._tensor_args.device
         ik_success_all = np.zeros(N, dtype=bool)
-        ik_arm_qpos = np.full((N, 6), np.nan, dtype=np.float32)
+        ik_arm_qpos = np.full((N, self._n_arm), np.nan, dtype=np.float32)
         for chunk_start in range(0, N, self.BATCH_SIZE):
             chunk_idx = list(range(
                 chunk_start, min(chunk_start + self.BATCH_SIZE, N)))
@@ -938,9 +963,8 @@ class GraspPlanner:
             for i, idx in enumerate(chunk_idx):
                 if succ[i]:
                     ik_success_all[idx] = True
-                    arm_q = q_sol[i, :6].copy()
-                    arm_q[3] = _snap_joint6(arm_q[3], current_qpos[3])
-                    arm_q[5] = _snap_joint6(arm_q[5], current_qpos[5])
+                    arm_q = q_sol[i, :self._n_arm].copy()
+                    self._snap_arm(arm_q, current_qpos)
                     ik_arm_qpos[idx] = arm_q
 
         feasible = np.where(ik_success_all)[0]
@@ -951,7 +975,7 @@ class GraspPlanner:
             return None, info
 
         # 4. Sort IK-feasible candidates by closeness to current arm.
-        cur_arm = np.asarray(current_qpos[:6])
+        cur_arm = np.asarray(current_qpos[:self._n_arm])
         dists = np.linalg.norm(ik_arm_qpos[feasible] - cur_arm, axis=1)
         order = np.argsort(dists)
 
@@ -985,7 +1009,7 @@ class GraspPlanner:
 
         # 5. Try plan_single_js on candidates in order until one succeeds.
         start_full = np.asarray(current_qpos, dtype=np.float32)
-        n_hand = len(self._init_state) - 6
+        n_hand = len(self._init_state) - self._n_arm
         hand_held = np.asarray(hold_hand_qpos, dtype=np.float32)
         if len(hand_held) != n_hand:
             info["reason"] = (
@@ -1153,7 +1177,7 @@ class GraspPlanner:
                 "plan_pose_constrained: ik_solver not initialized; "
                 "call plan() or solve_ik() once first."
             )
-        start_arm = np.asarray(start_full_qpos[:6], dtype=np.float32)
+        start_arm = np.asarray(start_full_qpos[:self._n_arm], dtype=np.float32)
         start_full = np.asarray(start_full_qpos, dtype=np.float32)
         # retract / seed use full-DOF (arm+hand) to match cuRobo IK's
         # internal joint dimension.
@@ -1187,9 +1211,8 @@ class GraspPlanner:
         for k in range(len(succ_arr)):
             if not succ_arr[k]:
                 continue
-            cand = q_sol[k, :6].copy()
-            cand[3] = _snap_joint6(cand[3], float(start_arm[3]))
-            cand[5] = _snap_joint6(cand[5], float(start_arm[5]))
+            cand = q_sol[k, :self._n_arm].copy()
+            self._snap_arm(cand, start_arm)
             candidates.append(cand)
         if not candidates:
             print("    [plan_pose_constrained] IK to goal FAILED")
@@ -1202,7 +1225,7 @@ class GraspPlanner:
               f"(best of {len(candidates)} feasible)")
         target_full = np.concatenate([
             target_arm.astype(np.float32),
-            np.asarray(start_full_qpos[6:], dtype=np.float32),
+            np.asarray(start_full_qpos[self._n_arm:], dtype=np.float32),
         ])
         ok, traj = self._refine_fingers(
             np.asarray(start_full_qpos, dtype=np.float32), target_full
@@ -1268,7 +1291,7 @@ class GraspPlanner:
 
         ``start_hand_qpos`` must be in the planner's (curobo URDF) joint order
         — same order as ``plan_result.pregrasp_pose`` / ``grasp_pose``. If
-        omitted, defaults to ``init_state[6:]`` (fully open hand). When the
+        omitted, defaults to the init_state hand config (fully open). When the
         real hand is at pregrasp, pass ``plan_result.pregrasp_pose`` so the
         planner's collision check matches the actual configuration.
 
@@ -1290,16 +1313,16 @@ class GraspPlanner:
         self._cached_world = world_cfg
 
         if start_hand_qpos is None:
-            start_hand_qpos = self._init_state[6:]
+            start_hand_qpos = self._init_state[self._n_arm:]
         start_full = np.concatenate([
-            np.asarray(start_arm_qpos[:6], dtype=np.float32),
+            np.asarray(start_arm_qpos[:self._n_arm], dtype=np.float32),
             np.asarray(start_hand_qpos, dtype=np.float32),
         ])
         if goal_arm_qpos is None:
-            goal_arm_qpos = self._init_state[:6]
+            goal_arm_qpos = self._init_state[:self._n_arm]
         goal_full = np.concatenate([
-            np.asarray(goal_arm_qpos[:6], dtype=np.float32),
-            self._init_state[6:].astype(np.float32),
+            np.asarray(goal_arm_qpos[:self._n_arm], dtype=np.float32),
+            self._init_state[self._n_arm:].astype(np.float32),
         ])
         ok, traj = self._refine_fingers(start_full, goal_full)
         return traj if ok else None
@@ -1405,7 +1428,7 @@ class GraspPlanner:
         whose kinematic errors are UNRECOVERABLE on xarm (force a full restart).
 
         Lift goal = the grasp wrist raised by ``lift_h`` in world +z, SAME
-        orientation, fingers HELD at ``grasp_qpos[6:]``. A pure +z lift moves the
+        orientation, fingers HELD at ``grasp_qpos``'s hand block. A pure +z lift moves the
         held object straight up (away from the table), so failures here are
         kinematic (the lifted wrist unreachable for this off-grid arm config —
         joint limit / singularity) or scene-collision (shelf/wall above), NOT
@@ -1433,9 +1456,9 @@ class GraspPlanner:
         if not bool(r.success.view(-1)[0]):
             return False, None                       # lifted wrist unreachable (joint limit)
         q_lift = np.asarray(grasp_qpos, dtype=np.float32).copy()
-        arm_q = r.solution.cpu().numpy().reshape(-1)[:6]
-        arm_q[5] = _snap_joint6(arm_q[5], float(grasp_qpos[5]))   # joint-6 wrap toward grasp
-        q_lift[:6] = arm_q
+        arm_q = r.solution.cpu().numpy().reshape(-1)[:self._n_arm]
+        self._snap_arm(arm_q, grasp_qpos)          # ±2π wrap toward the grasp config
+        q_lift[:self._n_arm] = arm_q
         ok, traj = self._refine_fingers(
             np.asarray(grasp_qpos, dtype=np.float32), q_lift)
         return (ok, traj if ok else None)
@@ -1659,7 +1682,7 @@ class GraspPlanner:
                 return None, None, timing
             idx = valid[local_idx]
             goal = traj[-1].copy()
-            goal[6:] = pregrasp[idx]
+            goal[self._n_arm:] = pregrasp[idx]
             t0 = _time.time()
             ok, traj = self._refine_fingers(self._init_state, goal)
             timing["finger_refine_s"] = round(_time.time() - t0, 3)
@@ -1683,7 +1706,7 @@ class GraspPlanner:
                 if not success[i]:
                     continue
                 goal = trajs[i, -1].copy()
-                goal[6:] = pregrasp[idx]
+                goal[self._n_arm:] = pregrasp[idx]
                 t0 = _time.time()
                 ok, traj = self._refine_fingers(inits[start + i], goal)
                 timing["finger_refine_s"] += _time.time() - t0
@@ -1890,7 +1913,7 @@ class GraspPlanner:
                 if not success[i]:
                     continue
                 goal = trajs[i, -1].copy()
-                goal[6:] = pregrasp[idx]
+                goal[self._n_arm:] = pregrasp[idx]
                 t1 = _time.time()
                 ok, traj = self._refine_fingers(self._init_state, goal)
                 t_refine_total += _time.time() - t1
@@ -2049,9 +2072,8 @@ class GraspPlanner:
                 q_sol = q_sol[:, 0, :]
             for i, idx in enumerate(chunk_idx):
                 if succ[i]:
-                    arm_q = q_sol[i, :6].copy()
-                    arm_q[3] = _snap_joint6(arm_q[3], self._init_state[3])
-                    arm_q[5] = _snap_joint6(arm_q[5], self._init_state[5])
+                    arm_q = q_sol[i, :self._n_arm].copy()
+                    self._snap_arm(arm_q, self._init_state)
                     # Reject IK whose any arm joint sits outside ±π — those
                     # extreme configs are on a far IK branch where the
                     # constrained lift (PoseCostMetric hold xy+rotation) has
@@ -2060,8 +2082,8 @@ class GraspPlanner:
                     if np.any(np.abs(arm_q) > np.pi):
                         continue
                     ik_success[idx] = True
-                    ik_qpos[idx, :6] = arm_q
-                    ik_qpos[idx, 6:] = approach_fingers[idx]
+                    ik_qpos[idx, :self._n_arm] = arm_q
+                    ik_qpos[idx, self._n_arm:] = approach_fingers[idx]
         t_ik = _time.time() - t0
 
         # Lift IK check: verify the wrist can rise a bit (avoids candidates

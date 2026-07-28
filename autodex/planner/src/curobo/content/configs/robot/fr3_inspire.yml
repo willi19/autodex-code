@@ -1,0 +1,227 @@
+## FR3 + Inspire RIGHT hand (generated)
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: false
+    usd_path: ''
+    usd_robot_root: ''
+    isaac_usd_path: ''
+    usd_flip_joints: {}
+    usd_flip_joint_limits: []
+    urdf_path: robot/fr3_inspire_description/fr3_inspire.urdf
+    asset_root_path: robot/fr3_inspire_description
+    base_link: base
+    ee_link: base_link
+    link_names:
+    - fr3_link0
+    - fr3_link1
+    - fr3_link2
+    - fr3_link3
+    - fr3_link4
+    - fr3_link5
+    - fr3_link6
+    - fr3_link7
+    - base_link
+    - right_thumb_1
+    - right_thumb_2
+    - right_thumb_3
+    - right_thumb_4
+    - right_index_1
+    - right_index_2
+    - right_middle_1
+    - right_middle_2
+    - right_ring_1
+    - right_ring_2
+    - right_little_1
+    - right_little_2
+    collision_link_names:
+    - fr3_link0
+    - fr3_link1
+    - fr3_link2
+    - fr3_link3
+    - fr3_link4
+    - fr3_link5
+    - fr3_link6
+    - fr3_link7
+    - base_link
+    - right_thumb_1
+    - right_thumb_2
+    - right_thumb_3
+    - right_thumb_4
+    - right_index_1
+    - right_index_2
+    - right_middle_1
+    - right_middle_2
+    - right_ring_1
+    - right_ring_2
+    - right_little_1
+    - right_little_2
+    collision_spheres: spheres/fr3_inspire.yml
+    collision_sphere_buffer: 0.0
+    self_collision_ignore:
+      fr3_link0:
+      - fr3_link1
+      fr3_link1:
+      - fr3_link2
+      fr3_link2:
+      - fr3_link3
+      fr3_link3:
+      - fr3_link4
+      fr3_link4:
+      - fr3_link5
+      fr3_link5:
+      - fr3_link6
+      - fr3_link7
+      fr3_link6:
+      - fr3_link7
+      - base_link
+      - right_thumb_1
+      - right_thumb_2
+      - right_thumb_3
+      - right_thumb_4
+      - right_index_1
+      - right_index_2
+      - right_middle_1
+      - right_middle_2
+      - right_ring_1
+      - right_ring_2
+      - right_little_1
+      - right_little_2
+      fr3_link7:
+      - base_link
+      - right_thumb_1
+      - right_thumb_2
+      - right_thumb_3
+      - right_thumb_4
+      - right_index_1
+      - right_index_2
+      - right_middle_1
+      - right_middle_2
+      - right_ring_1
+      - right_ring_2
+      - right_little_1
+      - right_little_2
+      base_link:
+      - right_thumb_1
+      - right_thumb_2
+      - right_index_1
+      - right_middle_1
+      - right_ring_1
+      - right_little_1
+      right_thumb_1:
+      - right_thumb_2
+      right_thumb_2:
+      - right_thumb_3
+      right_thumb_3:
+      - right_thumb_4
+      right_index_1:
+      - right_index_2
+      right_middle_1:
+      - right_middle_2
+      right_ring_1:
+      - right_ring_2
+      right_little_1:
+      - right_little_2
+    self_collision_buffer:
+      fr3_link0: 0
+      fr3_link1: 0
+      fr3_link2: 0
+      fr3_link3: 0
+      fr3_link4: 0
+      fr3_link5: 0
+      fr3_link6: 0
+      fr3_link7: 0
+      base_link: 0.0
+      right_thumb_1: -0.005
+      right_thumb_2: -0.005
+      right_thumb_3: -0.005
+      right_thumb_4: -0.005
+      right_index_1: -0.005
+      right_index_2: -0.005
+      right_middle_1: -0.005
+      right_middle_2: -0.005
+      right_ring_1: -0.005
+      right_ring_2: -0.005
+      right_little_1: -0.005
+      right_little_2: -0.005
+    use_global_cumul: true
+    mesh_link_names:
+    - fr3_link0
+    - fr3_link1
+    - fr3_link2
+    - fr3_link3
+    - fr3_link4
+    - fr3_link5
+    - fr3_link6
+    - fr3_link7
+    - base_link
+    - right_thumb_1
+    - right_thumb_2
+    - right_thumb_3
+    - right_thumb_4
+    - right_index_1
+    - right_index_2
+    - right_middle_1
+    - right_middle_2
+    - right_ring_1
+    - right_ring_2
+    - right_little_1
+    - right_little_2
+    cspace:
+      joint_names:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+      - right_thumb_1_joint
+      - right_thumb_2_joint
+      - right_index_1_joint
+      - right_middle_1_joint
+      - right_ring_1_joint
+      - right_little_1_joint
+      retract_config:
+      - 0.0
+      - -0.785
+      - 0.0
+      - -2.356
+      - 0.0
+      - 1.571
+      - 0.785
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      cspace_distance_weight:
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      null_space_weight:
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      max_jerk: 500.0
+      max_acceleration: 15.0

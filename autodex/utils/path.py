@@ -48,7 +48,8 @@ def load_candidate(obj_name, obj_pose, version, shuffle=True, skip_done=True,
                     scene_type_filter=None,
                     skip_scenes_with_success=False,
                     tabletop_pose_stem=None,
-                    candidate_order=None):
+                    candidate_order=None,
+                    candidates_root=None):
     """Load all grasp candidates under ``{candidates}/{hand}/{version}/{obj}``.
 
     Supports both layouts (auto-detected by walking until ``wrist_se3.npy`` is found):
@@ -68,7 +69,8 @@ def load_candidate(obj_name, obj_pose, version, shuffle=True, skip_done=True,
     grasp_pose_list = []
     scene_info = []
 
-    candidate_obj_path = os.path.join(get_candidate_path(hand), version, obj_name)
+    root = candidates_root or get_candidate_path(hand)
+    candidate_obj_path = os.path.join(root, version, obj_name)
     if not os.path.isdir(candidate_obj_path):
         return np.empty((0, 4, 4)), np.empty((0, 0)), np.empty((0, 0)), []
 

@@ -179,12 +179,14 @@ EE_LINK_BY_HAND = {
     "inspire_left": "base_link",
     "inspire":      "base_link",
     "allegro":      "base_link",
+    "fr3_inspire":  "base_link",
 }
 
 URDF_BY_HAND = {
     "inspire_left": ("inspire_left_description", "xarm_inspire_left.urdf"),
     "inspire":      ("inspire_description",      "xarm_inspire.urdf"),
     "allegro":      ("allegro_description",      "xarm_allegro.urdf"),
+    "fr3_inspire":  ("fr3_inspire_description",  "fr3_inspire.urdf"),
 }
 
 
@@ -220,21 +222,25 @@ def _ik_solve(planner: GraspPlanner, wrist_se3: np.ndarray, finger_q: np.ndarray
     q_sol = result.solution.cpu().numpy()[0]
     if q_sol.ndim == 2:
         q_sol = q_sol[0]
-    arm = q_sol[:6].copy()
-    # Snap joint 6 to nearest 2π-equivalent of the previous qpos so consecutive
-    # keyframes don't end up on opposite sides of the joint range (which makes
-    # the planner take a long way around). Fall back to INIT if no retract.
-    ref = retract_q[5] if retract_q is not None else planner._init_state[5]
-    diff = arm[5] - ref
-    arm[5] -= np.round(diff / (2 * np.pi)) * 2 * np.pi
-    # xarm URDF says joint 6 has ±2π range but cuRobo clamps to ±π. If the
-    # nearest-to-ref equivalent lands outside cuRobo's limit, wrap again into
-    # [-π, π] (the physical kinematics are identical; motion_gen / trajopt /
-    # PRM mask would reject it as joint-limit violation otherwise).
-    if arm[5] > np.pi:
-        arm[5] -= 2 * np.pi
-    elif arm[5] < -np.pi:
-        arm[5] += 2 * np.pi
+    # Arm DOF = full solution minus the hand fingers (6-DOF xarm, 7-DOF FR3).
+    n_arm = len(q_sol) - len(finger_q)
+    last = n_arm - 1  # wrist-most arm joint
+    arm = q_sol[:n_arm].copy()
+    # Snap the wrist-most joint to nearest 2π-equivalent of the previous qpos so
+    # consecutive keyframes don't end up on opposite sides of the joint range
+    # (which makes the planner take a long way around). Fall back to INIT if no
+    # retract.
+    ref = retract_q[last] if retract_q is not None else planner._init_state[last]
+    diff = arm[last] - ref
+    arm[last] -= np.round(diff / (2 * np.pi)) * 2 * np.pi
+    # xarm URDF says the wrist joint has ±2π range but cuRobo clamps to ±π. If
+    # the nearest-to-ref equivalent lands outside cuRobo's limit, wrap again
+    # into [-π, π] (the physical kinematics are identical; motion_gen / trajopt
+    # / PRM mask would reject it as joint-limit violation otherwise).
+    if arm[last] > np.pi:
+        arm[last] -= 2 * np.pi
+    elif arm[last] < -np.pi:
+        arm[last] += 2 * np.pi
     return np.concatenate([arm, finger_q])
 
 
@@ -316,6 +322,7 @@ def plan_one_seed(planner: GraspPlanner, *,
     """
     init = planner._init_state.copy()
     open_q = INSPIRE_INIT.astype(np.float32)
+    n_arm = len(init) - len(open_q)  # 6-DOF xarm, 7-DOF FR3
     full = (h_cm == 0)
 
     def wrist_world(T_obj):
@@ -323,7 +330,7 @@ def plan_one_seed(planner: GraspPlanner, *,
 
     q_pregrasp = _ik_solve(planner, wrist_world(T_obj_start), pregrasp_q, retract_q=init)
     if q_pregrasp is None: return None, "ik_pregrasp"
-    q_grasped = q_pregrasp.copy(); q_grasped[6:] = grasp_q
+    q_grasped = q_pregrasp.copy(); q_grasped[n_arm:] = grasp_q
     q_apex_i = _ik_solve(planner, wrist_world(T_obj_apex_i), grasp_q, retract_q=q_grasped)
     if q_apex_i is None: return None, "ik_apex_i"
     q_apex_j = _ik_solve(planner, wrist_world(T_obj_apex_j), grasp_q, retract_q=q_apex_i)
@@ -334,7 +341,7 @@ def plan_one_seed(planner: GraspPlanner, *,
     # Release / depart / retract keyframes only needed for full put-down.
     q_released = q_depart = None
     if full:
-        q_released = q_placed.copy(); q_released[6:] = open_q
+        q_released = q_placed.copy(); q_released[n_arm:] = open_q
         T_wrist_depart = wrist_world(T_obj_end).copy()
         T_wrist_depart[2, 3] += DEPART_DZ
         q_depart = _ik_solve(planner, T_wrist_depart, open_q, retract_q=q_released)

@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd ~/AutoDex\\necho \\\"=== 시스템 내 xarm_allegro URDF들 ===\\\"\\nfind /home/mingi/shared_data ~/AutoDex -name \\\"xarm_allegro*.urdf\\\" 2>/dev/null | while read f; do echo \\\"$(stat -c '%y' \\\"$f\\\" | c...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s\n=== 시스템 내 xarm_allegro URDF들 ===",
+  "timestamp": "2026-07-14T12:46:04.969Z",
+  "retry_count": 1
+}

@@ -55,6 +55,13 @@ HAND_JOINTS_INSPIRE_LEFT = [
 # Per-joint angle limits in cuRobo order (matches _convert_inspire).
 INSPIRE_LIMITS = np.array([1.15, 0.55, 1.6, 1.6, 1.6, 1.6])
 
+# Allegro: 16 actuated hand joints (joint_0.0 .. joint_15.0), URDF order.
+HAND_JOINTS_ALLEGRO = [f"joint_{i}.0" for i in range(16)]
+# Raw stream order -> URDF order (from project_robot_video_sync memory).
+# hand_urdf[i] = raw[MAP[i]]. Allegro values are already radians (no unit conv).
+ALLEGRO_POS_MAP = [5, 2, 0, 1, 7, 15, 14, 12, 11, 13, 4, 9, 8, 6, 10, 3]
+ALLEGRO_ACT_MAP = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3]
+
 EE_LINK = "base_link"   # hand base — wrist for FK
 MESH_BASE = Path.home() / "shared_data" / "AutoDex" / "object" / "paradex"
 
@@ -101,7 +108,7 @@ def _compute_sphere_poses(urdf: yourdfpy.URDF,
              for link, i, _, _ in items}
     for t, q in enumerate(full_q):
         cfg = {**{arm_names[i]: float(q[i]) for i in range(6)},
-               **{hand_names[i]: float(q[6 + i]) for i in range(6)}}
+               **{hand_names[i]: float(q[6 + i]) for i in range(len(hand_names))}}
         urdf.update_cfg(cfg)
         link_T_cache = {}
         for link, i, c, _ in items:
@@ -170,7 +177,7 @@ def _fk_wrist_batch(urdf: yourdfpy.URDF,
     out = np.tile(np.eye(4), (len(full_q), 1, 1))
     for t, q in enumerate(full_q):
         cfg = {**{arm_names[i]: float(q[i]) for i in range(6)},
-               **{hand_names[i]: float(q[6 + i]) for i in range(6)}}
+               **{hand_names[i]: float(q[6 + i]) for i in range(len(hand_names))}}
         urdf.update_cfg(cfg)
         out[t] = urdf.get_transform(EE_LINK, urdf.base_link)
     return out
@@ -261,15 +268,51 @@ def _collision_check_traj(full_q: np.ndarray,
             "collide": collide}
 
 
-def _detect_grasp_step(hand_rad: np.ndarray) -> int:
-    """Return the first index where the thumb_pitch has closed at least 0.15 rad
-    above its initial value, indicating the squeeze started. Falls back to 0
-    if no such step (caller will then attach object from frame 0).
+def _detect_grasp_step(hand_rad: np.ndarray, hand: str = "inspire_left") -> int:
+    """First index where the hand has closed past a small threshold from its
+    initial pose (squeeze start). Falls back to 0 (attach object from frame 0).
+
+    Inspire uses the thumb_pitch column; allegro uses overall finger flexion
+    (its thumb column is not a single reliable squeeze signal).
     """
+    if hand == "allegro":
+        d = np.linalg.norm(hand_rad - hand_rad[0], axis=1)
+        closed = np.where(d > 0.3)[0]
+        return int(closed[0]) if len(closed) else 0
     thumb_pitch = hand_rad[:, 1]
     base = thumb_pitch[0]
     closed = np.where(thumb_pitch > base + 0.15)[0]
     return int(closed[0]) if len(closed) else 0
+
+
+def _load_tracked_obj_poses(trial_dir: Path, c2r: np.ndarray,
+                            n_frames: int) -> np.ndarray:
+    """Object-tracking (gotrack) world poses on the synced video-frame axis.
+
+    world_pose_records.json holds per-frame ``pose_world`` (camera frame) keyed
+    by ``frame_index`` -- the SAME video-frame index as the synced arm/hand
+    streams. Convert each to robot frame (inv(C2R) @ pose_world) and place at its
+    frame; frames before/after the tracked span hold the first/last tracked pose.
+    """
+    recs = json.load(open(trial_dir / "object_tracking" / "gotrack_output"
+                          / "world_pose_records.json"))
+    recs = [r for r in recs if r.get("status") == "ok"]
+    if not recs:
+        sys.exit("--object_tracking: no 'ok' frames in world_pose_records.json")
+    c2r_inv = np.linalg.inv(c2r)
+    # frame_index i == synced/trigger frame i (gotrack processes frames 0..k and
+    # stops before the end); hold the last tracked pose on the untracked tail.
+    fi = [int(r["frame_index"]) for r in recs]
+    P = [c2r_inv @ np.asarray(r["pose_world"], dtype=np.float64) for r in recs]
+    out = np.tile(np.eye(4), (n_frames, 1, 1))
+    last, j = P[0], 0
+    for i in range(n_frames):
+        while j < len(fi) and fi[j] <= i:
+            last, j = P[j], j + 1
+        out[i] = last
+    print(f"[replay] object tracking: {len(recs)} frames "
+          f"(idx {fi[0]}-{fi[-1]}) on {n_frames} synced frames")
+    return out
 
 
 def main() -> None:
@@ -285,12 +328,25 @@ def main() -> None:
     parser.add_argument("--exp_name", default="reset_test/reorient_drop",
                         help="Path under experiment/ to search for trials.")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--show", default="both",
+                        choices=["both", "sensor", "action"],
+                        help="Which robot to draw: sensor (actual position), "
+                             "action (commanded action_qpos), or both.")
     parser.add_argument("--no_action", action="store_true",
-                        help="Hide the commanded-action ghost robot (default "
-                             "shows both sensor and action overlaid).")
+                        help="Alias for --show sensor (hide the commanded-action "
+                             "robot).")
     parser.add_argument("--action_offset_y", type=float, default=0.0,
                         help="Offset the action ghost robot along world y "
                              "(meters) so the two robots don't overlap.")
+    parser.add_argument("--object_tracking", action="store_true",
+                        help="Play the gotrack object-tracking world poses "
+                             "(object_tracking/gotrack_output) instead of a "
+                             "static object. Overrides --attach_object.")
+    parser.add_argument("--attach_object", action="store_true",
+                        help="Attach the object to the hand after the grasp "
+                             "step (needs a robot-frame wrist_se3). Default off: "
+                             "object stays static at its inv(C2R)@pose_world "
+                             "pose, which is always correct.")
     parser.add_argument("--check_collision", action="store_true",
                         help="Run cuRobo collision check on every trajectory "
                              "step (pre-grasp = object in world, post-grasp = "
@@ -307,60 +363,73 @@ def main() -> None:
                              "adds the xArm arm links too (~89 spheres).")
     args = parser.parse_args()
 
-    if args.hand != "inspire_left":
-        sys.exit("only inspire_left wired up so far (hand order/limits differ "
-                 "for inspire/allegro — extend HAND_JOINTS_* and conversion).")
+    if args.hand not in ("inspire_left", "allegro"):
+        sys.exit("only inspire_left and allegro wired up (inspire-right hand "
+                 "order not added — extend HAND_JOINTS_* and conversion).")
+    hand_names = (HAND_JOINTS_ALLEGRO if args.hand == "allegro"
+                  else HAND_JOINTS_INSPIRE_LEFT)
 
     trial_dir = _resolve_trial_dir(args)
     obj_name = _infer_obj_name(trial_dir, args.obj)
     print(f"[replay] trial = {trial_dir}")
     print(f"[replay] obj   = {obj_name}")
 
-    raw = trial_dir / "raw"
-    arm_t       = np.load(raw / "arm"  / "time.npy")
-    arm_pos     = np.load(raw / "arm"  / "position.npy")
-    # NOTE: arm/action.npy is CARTESIAN (mm + axis-angle); the joint-space
-    # commanded values are saved separately as arm/action_qpos.npy.
-    arm_act_qp  = np.load(raw / "arm"  / "action_qpos.npy")
-    hand_t      = np.load(raw / "hand" / "time.npy")
-    hand_pos_raw = np.load(raw / "hand" / "position.npy")  # int 0-1000, ctrl order
-    hand_act_raw = np.load(raw / "hand" / "action.npy")    # int 0-1000, ctrl order
+    # Frame-synced qpos (arm/, hand/): already video-frame-aligned and URDF
+    # joint order, same frame axis as object_tracking. hand/state|action are
+    # already reordered to URDF -- no remap.
+    arm_state  = np.load(trial_dir / "arm"  / "state.npy")     # (F,6) sensor qpos
+    # arm/action.npy is the cartesian command (lift = wrist_se3, |.| >> 2pi).
+    # arm/action_qpos.npy is the IK-fixed joint qpos (lift converted) -- use it so
+    # the action robot actually lifts. Fall back to action.npy only if it is absent.
+    aq_path = trial_dir / "arm" / "action_qpos.npy"
+    arm_action = np.load(aq_path if aq_path.exists() else trial_dir / "arm" / "action.npy")
+    hand_state  = np.load(trial_dir / "hand" / "state.npy")    # (F,H) URDF order
+    hand_action = np.load(trial_dir / "hand" / "action.npy")   # (F,H) URDF order
 
-    print(f"[replay] arm  : {arm_pos.shape} ({arm_t[-1] - arm_t[0]:.2f}s)")
-    print(f"[replay] hand : {hand_pos_raw.shape} ({hand_t[-1] - hand_t[0]:.2f}s)")
+    # Safety net: if any frame is still a cartesian wrist_se3 (|.| >> 2pi) -- e.g.
+    # action_qpos.npy missing and we fell back to action.npy -- forward-fill the
+    # last valid qpos row so the action robot doesn't explode.
+    bad = np.any(np.abs(arm_action) > 7.0, axis=1)
+    if bad.any():
+        last = 0
+        for i in range(len(arm_action)):
+            if not bad[i]:
+                last = i
+            else:
+                arm_action[i] = arm_action[last]
+        print(f"[replay] arm/action: {int(bad.sum())} lift-phase frames "
+              f"(wrist_se3, not qpos) held at last valid qpos")
 
-    def _hand_to_arm_timeline(h_raw_all):
-        h_aligned = np.zeros((len(arm_t), 6), dtype=np.float64)
-        for i in range(6):
-            h_aligned[:, i] = np.interp(arm_t, hand_t, h_raw_all[:, i])
-        return sensor_units_to_rad(h_aligned)
-
-    hand_rad_sensor = _hand_to_arm_timeline(hand_pos_raw)
-    hand_rad_action = _hand_to_arm_timeline(hand_act_raw)
-
-    full_q_sensor = np.concatenate([arm_pos,    hand_rad_sensor],
-                                    axis=1).astype(np.float32)
-    full_q_action = np.concatenate([arm_act_qp, hand_rad_action],
-                                    axis=1).astype(np.float32)
-    full_q = full_q_sensor   # default: collision check + obj-attach on sensor
-    print(f"[replay] sensor: {full_q_sensor.shape}  action: {full_q_action.shape}")
+    full_q_sensor = np.concatenate([arm_state,  hand_state],  axis=1).astype(np.float32)
+    full_q_action = np.concatenate([arm_action, hand_action], axis=1).astype(np.float32)
+    print(f"[replay] synced frames: {len(full_q_sensor)}  "
+          f"sensor {full_q_sensor.shape}  action {full_q_action.shape}")
 
     # Object pose — convert WORLD (camera) → robot via C2R.
     pose_world = np.load(trial_dir / "pose_world.npy")
     c2r = np.load(trial_dir / "C2R.npy")
     pose_obj_robot = np.linalg.inv(c2r) @ pose_world
 
-    # Build T_obj_in_wrist from saved grasp-time wrist and initial object pose.
-    plan_dir = trial_dir / "plan"
-    wrist_se3 = np.load(plan_dir / "wrist_se3.npy")     # 4x4, robot frame
-    if (plan_dir / "T_obj_in_wrist.npy").exists():
-        T_obj_in_wrist = np.load(plan_dir / "T_obj_in_wrist.npy")
-    else:
-        T_obj_in_wrist = np.linalg.inv(wrist_se3) @ pose_obj_robot
-
-    grasp_step = _detect_grasp_step(hand_rad_sensor)
-    print(f"[replay] grasp detected at step {grasp_step} "
-          f"(t={arm_t[grasp_step] - arm_t[0]:.2f}s)")
+    # Object attach (hand-follow after grasp) is OPT-IN: it needs wrist_se3 in a
+    # consistent robot frame, which dataset trials (wrist_source=fk_executed,
+    # canonical/object frame) do NOT guarantee -- a bad frame flings the object
+    # off and looks like "object not c2r'd". Default: keep the object STATIC at
+    # inv(C2R) @ pose_world (correct robot-frame placement) for the whole replay.
+    T_obj_in_wrist = None
+    grasp_step = len(full_q_sensor)   # no attach -> object never leaves init pose
+    if args.attach_object:
+        grasp_src = next((d for d in (trial_dir / "plan", trial_dir / "executed_grasp")
+                          if (d / "wrist_se3.npy").exists()), None)
+        if grasp_src is None:
+            sys.exit(f"--attach_object needs wrist_se3.npy under plan/ or "
+                     f"executed_grasp/ in {trial_dir}")
+        wrist_se3 = np.load(grasp_src / "wrist_se3.npy")     # 4x4, robot frame
+        if (grasp_src / "T_obj_in_wrist.npy").exists():
+            T_obj_in_wrist = np.load(grasp_src / "T_obj_in_wrist.npy")
+        else:
+            T_obj_in_wrist = np.linalg.inv(wrist_se3) @ pose_obj_robot
+        grasp_step = _detect_grasp_step(hand_state, args.hand)
+        print(f"[replay] grasp detected at frame {grasp_step}")
 
     collide_info = None
     if args.check_collision:
@@ -377,20 +446,24 @@ def main() -> None:
         c_action = _collision_check_traj(full_q_action, scene_path,
                                           args.hand, grasp_step)
         out_path = trial_dir / "replay_collision.npz"
-        np.savez(out_path, time=arm_t,
+        np.savez(out_path,
                  **{f"sensor_{k}": v for k, v in c_sensor.items()},
                  **{f"action_{k}": v for k, v in c_action.items()})
         print(f"\n[collide] report saved → {out_path}")
         collide_info = {"sensor": c_sensor, "action": c_action}
 
-    # Compute wrist FK at every step (needed only AFTER grasp_step).
     urdf_path = URDF_BY_HAND[args.hand]
     urdf = yourdfpy.URDF.load(str(urdf_path))
-    wrist_T = _fk_wrist_batch(urdf, full_q, ARM_JOINTS,
-                              HAND_JOINTS_INSPIRE_LEFT)
 
-    obj_poses = np.tile(pose_obj_robot[None], (len(full_q), 1, 1))
-    obj_poses[grasp_step:] = wrist_T[grasp_step:] @ T_obj_in_wrist
+    # Object pose over time: gotrack tracking (--object_tracking) > hand-attach
+    # (--attach_object) > static at the c2r'd init pose (default).
+    if args.object_tracking:
+        obj_poses = _load_tracked_obj_poses(trial_dir, c2r, len(full_q_sensor))
+    else:
+        obj_poses = np.tile(pose_obj_robot[None], (len(full_q_sensor), 1, 1))
+        if args.attach_object and T_obj_in_wrist is not None:
+            wrist_T = _fk_wrist_batch(urdf, full_q_sensor, ARM_JOINTS, hand_names)
+            obj_poses[grasp_step:] = wrist_T[grasp_step:] @ T_obj_in_wrist
 
     # Viewer.
     mesh_path = MESH_BASE / obj_name / "raw_mesh" / f"{obj_name}.obj"
@@ -398,12 +471,20 @@ def main() -> None:
         sys.exit(f"obj mesh not found: {mesh_path}")
     obj_mesh = trimesh.load(str(mesh_path), process=False)
 
+    # --show controls which robot(s) to draw: sensor (actual), action (commanded
+    # action_qpos), or both. --no_action is kept as an alias for --show sensor.
+    show = "sensor" if args.no_action else args.show
+
     vis = ViserViewer(port_number=args.port)
-    vis.add_robot("xarm", str(urdf_path))
-    if not args.no_action:
+    if show in ("both", "sensor"):
+        vis.add_robot("xarm", str(urdf_path))
+    if show in ("both", "action"):
         action_pose = np.eye(4)
-        action_pose[1, 3] = float(args.action_offset_y)
+        action_pose[1, 3] = float(args.action_offset_y) if show == "both" else 0.0
         vis.add_robot("xarm_action", str(urdf_path), pose=action_pose)
+        # green so the commanded (action_qpos) robot is distinct from sensor.
+        # NOTE: robot change_color takes 0-255 (objects take 0-1).
+        vis.change_color("xarm_action", (0, 255, 0))
     vis.add_object("obj", obj_mesh, pose_obj_robot)
     vis.add_floor(height=0.0)
 
@@ -415,15 +496,17 @@ def main() -> None:
               f"{len(full_q_sensor)} steps...")
         sphere_traj, sphere_radii = _compute_sphere_poses(
             urdf, full_q_sensor, spheres,
-            ARM_JOINTS, HAND_JOINTS_INSPIRE_LEFT)
+            ARM_JOINTS, hand_names)
         for name, r in sphere_radii.items():
             sph_mesh = trimesh.creation.icosphere(subdivisions=1, radius=r)
             sph_mesh.visual.face_colors = [255, 80, 80, 110]  # transp red
             vis.add_object(name, sph_mesh, sphere_traj[name][0])
         print(f"[replay] added {n_spheres} cuRobo collision spheres")
 
-    robot_traj = {"xarm": full_q_sensor}
-    if not args.no_action:
+    robot_traj = {}
+    if show in ("both", "sensor"):
+        robot_traj["xarm"] = full_q_sensor
+    if show in ("both", "action"):
         robot_traj["xarm_action"] = full_q_action
     vis.add_traj("replay", robot_traj,
                  {"obj": obj_poses, **sphere_traj})

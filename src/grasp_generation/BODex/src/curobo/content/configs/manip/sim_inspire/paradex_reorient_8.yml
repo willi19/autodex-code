@@ -1,0 +1,60 @@
+world:
+  type: paradex
+  obj_list : [
+    "organizer_beige",
+    "soaptray",
+    "donut",
+    "pepper_tuna",
+    "icecream_scoop"
+  ]
+  scene_type : ["reorient_8"]
+
+robot_file: "inspire.yml"
+robot_file_with_arm:
+base_cfg_file: "base_grasp.yml"
+particle_file: "particle_grasp_debug.yml"
+gradient_file: "gradient_grasp_fc.yml"
+
+exp_name: 'reset_8'
+seed_num: 1000
+seeder_cfg:
+  obj_sample:
+    num: 1024
+    inflate: 0.10
+    convex_hull: False
+    collision_free: True
+  ik_init_q:
+  load_path:
+  skip_transfer: False
+  t:
+  r:
+  q: [0., 0., 0., 0., 0., 0.]
+  jitter_angle: [[-180, -15, -15], [180, 15, 15]]
+  jitter_dist: [[0.0, -0.03, -0.03], [0.03, 0.03, 0.03]]
+
+grasp_contact_strategy:
+  contact_points_name: ['right_thumb_4/0', 'right_index_2/2', 'right_middle_2/2', 'right_ring_2/2', 'right_little_2/2']
+  opt_progress: [0.0, 0.3, 0.95]
+  distance: [0.01, 0.01, 0.0]
+  contact_query_mode: [-1, 0, 0]
+  save_qpos: [False, True]
+  max_ge_stage: 0
+
+grasp_cfg:
+  task_dict:
+    f: [0, 0, 1]
+    p: [0, 0, 0]
+    t: [0, 0, 0]
+    gamma: 180
+  ge_param:
+    type: 'qp'
+    miu_coef: [0.1, 0]
+    solver_type: 'batch_reluqp'
+    k_lower: 0.2
+    pressure_constraints:
+      [[[0, 1, 2, 3], 1.0],
+        [[0, 1], 0.4],
+        [[3], 0.5],
+      ]
+    enable_density: False
+    solve_interval: 5

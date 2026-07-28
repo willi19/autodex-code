@@ -45,12 +45,12 @@ from scipy.spatial.transform import Rotation as R
 from curobo.geom.types import WorldConfig
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from autodex.utils.path import project_dir, obj_path, repo_dir
+from autodex.utils.path import repo_dir, get_scene_dir
 from autodex.utils.conversion import se32cart, cart2se3
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import TABLE_CUBOID, add_obstacles
 from autodex.planner.planner import (
-    _to_curobo_world, _to_curobo_pose, _snap_joint6,
+    _to_curobo_world, _to_curobo_pose,
 )
 from paradex.visualization.visualizer.viser import ViserViewer
 
@@ -59,15 +59,43 @@ LIFT_HEIGHT_M = 0.25
 GRASP_LIFT_M = 0.12           # small post-grasp lift to show the pick
 TABLE_SURFACE_Z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2  # 0.039
 EE_LINK = "base_link"
-GRASP_VERSION = "v7"          # scene grasp candidates (scene types auto-discovered
-                              # from v7/{obj}/ — shelf, wall, box, ... generically)
+GRASP_VERSION = "v8"          # scene grasp candidates (scene types auto-discovered
+                              # from {version}/{obj}/ — shelf, wall, box, ... generically)
+
+# Live candidate tree. project_dir/candidates holds the NAS *tarballs* for v8
+# (see the v8 gen pipeline: tar-to-NAS, keep the local dir browsable), so the
+# extracted grasps live in the repo — same root plan_reset.py uses.
+CAND_ROOT = Path(repo_dir) / "candidates"
+
+# v8 scenes + grasps were generated against object_processing, NOT the older
+# obj_path (= AutoDex/object/paradex) whose tabletop set differs. Mixing the two
+# mislabels pose_idx, so every mesh/tabletop lookup here uses object_processing.
+OBJ_ROOT = Path.home() / "shared_data" / "object_processing"
 
 _URDF_ROOT = Path.home() / "shared_data" / "AutoDex" / "content" / "assets" / "robot"
+# Keyed by PLANNER hand (arm+hand), not by candidate hand.
 URDF_BY_HAND = {
     "inspire_left": _URDF_ROOT / "inspire_left_description" / "xarm_inspire_left.urdf",
     "inspire":      _URDF_ROOT / "inspire_description"      / "xarm_inspire.urdf",
     "allegro":      _URDF_ROOT / "allegro_description"      / "xarm_allegro.urdf",
+    "fr3_inspire":  _URDF_ROOT / "fr3_inspire_description"  / "fr3_inspire.urdf",
 }
+
+# (arm, candidate hand) -> GraspPlanner hand. The candidate hand names the grasp
+# set on disk (arm-independent, floating-hand BODex output); the arm decides which
+# robot the planner loads. Only pairs with a planner config are listed.
+PLANNER_HAND = {("fr3", "inspire"): "fr3_inspire"}
+
+
+def planner_hand(arm: str, hand: str) -> str:
+    """Planner (arm+hand) config key for a candidate hand on a given arm."""
+    if arm in ("", "xarm"):
+        return hand
+    try:
+        return PLANNER_HAND[(arm, hand)]
+    except KeyError:
+        raise SystemExit(f"no planner config for arm={arm} hand={hand}; "
+                         f"have {sorted(PLANNER_HAND)}")
 # Floating-base hand URDFs (6 base joints + finger joints) — used to draw the
 # target grasp hand as a static ghost at the goal wrist pose.
 FLOATING_URDF_BY_HAND = {
@@ -75,7 +103,6 @@ FLOATING_URDF_BY_HAND = {
     "inspire":      _URDF_ROOT / "inspire_description" / "inspire_floating.urdf",
     "allegro":      _URDF_ROOT / "allegro_description" / "allegro_floating.urdf",
 }
-MESH_BASE = Path(obj_path)
 
 X_GRID = np.arange(0.30, 0.71, 0.05)        # must match seed_cache.X_GRID
 YAW_GRID = np.linspace(0, 2 * np.pi, 36, endpoint=False)   # 10deg, match seed_cache n_yaw=36
@@ -90,15 +117,15 @@ CURRENT_SCENE_TYPES = ("shelf", "wall", "box")
 # data discovery
 # --------------------------------------------------------------------------- #
 def hands_with_reset() -> list[str]:
-    base = Path(project_dir) / "candidates"
+    base = CAND_ROOT
     return sorted(h.name for h in base.iterdir()
                   if (h / "reset").is_dir()) if base.is_dir() else []
 
 
 def objects_for_hand(hand: str) -> list[str]:
     """Objects that have BOTH reset cells (for the route) and v7 grasps."""
-    reset_dir = Path(project_dir) / "candidates" / hand / "reset"
-    v7_dir = Path(project_dir) / "candidates" / hand / GRASP_VERSION
+    reset_dir = CAND_ROOT / hand / "reset"
+    v7_dir = CAND_ROOT / hand / GRASP_VERSION
     if not (reset_dir.is_dir() and v7_dir.is_dir()):
         return []
     return sorted(set(p.name for p in reset_dir.iterdir() if p.is_dir())
@@ -106,40 +133,44 @@ def objects_for_hand(hand: str) -> list[str]:
 
 
 def scene_types_for(hand: str, obj: str) -> list[str]:
-    d = Path(project_dir) / "candidates" / hand / GRASP_VERSION / obj
+    d = CAND_ROOT / hand / GRASP_VERSION / obj
     return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
 
 def scene_ids_for(hand: str, obj: str, stype: str) -> list[str]:
-    d = Path(project_dir) / "candidates" / hand / GRASP_VERSION / obj / stype
+    d = CAND_ROOT / hand / GRASP_VERSION / obj / stype
     return sorted((p.name for p in d.iterdir() if p.is_dir()), key=int) \
         if d.is_dir() else []
 
 
 def grasp_names_for(hand: str, obj: str, stype: str, sid: str) -> list[str]:
-    d = Path(project_dir) / "candidates" / hand / GRASP_VERSION / obj / stype / sid
+    d = CAND_ROOT / hand / GRASP_VERSION / obj / stype / sid
     return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
 
-def scene_pose_idx(obj: str, stype: str, sid: str) -> int | None:
-    """Required tabletop pose for a scene (meta.pose_idx)."""
-    p = Path(obj_path) / obj / "scene" / stype / f"{sid}.json"
+def scene_pose_idx(hand: str, obj: str, stype: str, sid: str) -> int | None:
+    """Required tabletop pose for a scene (meta.pose_idx).
+
+    Scenes are HAND-specific (the adaptive gap is adapted per hand), so they are
+    read via get_scene_dir(hand, ...) — never the shared object_processing scratch.
+    """
+    p = Path(get_scene_dir(hand, obj, stype)) / f"{sid}.json"
     if not p.exists():
         return None
     return int(json.load(open(p))["meta"]["pose_idx"])
 
 
-def default_start_pose(obj: str, stype: str, sid: str) -> str:
+def default_start_pose(hand: str, obj: str, stype: str, sid: str) -> str:
     """Pick a start pose DIFFERENT from the scene's required pose so the first
     Plan shows a reset (falls back to the target pose if it's the only one)."""
     poses = sorted(load_tabletop_poses(obj).keys())
-    j = scene_pose_idx(obj, stype, sid)
+    j = scene_pose_idx(hand, obj, stype, sid)
     other = [p for p in poses if p != j]
     return str(other[0] if other else (j if j is not None else poses[0]))
 
 
 def autoselect_h_cm(hand: str, obj: str) -> int | None:
-    base = Path(project_dir) / "candidates" / hand / "reset" / obj
+    base = CAND_ROOT / hand / "reset" / obj
     if not base.is_dir():
         return None
     hs = sorted(int(p.name.split("_")[1]) for p in base.glob("reorient_*")
@@ -165,13 +196,18 @@ def fk_ee(urdf, joint_traj) -> np.ndarray:
     return out
 
 
+def mesh_file(obj: str) -> Path:
+    """Collision/visual mesh v8 grasps + scenes were generated against."""
+    return OBJ_ROOT / obj / "processed_data" / "mesh" / "simplified.obj"
+
+
 def load_tabletop_poses(obj: str) -> dict[int, np.ndarray]:
-    d = Path(obj_path) / obj / "processed_data" / "info" / "tabletop"
+    d = OBJ_ROOT / obj / "processed_data" / "info" / "tabletop"
     return {int(f.stem): _load_T(f) for f in sorted(d.glob("*.npy"))}
 
 
 def build_graph(hand: str, obj: str, h_cm: int) -> dict[int, set[int]]:
-    base = Path(project_dir) / "candidates" / hand / "reset" / obj / f"reorient_{h_cm}"
+    base = CAND_ROOT / hand / "reset" / obj / f"reorient_{h_cm}"
     graph: dict[int, set[int]] = {}
     for cell in base.iterdir():
         if not cell.is_dir() or "_" not in cell.name:
@@ -197,7 +233,7 @@ def find_reset_path(graph: dict[int, set[int]], i: int, j: int) -> list[int] | N
 
 
 def load_reset_seeds(hand, obj, h_cm, i, j, T_obj_world):
-    cell = (Path(project_dir) / "candidates" / hand / "reset" / obj
+    cell = (CAND_ROOT / hand / "reset" / obj
             / f"reorient_{h_cm}" / f"{i}_{j}")
     if not cell.exists():
         return None
@@ -246,8 +282,9 @@ def ik_check_seeds(planner: GraspPlanner, scene_cfg: dict, seeds: dict) -> dict:
         for k, ii in enumerate(idx):
             if succ[k]:
                 ik_success[ii] = True
-                arm = qsol[k, :6].copy(); arm[5] = _snap_joint6(arm[5], planner._init_state[5])
-                ik_qpos[ii, :6] = arm; ik_qpos[ii, 6:] = pregrasp[ii]
+                na = planner._n_arm
+                arm = planner._snap_arm(qsol[k, :na].copy(), planner._init_state)
+                ik_qpos[ii, :na] = arm; ik_qpos[ii, na:] = pregrasp[ii]
     return {"ik_success": ik_success, "ik_qpos": ik_qpos, "wrist_se3": wrist_se3,
             "pregrasp": pregrasp, "grasp": seeds["grasp"], "n_total": N,
             "n_backward": int(backward.sum()), "n_collision": int(collision.sum())}
@@ -271,8 +308,9 @@ def _ensure_motion_gen(planner, world):
 
 
 def _arm_limits(planner):
+    n = planner._n_arm
     jl = planner._motion_gen.kinematics.get_joint_limits()
-    return jl.position[0].cpu().numpy()[:6], jl.position[1].cpu().numpy()[:6]
+    return jl.position[0].cpu().numpy()[:n], jl.position[1].cpu().numpy()[:n]
 
 
 def _unwrap_arm(arm, prev, lo, hi):
@@ -281,7 +319,7 @@ def _unwrap_arm(arm, prev, lo, hi):
     joint wrapped by ~2*pi -> a big visual jump even though the wrist is smooth.
     (Previously only joint 6 was unwrapped, so other joints could flip.)"""
     out = np.asarray(arm, dtype=np.float32).copy()
-    for j in range(6):
+    for j in range(len(out)):
         cand = out[j] - 2.0 * np.pi * np.round((out[j] - prev[j]) / (2.0 * np.pi))
         if lo[j] - 1e-6 <= cand <= hi[j] + 1e-6:
             out[j] = cand
@@ -306,8 +344,9 @@ def cartesian_move_z(planner, urdf, scene_lift, start_qpos, dz, hold_hand, n=24)
     GATE = 0.5            # rad; max per-waypoint joint step (continuity success metric)
     T_w0 = fk_ee(urdf, start_qpos[None])[0]
     hold = np.asarray(hold_hand, dtype=np.float32)
-    traj = [np.concatenate([start_qpos[:6], hold]).astype(np.float32)]
-    prev_arm = start_qpos[:6].astype(np.float32)
+    na = planner._n_arm
+    traj = [np.concatenate([start_qpos[:na], hold]).astype(np.float32)]
+    prev_arm = start_qpos[:na].astype(np.float32)
     for z in np.linspace(0.0, dz, n)[1:]:
         T = T_w0.copy(); T[2, 3] += float(z)
         # CONTINUITY-gated IK: 1 warm-start at prev + 31 random, pick the solution
@@ -325,7 +364,7 @@ def cartesian_move_z(planner, urdf, scene_lift, start_qpos, dz, hold_hand, n=24)
         for i in range(len(sols)):
             if not succ[i]:
                 continue
-            c = _unwrap_arm(sols[i][:6], prev_arm, lo, hi)
+            c = _unwrap_arm(sols[i][:na], prev_arm, lo, hi)
             d = float(np.abs(c - prev_arm).max())
             if d < bd:
                 bd, best = d, c
@@ -343,25 +382,27 @@ def _unclear_phase(planner, obj_T, to_config=None, name="unclear"):
     j0 azimuth offset for swept reposition picks); defaults to INIT (reset starts there)."""
     init = planner._init_state.astype(np.float32)
     tgt = init if to_config is None else np.asarray(to_config, np.float32)
-    clear6 = init[:6].copy(); clear6[0] -= np.deg2rad(60.0)
-    rob = np.concatenate([_interp(clear6, tgt[:6], 20),
-                          np.tile(tgt[6:][None], (20, 1))], 1)
+    na = planner._n_arm
+    clear_arm = init[:na].copy(); clear_arm[0] -= np.deg2rad(60.0)
+    rob = np.concatenate([_interp(clear_arm, tgt[:na], 20),
+                          np.tile(tgt[na:][None], (20, 1))], 1)
     obj = np.tile(np.asarray(obj_T, np.float32)[None], (20, 1, 1))
     return (name, rob, obj)
 
 
 def build_release_retract(planner, descent_end, pregrasp_hand, grasp_hand):
-    init_hand = planner._init_state[6:].astype(np.float32)
-    xarm_init = planner._init_state[:6].astype(np.float32)
+    na = planner._n_arm
+    init_hand = planner._init_state[na:].astype(np.float32)
+    arm_init = planner._init_state[:na].astype(np.float32)
     Nr = 20
-    arm = np.tile(descent_end[:6][None], (Nr, 1))
+    arm = np.tile(descent_end[:na][None], (Nr, 1))
     release = np.concatenate(
         [np.concatenate([arm, _interp(grasp_hand, pregrasp_hand, Nr)], 1),
          np.concatenate([arm, _interp(pregrasp_hand, init_hand, Nr)], 1)], 0)
     # retract to the -60deg "clear" pose (base rotated out of the camera view) --
     # ALL joints move together (continuous), not one-at-a-time sequential.
-    clear = xarm_init.copy(); clear[0] -= np.deg2rad(60.0)
-    arm_ret = _interp(descent_end[:6].astype(np.float32), clear, 40)
+    clear = arm_init.copy(); clear[0] -= np.deg2rad(60.0)
+    arm_ret = _interp(descent_end[:na].astype(np.float32), clear, 40)
     retract = np.concatenate([arm_ret, np.tile(init_hand[None], (len(arm_ret), 1))], 1)
     return release, retract
 
@@ -426,7 +467,8 @@ def plan_transition(planner, urdf, obj, hand, h_cm, i, j, T_obj_world_i,
 
         Nb = 20
         grasp_close = np.concatenate(
-            [np.tile(grasp_qpos[:6][None], (Nb, 1)), _interp(pregrasp_hand, grasp_hand, Nb)], 1)
+            [np.tile(grasp_qpos[:planner._n_arm][None], (Nb, 1)),
+             _interp(pregrasp_hand, grasp_hand, Nb)], 1)
         release, retract = build_release_retract(planner, descent[-1].copy(), pregrasp_hand, grasp_hand)
         obj_app = np.tile(T_obj_world_i[None], (len(approach), 1, 1))
         obj_grp = np.tile(T_obj_world_i[None], (len(grasp_close), 1, 1))
@@ -492,9 +534,11 @@ def plan_grasp_in_scene(planner, urdf, obj, hand, stype, sid, grasp_sel,
         grasp_qpos = approach[-1].copy()
         Nb = 20
         grasp_close = np.concatenate(
-            [np.tile(grasp_qpos[:6][None], (Nb, 1)), _interp(pregrasp_hand, grasp_hand, Nb)], 1)
+            [np.tile(grasp_qpos[:planner._n_arm][None], (Nb, 1)),
+             _interp(pregrasp_hand, grasp_hand, Nb)], 1)
         # STRAIGHT cartesian lift (mirrors executor real.py:592).
-        grasp_at_close = np.concatenate([grasp_qpos[:6], grasp_hand]).astype(np.float32)
+        grasp_at_close = np.concatenate(
+            [grasp_qpos[:planner._n_arm], grasp_hand]).astype(np.float32)
         lift = cartesian_move_z(planner, urdf, scene_lift, grasp_at_close,
                                 GRASP_LIFT_M, grasp_hand)
         if lift is None:
@@ -515,8 +559,7 @@ def plan_grasp_in_scene(planner, urdf, obj, hand, stype, sid, grasp_sel,
 # --------------------------------------------------------------------------- #
 def plan_full_path(planner, urdf, obj, hand, h_cm, tabletop_poses, graph,
                    mesh_path, stype, sid, grasp_sel, start_pose, x0, theta0):
-    j = int(json.load(open(Path(obj_path) / obj / "scene" / stype / f"{sid}.json"))
-            ["meta"]["pose_idx"])
+    j = scene_pose_idx(hand, obj, stype, sid)
     i = int(start_pose)
     log = [f"start pose i={i} @ x={x0:.2f} theta={np.degrees(theta0):.0f}deg  "
            f"-> grasp scene {stype}/{sid} needs pose j={j}"]
@@ -586,17 +629,17 @@ def compute_coverage_data(planner, obj, hand, scene_types=CURRENT_SCENE_TYPES):
 
     cdir = Path(repo_dir) / "order" / hand / GRASP_VERSION / obj
     va_path, meta_path = cdir / "coverage_current.npy", cdir / "coverage_current.json"
-    cand_root = str(Path(project_dir) / "candidates" / hand / GRASP_VERSION)
+    cand_root = str(CAND_ROOT / hand / GRASP_VERSION)
     info, wrist_obj, preg = load_grasp_data(cand_root, obj)
     if len(info) == 0:
         return None
-    grasp_meta = [(g[1], g[2], g[3], scene_pose_idx(obj, g[1], g[2])) for g in info]
+    grasp_meta = [(g[1], g[2], g[3], scene_pose_idx(hand, obj, g[1], g[2])) for g in info]
 
     if va_path.exists() and meta_path.exists():
         valid_array = np.load(va_path)
         scene_meta = [tuple(m) for m in json.load(open(meta_path))["scene_meta"]]
     else:
-        scene_root = Path(obj_path) / obj / "scene"
+        scene_root = Path(get_scene_dir(hand, obj))
         rows, scene_meta = [], []
         for st in scene_types:
             std = scene_root / st
@@ -609,7 +652,7 @@ def compute_coverage_data(planner, obj, hand, scene_types=CURRENT_SCENE_TYPES):
                 coll = planner._check_collision(_to_curobo_world(scfg), wrist_world, preg)
                 if (~coll).any():
                     rows.append(~coll)
-                    scene_meta.append((st, sf.stem, scene_pose_idx(obj, st, sf.stem)))
+                    scene_meta.append((st, sf.stem, scene_pose_idx(hand, obj, st, sf.stem)))
         if not rows:
             return None
         valid_array = np.array(rows)
@@ -789,12 +832,13 @@ def plan_grasps_at_placement(planner, urdf, obj, hand, current_T, cand, wrist_ob
         for i in range(B):
             if succ[i]:
                 g = cand[cs + i]
-                arm = sol[i, :6].copy(); arm[5] = _snap_joint6(arm[5], planner._init_state[5])
+                arm = planner._snap_arm(sol[i, :planner._n_arm].copy(),
+                                        planner._init_state)
                 ik_qpos[g] = np.concatenate([arm, np.asarray(pregrasp[g], np.float32)])
     # keep _ik_solver alive: _clean_plan -> build_one re-IKs per sweep angle below.
 
     scene_lift = {"mesh": {}, "cuboid": {"table": TABLE_CUBOID}}
-    cbase = Path(project_dir) / "candidates" / hand / GRASP_VERSION / obj
+    cbase = CAND_ROOT / hand / GRASP_VERSION / obj
     phases, played, failed = [], 0, 0
     avail = [g for g in cand if g in ik_qpos]      # IK-reachable only
     while not covered[scenes_p].all() and avail:
@@ -814,11 +858,12 @@ def plan_grasps_at_placement(planner, urdf, obj, hand, current_T, cand, wrist_ob
         pregrasp_g = np.asarray(pregrasp[g], np.float32)
         grasp_qpos = approach[-1].copy()
         Nb = 20
+        na = planner._n_arm
         grasp_close = np.concatenate(
-            [np.tile(grasp_qpos[:6][None], (Nb, 1)), _interp(pregrasp_g, grasp_g, Nb)], 1)
+            [np.tile(grasp_qpos[:na][None], (Nb, 1)), _interp(pregrasp_g, grasp_g, Nb)], 1)
         _t = time.time()
         lift = cartesian_move_z(planner, urdf, scene_lift,
-                                np.concatenate([grasp_qpos[:6], grasp_g]).astype(np.float32),
+                                np.concatenate([grasp_qpos[:na], grasp_g]).astype(np.float32),
                                 GRASP_LIFT_M, grasp_g)
         _alog(f"grasp g{g}", "lift", time.time() - _t, lift is not None)
         if lift is None:
@@ -833,12 +878,13 @@ def plan_grasps_at_placement(planner, urdf, obj, hand, current_T, cand, wrist_ob
         # camera-clear rest pose = INIT with base rotated -60deg. Bracket to the plan's
         # ACTUAL start config (approach[0]) -- a swept grasp carries a j0 azimuth offset
         # there -- so there's no jump between the bracket and the approach.
-        start6 = approach[0][:6].astype(np.float32)
-        start_hand = approach[0][6:].astype(np.float32)
-        clear6 = planner._init_state[:6].astype(np.float32).copy(); clear6[0] -= np.deg2rad(60.0)
-        unclear = np.concatenate([_interp(clear6, start6, 20),
+        start_arm = approach[0][:na].astype(np.float32)
+        start_hand = approach[0][na:].astype(np.float32)
+        clear_arm = planner._init_state[:na].astype(np.float32).copy()
+        clear_arm[0] -= np.deg2rad(60.0)
+        unclear = np.concatenate([_interp(clear_arm, start_arm, 20),
                                   np.tile(start_hand[None], (20, 1))], 1)
-        clearp = np.concatenate([_interp(start6, clear6, 20),
+        clearp = np.concatenate([_interp(start_arm, clear_arm, 20),
                                  np.tile(start_hand[None], (20, 1))], 1)
         obj_hold = np.tile(current_T[None], (20, 1, 1))
         phases += [(f"g{g}_unclear", unclear, obj_hold),
@@ -878,8 +924,9 @@ def cartesian_object_path(planner, scene_lift, start_qpos, obj_wps, T_obj_in_wri
     inv_oiw = np.linalg.inv(T_obj_in_wrist)
     lo, hi = _arm_limits(planner)
     hold = np.asarray(hold, np.float32)
-    traj = [np.concatenate([start_qpos[:6], hold]).astype(np.float32)]
-    prev = start_qpos[:6].astype(np.float32)
+    na = planner._n_arm
+    traj = [np.concatenate([start_qpos[:na], hold]).astype(np.float32)]
+    prev = start_qpos[:na].astype(np.float32)
     for k in range(1, len(obj_wps)):
         for t in np.linspace(0.0, 1.0, n_seg)[1:]:
             wrist = _interp_se3(obj_wps[k - 1], obj_wps[k], float(t)) @ inv_oiw
@@ -894,7 +941,7 @@ def cartesian_object_path(planner, scene_lift, start_qpos, obj_wps, T_obj_in_wri
             if not bool(succ[0]):
                 planner._ik_solver = None
                 return None
-            arm = _unwrap_arm(sol[0, :6], prev, lo, hi)   # all joints continuous
+            arm = _unwrap_arm(sol[0, :na], prev, lo, hi)   # all joints continuous
             traj.append(np.concatenate([arm, hold]).astype(np.float32))
             prev = arm
     planner._ik_solver = None
@@ -986,8 +1033,10 @@ def plan_reposition(planner, urdf, obj, hand, current_T, target_T, transport_can
 # interactive app
 # --------------------------------------------------------------------------- #
 class App:
-    def __init__(self, vis, default_obj, default_hand, port):
+    def __init__(self, vis, default_obj, default_hand, port, arm="xarm"):
         self.vis = vis
+        self.arm = arm
+        # keyed by PLANNER hand (arm+hand), so xarm and fr3 never share a planner
         self.planners: dict[str, GraspPlanner] = {}
         self.urdfs: dict[str, yourdfpy.URDF] = {}
         self.cur_obj = None
@@ -998,11 +1047,13 @@ class App:
 
     # ---- lazy resources ----
     def planner(self, hand):
-        if hand not in self.planners:
-            self._status(f"warming up planner ({hand})...")
-            self.planners[hand] = GraspPlanner(hand=hand)
-            self.urdfs[hand] = yourdfpy.URDF.load(str(URDF_BY_HAND[hand]))
-        return self.planners[hand], self.urdfs[hand]
+        """Planner + FK urdf for a CANDIDATE hand, on this App's arm."""
+        ph = planner_hand(self.arm, hand)
+        if ph not in self.planners:
+            self._status(f"warming up planner ({ph})...")
+            self.planners[ph] = GraspPlanner(hand=ph)
+            self.urdfs[ph] = yourdfpy.URDF.load(str(URDF_BY_HAND[ph]))
+        return self.planners[ph], self.urdfs[ph]
 
     def _status(self, msg):
         self.status.content = f"```\n{msg}\n```"
@@ -1022,7 +1073,8 @@ class App:
             self.dd_sid = s.gui.add_dropdown("scene id", scene_ids_for(hand0, obj0, self.dd_type.value) or [""])
             self.dd_grasp = s.gui.add_dropdown("grasp", ["auto"] + grasp_names_for(hand0, obj0, self.dd_type.value, self.dd_sid.value))
             poses = sorted(load_tabletop_poses(obj0).keys()) if obj0 else [0]
-            start0 = default_start_pose(obj0, self.dd_type.value, self.dd_sid.value) if obj0 else "0"
+            start0 = (default_start_pose(hand0, obj0, self.dd_type.value, self.dd_sid.value)
+                      if obj0 else "0")
             self.dd_start = s.gui.add_dropdown("start pose", [str(p) for p in poses], initial_value=start0)
             self.sl_x = s.gui.add_slider("initial x", min=0.30, max=0.55, step=0.01, initial_value=0.45)
             self.sl_theta = s.gui.add_slider("initial theta (deg)", min=-180, max=180, step=5, initial_value=0)
@@ -1069,9 +1121,10 @@ class App:
         fh = self.vis.obj_dict["obj"]["frame"]
         fh.position = Tinit[:3, 3]
         fh.wxyz = R.from_matrix(Tinit[:3, :3]).as_quat()[[3, 0, 1, 2]]
-        if hand in self.planners:              # park robot at init if warmed
-            self.vis.robot_dict["xarm"].update_cfg(self.planners[hand]._init_state)
-        j = scene_pose_idx(obj, self.dd_type.value, self.dd_sid.value)
+        ph = planner_hand(self.arm, hand)
+        if ph in self.planners:                # park robot at init if warmed
+            self.vis.robot_dict["xarm"].update_cfg(self.planners[ph]._init_state)
+        j = scene_pose_idx(hand, obj, self.dd_type.value, self.dd_sid.value)
         self._status(f"preview: start pose {self.dd_start.value} @ "
                      f"x={float(self.sl_x.value):.2f} "
                      f"theta={float(self.sl_theta.value):.0f}deg\n"
@@ -1112,21 +1165,21 @@ class App:
             self.dd_grasp.value = gs[0]
         # if the current start pose == this scene's required pose, no reset would
         # happen (object stays put). Nudge to a pose that triggers a reset.
-        j = scene_pose_idx(obj, stype, sid)
+        j = scene_pose_idx(self.dd_hand.value, obj, stype, sid)
         if j is not None and self.dd_start.value == str(j):
-            self.dd_start.value = default_start_pose(obj, stype, sid)
+            self.dd_start.value = default_start_pose(self.dd_hand.value, obj, stype, sid)
 
     # ---- swap meshes when object/hand change ----
     def _ensure_scene(self, obj, hand):
         if hand != self.cur_hand:
             if "xarm" in self.vis.robot_dict:
                 self.vis.robot_dict["xarm"].remove(); del self.vis.robot_dict["xarm"]
-            self.vis.add_robot("xarm", str(URDF_BY_HAND[hand]))
+            self.vis.add_robot("xarm", str(URDF_BY_HAND[planner_hand(self.arm, hand)]))
             self.cur_hand = hand
         if obj != self.cur_obj:
             if "obj" in self.vis.obj_dict:
                 self.vis.obj_dict["obj"]["frame"].remove(); del self.vis.obj_dict["obj"]
-            mesh = trimesh.load(str(MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"), process=False)
+            mesh = trimesh.load(str(mesh_file(obj)), process=False)
             self.vis.add_object("obj", mesh, np.eye(4))
             self.cur_obj = obj
 
@@ -1183,7 +1236,7 @@ class App:
             self._status(f"no reset cells for {hand}/{obj}"); return
         tabletop = load_tabletop_poses(obj)
         graph = build_graph(hand, obj, h_cm)
-        mesh_path = MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"
+        mesh_path = mesh_file(obj)
 
         # The reset placement is randomized (closest-arm pick over a shuffled
         # candidate set), so a bad placement can leave the grasp out of reach.
@@ -1206,7 +1259,7 @@ class App:
         Tinit = self._start_placement(obj, req["start_pose"], req["x0"], req["theta0"])
         self.vis.obj_dict["obj"]["transform"] = Tinit
         # target ghost (goal grasp hand + object) so you can see the path converge
-        self._show_target(hand, target, MESH_BASE / obj / "raw_mesh" / f"{obj}.obj")
+        self._show_target(hand, target, mesh_file(obj))
         if not timeline:
             self._status(status); return
         for nm, rt, ot in timeline:
@@ -1248,8 +1301,14 @@ class App:
         fall back to the next candidate. Repeat until the pose's scenes are
         covered or no graspable candidate remains. Resets = #pose groups."""
         obj, hand, x0 = req["obj"], req["hand"], req["x0"]
+        # The campaign result is ARM-specific (what plans on an xarm need not plan
+        # on an FR3), so a non-xarm arm gets its own cache file. The coverage array
+        # next to it (coverage_current.*) stays shared — it is a purely geometric
+        # grasp-vs-scene check with no arm in it.
+        stem = ("campaign_cache" if self.arm in ("", "xarm")
+                else f"campaign_cache_{planner_hand(self.arm, hand)}")
         cache_path = (Path(repo_dir) / "order" / hand / GRASP_VERSION / obj
-                      / "campaign_cache.pkl")
+                      / f"{stem}.pkl")
 
         # --- REPLAY from cache: the flaky planning was done once, offline. No
         #     planner/GPU needed — just load the saved trajectories and play. ---
@@ -1258,7 +1317,7 @@ class App:
             c = pickle.load(open(cache_path, "rb"))
             self.vis.clear_traj()
             self.vis.obj_dict["obj"]["transform"] = c["init_T"]
-            self._show_target(hand, None, MESH_BASE / obj / "raw_mesh" / f"{obj}.obj")
+            self._show_target(hand, None, mesh_file(obj))
             for nm, rt, ot in c["timeline"]:
                 self.vis.add_traj(nm, {"xarm": rt}, {"obj": ot})
             self.vis.gui_timestep.value = 0
@@ -1286,7 +1345,7 @@ class App:
             self._status(f"no reset cells for {hand}/{obj}"); return
         tabletop = load_tabletop_poses(obj)
         graph = build_graph(hand, obj, h_cm)
-        mesh_path = MESH_BASE / obj / "raw_mesh" / f"{obj}.obj"
+        mesh_path = mesh_file(obj)
 
         wrist_obj = data["wrist_obj"]
         poses = sorted({m[2] for m in scene_meta})
@@ -1516,10 +1575,12 @@ class App:
                         open(cache_path, "wb"))
             # FULL documented record for the homepage: every phase, the selected
             # grasp, frame counts, and a plain explanation of what each phase does.
-            _save_campaign_detail(cache_path.with_name("campaign_detail.json"),
+            detail_name = cache_path.stem.replace("campaign_cache",
+                                                  "campaign_detail") + ".json"
+            _save_campaign_detail(cache_path.with_name(detail_name),
                                   obj, hand, timeline, T0, covered, scene_meta,
                                   scene_pose, poses, pose_detail, resets, repos, msg)
-            msg += (f"\n\n[cached -> {cache_path.name}; detail -> campaign_detail.json"
+            msg += (f"\n\n[cached -> {cache_path.name}; detail -> {detail_name}"
                     f" (+ npz trajectories); next run replays]")
         except Exception as e:
             msg += f"\n[cache save failed: {e}]"
@@ -1588,7 +1649,10 @@ def _save_campaign_detail(path, obj, hand, timeline, init_T, covered, scene_meta
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--obj", default="pepsi")
-    p.add_argument("--hand", default="inspire_left")
+    p.add_argument("--hand", default="inspire_left",
+                   help="CANDIDATE hand — which grasp set on disk to use")
+    p.add_argument("--arm", default="xarm", choices=["xarm", "fr3"],
+                   help="which arm the planner uses (fr3 = Franka FR3)")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--plan", action="store_true",
                    help="HEADLESS: plan the whole campaign and SAVE (cache + "
@@ -1599,10 +1663,11 @@ def main():
 
     vis = ViserViewer(port_number=args.port)
     vis.add_floor(height=0.0)
-    app = App(vis, args.obj, args.hand, args.port)
+    app = App(vis, args.obj, args.hand, args.port, arm=args.arm)
 
     if args.plan:                                          # plan-by-code: build + save, no GUI
-        print(f"[exp] HEADLESS plan: {args.obj}/{args.hand} ...", flush=True)
+        print(f"[exp] HEADLESS plan: {args.obj}/{args.hand} on {args.arm} "
+              f"({planner_hand(args.arm, args.hand)}) ...", flush=True)
         app._pending = dict(mode="campaign", obj=args.obj, hand=args.hand,
                             x0=float(args.x0), rebuild=True)
         app.service_pending()                             # runs _run_campaign -> saves everything

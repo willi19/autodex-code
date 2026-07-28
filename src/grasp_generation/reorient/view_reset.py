@@ -36,6 +36,7 @@ URDF_BY_HAND = {
     "inspire_left": ("inspire_left_description", "xarm_inspire_left.urdf"),
     "inspire":      ("inspire_description",      "xarm_inspire.urdf"),
     "allegro":      ("allegro_description",      "xarm_allegro.urdf"),
+    "fr3_inspire":  ("fr3_inspire_description",  "fr3_inspire.urdf"),
 }
 
 # cuRobo ee_link per hand — wrist FK target for computing carried-object pose
@@ -43,6 +44,7 @@ EE_LINK_BY_HAND = {
     "inspire_left": "base_link",
     "inspire":      "base_link",
     "allegro":      "base_link",
+    "fr3_inspire":  "base_link",
 }
 
 # Phases where the object is rigidly carried by the wrist
