@@ -41,13 +41,27 @@ INSPIRE_LEFT_LINK6_TO_WRIST = np.array([
 ])
 
 # ── FR3 (Franka) ─────────────────────────────────────────────────────────────
-# 7-DOF. Solved by IK so the wrist (hand base_link) lands on the same 6D pose
-# the xarm reaches at XARM_INIT — FK check reproduced it to 0.01 mm / 0.000 deg.
-# Inside both the URDF limits and the real FR3 spec ranges.
-FR3_INIT = np.array([
-    0.65911102, -0.26389799, -1.03441095, -2.58232594, -0.48430899,
-    3.98870993, 0.87985802
-])
+# 7-DOF init = the franka HOME pose saved by paradex hand-eye calibration
+# (system/current/hecalib/franka/home_qpos.npy). Executor homes here and the
+# planner plans trajectories starting here, so both stay consistent with the
+# real robot's calibrated home. Falls back to the last-known home values if the
+# paradex file is unavailable. (Previously an IK-solved pose matching the xarm
+# init wrist; switched to the real calibrated home on user request.)
+import os as _os
+_FR3_HOME_FILE = _os.path.expanduser(
+    "~/paradex/system/current/hecalib/franka/home_qpos.npy")
+try:
+    FR3_INIT = np.load(_FR3_HOME_FILE).astype(np.float64)
+    assert FR3_INIT.shape == (7,)
+except Exception:
+    FR3_INIT = np.array([-0.00315, 0.02135, 0.00298, -2.32733,
+                         -0.00027, 3.95842, 0.78357])
+# NOTE: inspire hand is mounted 180° reversed on the flange; that is modeled by
+# the URDF flange_to_hand yaw (rotated +pi). The home qpos itself is left as the
+# calibrated home — at this config the (remounted) hand is already 180°-rotated
+# per the new URDF. Rotating joint7 here would make the arm compensate (undoing
+# the visual) and pushes joint7 outside cuRobo's limit (usd_flip_joint_limits),
+# breaking plan_single_js with INVALID_START_STATE_JOINT_LIMITS.
 
 # fr3_link7 -> wrist (hand base_link), from the fr3_inspire URDF's fixed chain
 # (fr3_joint8 -> flange_to_hand). FR3 analog of INSPIRE_LINK6_TO_WRIST; the same
