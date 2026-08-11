@@ -298,6 +298,33 @@ def _autoselect_h_cm(hand: str, obj: str, target_j: int | None = None) -> int | 
     return sorted(cands, key=lambda kv: kv[0])[0][0]
 
 
+def _autoselect_h_cm_for_cell(hand: str, obj: str, i_int: int,
+                               j_int: int) -> int | None:
+    """Smallest ``reorient_{h_cm}`` folder containing the EXACT cell
+    ``{i_int}_{j_int}``.
+
+    Cells are height-escalated per pair (``reset_escalated_manifest.json``), so
+    two transitions to the same ``target_j`` can live at different heights —
+    e.g. green_attached_container has ``2_0`` at reorient_0 but ``6_0`` at
+    reorient_12. Selecting h from ``target_j`` alone (``_autoselect_h_cm``)
+    therefore misses cells that exist at another height.
+    """
+    reset_root = Path(project_dir) / "candidates" / hand / "reset" / obj
+    if not reset_root.exists():
+        return None
+    hs = []
+    for p in reset_root.iterdir():
+        if not p.is_dir() or not p.name.startswith("reorient_"):
+            continue
+        try:
+            h = int(p.name.split("_", 1)[1])
+        except ValueError:
+            continue
+        if (p / f"{i_int}_{j_int}").is_dir():
+            hs.append(h)
+    return min(hs) if hs else None
+
+
 def _load_target_tabletop_pose(obj: str, target_j: int) -> np.ndarray:
     """Load 4x4 tabletop pose (robot frame) for filename int ``target_j``.
     Files are zero-padded 3-digit (``002.npy``)."""
@@ -891,6 +918,27 @@ def main():
                     raise _SoftSkip
 
                 # 3. Load reset seeds for cell {i_int}_{target_j}.
+                # Height is escalated PER CELL (see reset_escalated_manifest.json):
+                # each {i}_{j} lives under the smallest reorient_{h} where BODex
+                # found grasps, so h must be picked once the start pose i is
+                # known — not once at startup from target_j alone.
+                h_cm_cell = _autoselect_h_cm_for_cell(
+                    args.hand, args.obj, i_int, args.target_j
+                )
+                if h_cm_cell is None:
+                    rec["progress"]["plan"] = f"no_cell ({i_int}_{args.target_j})"
+                    rec["status"] = "no_cell"
+                    print(f"    no reorient_*/{i_int}_{args.target_j} cell "
+                          f"anywhere under reset/{args.obj} — skipping cycle")
+                    raise _SoftSkip
+                if h_cm_cell != h_cm:
+                    print(f"    [h_cm] cell {i_int}_{args.target_j} lives at "
+                          f"reorient_{h_cm_cell} (startup default was "
+                          f"reorient_{h_cm}) — switching for this cycle")
+                h_cm = h_cm_cell
+                RELEASE_HEIGHT_M = h_cm / 100.0
+                rec["h_cm"] = h_cm
+                rec["release_height_m"] = RELEASE_HEIGHT_M
                 print(f"[cycle {cycle}] Loading reset seeds "
                       f"reorient_{h_cm}/{i_int}_{args.target_j}...")
                 seeds = _load_reset_seeds(
