@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"for env in bodex mingi; do\\n  echo \\\"=== $env (curobo $(~/miniconda3/envs/$env/bin/python -c 'import curobo;print(curobo.__version__)' 2>/dev/null)) ===\\\"\\n  echo -n \\\"  AutoDex planner   ...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s\n=== bodex (curobo 0.1.0) ===\n  AutoDex planner   :",
+  "timestamp": "2026-07-30T20:16:05.058Z",
+  "retry_count": 1
+}

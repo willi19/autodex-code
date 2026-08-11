@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd ~/AutoDex/src/validation/robothome && ls traj/ 2>/dev/null | head -8; python3 -c \\\"\\nimport numpy as np, glob\\nfs=sorted(glob.glob('traj/*.npz'))\\nprint('npz 개수:', len(fs))\\nfor f in fs...",
+  "error": "Exit code 1\n20260430_033102_pick_start__to_grasp_chocoSong-i_demo_choco_0_z000.npz\n20260430_033119_pick_start__to_grasp_chocoSong-i_demo_choco_2_z000.npz\n20260430_033130_pick_start__to_grasp_chocoSong-i_demo_choco_3_z000.npz\n20260430_033138_pick_start__to_grasp_chocoSong-i_demo_choco_4_z000.npz\n20260430_033147_pick_start__to_grasp_chocoSong-i_demo_choco_7_z000.npz\n20260430_033156_pick_start__to_grasp_chocoSong-i_demo_choco_8_z000.npz\n20260430_033221_pick_start__to_grasp_chocoSong-i_demo_choco_9_...",
+  "timestamp": "2026-07-30T20:34:18.624Z",
+  "retry_count": 1
+}

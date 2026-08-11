@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1785259981143,
+  "lastScanned": 1786373495356,
   "projectRoot": "/home/mingi/AutoDex",
   "techStack": {
     "languages": [
@@ -46,7 +46,7 @@
       "path": "Visualization",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1785259981141,
+      "lastAccessed": 1786373495352,
       "keyFiles": [
         "README.md",
         "bodex_output.py",
@@ -59,7 +59,7 @@
       "path": "autodex",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1785259981141,
+      "lastAccessed": 1786373495353,
       "keyFiles": [
         "README.md",
         "__init__.py"
@@ -69,7 +69,7 @@
       "path": "autodex.egg-info",
       "purpose": null,
       "fileCount": 4,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495353,
       "keyFiles": [
         "PKG-INFO",
         "SOURCES.txt",
@@ -81,28 +81,28 @@
       "path": "bodex_outputs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "candidates": {
       "path": "candidates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "data": {
       "path": "data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "docs": {
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 2,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": [
         "coverage_pipeline_logic.md",
         "distributed_tracking.md"
@@ -112,28 +112,28 @@
       "path": "logging",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "order": {
       "path": "order",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "outputs": {
       "path": "outputs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": []
     },
     "patches": {
       "path": "patches",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495354,
       "keyFiles": [
         "MV-GoTrack-renderer-fix.patch"
       ]
@@ -142,7 +142,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 27,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495355,
       "keyFiles": [
         "allegro.csv",
         "allegro.tsv",
@@ -155,7 +155,7 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 1,
-      "lastAccessed": 1785259981142,
+      "lastAccessed": 1786373495355,
       "keyFiles": [
         "readme.md"
       ]
@@ -164,7 +164,7 @@
       "path": "autodex/utils",
       "purpose": "Utility functions",
       "fileCount": 9,
-      "lastAccessed": 1785259981143,
+      "lastAccessed": 1786373495355,
       "keyFiles": [
         "__init__.py",
         "conversion.py",
@@ -174,303 +174,15 @@
   },
   "hotPaths": [
     {
-      "path": "src/experiment/reset/replay_trial.py",
-      "accessCount": 44,
-      "lastAccessed": 1784032083684,
-      "type": "file"
-    },
-    {
-      "path": "autodex/planner/planner.py",
-      "accessCount": 29,
-      "lastAccessed": 1784627488486,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/fix_lift_action_ik.py",
-      "accessCount": 26,
-      "lastAccessed": 1784037834781,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/recompute_pose.py",
-      "accessCount": 19,
-      "lastAccessed": 1783941601740,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/overlay_pose_outliers.py",
-      "accessCount": 15,
-      "lastAccessed": 1783956241730,
-      "type": "file"
-    },
-    {
-      "path": "src/grasp_generation/adaptive_orchestrator.py",
-      "accessCount": 7,
-      "lastAccessed": 1783899415086,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/legacy_pose_sil_loss.py",
-      "accessCount": 7,
-      "lastAccessed": 1783953483308,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/fill_pose_from_runtime.py",
-      "accessCount": 6,
-      "lastAccessed": 1783947411118,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/render_grasp.py",
-      "accessCount": 5,
-      "lastAccessed": 1783601341858,
-      "type": "file"
-    },
-    {
-      "path": "autodex/utils/sync.py",
-      "accessCount": 5,
-      "lastAccessed": 1784031112039,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/apply_pose_id.py",
-      "accessCount": 4,
-      "lastAccessed": 1783618223245,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/overlay_init_pose.py",
-      "accessCount": 4,
-      "lastAccessed": 1783956318518,
-      "type": "file"
-    },
-    {
-      "path": "autodex/perception/silhouette.py",
-      "accessCount": 4,
-      "lastAccessed": 1784024256843,
-      "type": "file"
-    },
-    {
-      "path": "src/execution/run_auto.py",
-      "accessCount": 3,
-      "lastAccessed": 1783527249839,
-      "type": "file"
-    },
-    {
-      "path": "src/visualization/turntable_grasp.py",
-      "accessCount": 3,
-      "lastAccessed": 1783601124172,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/inspire_exec.py",
-      "accessCount": 3,
-      "lastAccessed": 1783616749176,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/harmonize_merge.py",
-      "accessCount": 3,
-      "lastAccessed": 1783618230650,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/gen_corl_masks.py",
-      "accessCount": 3,
-      "lastAccessed": 1783705395167,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/measure_corl_sil.py",
-      "accessCount": 3,
-      "lastAccessed": 1783956499444,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/check_mesh_fit.py",
-      "accessCount": 3,
-      "lastAccessed": 1784018004320,
-      "type": "file"
-    },
-    {
-      "path": "autodex/utils/robot_config.py",
-      "accessCount": 3,
-      "lastAccessed": 1784276522973,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/overlay_uncovered.py",
-      "accessCount": 3,
-      "lastAccessed": 1784623688454,
-      "type": "file"
-    },
-    {
-      "path": "src/visualization/exp.py",
-      "accessCount": 3,
-      "lastAccessed": 1784627302170,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/collect_wireout.py",
-      "accessCount": 2,
-      "lastAccessed": 1783501884018,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/validate_pose.py",
-      "accessCount": 2,
-      "lastAccessed": 1783501886703,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/collect_pose_outliers.py",
-      "accessCount": 2,
-      "lastAccessed": 1783520253111,
-      "type": "file"
-    },
-    {
-      "path": "autodex/executor/real.py",
-      "accessCount": 2,
-      "lastAccessed": 1783528795203,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/reclassify_by_initial.py",
-      "accessCount": 2,
-      "lastAccessed": 1783584622057,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/copy_raw.py",
-      "accessCount": 2,
-      "lastAccessed": 1783585019061,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/reclassify_plain.py",
-      "accessCount": 2,
-      "lastAccessed": 1783687465934,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/canonicalize.py",
-      "accessCount": 2,
-      "lastAccessed": 1783689858835,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/sync_arm_hand.py",
-      "accessCount": 2,
-      "lastAccessed": 1783958448059,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/measure_op_sil.py",
-      "accessCount": 2,
-      "lastAccessed": 1784019542848,
-      "type": "file"
-    },
-    {
-      "path": "src/execution/label.py",
+      "path": "src/grasp_generation/reorient/gen_all.py",
       "accessCount": 1,
-      "lastAccessed": 1783416426901,
+      "lastAccessed": 1786379868424,
       "type": "file"
     },
     {
-      "path": "src/execution/scene_cfg.py",
+      "path": "src/grasp_generation/reorient/gen_scene.py",
       "accessCount": 1,
-      "lastAccessed": 1783416611433,
-      "type": "file"
-    },
-    {
-      "path": "src/validation/perception/foundpose_overlay_grid.py",
-      "accessCount": 1,
-      "lastAccessed": 1783524508643,
-      "type": "file"
-    },
-    {
-      "path": "autodex/perception/mask.py",
-      "accessCount": 1,
-      "lastAccessed": 1783580618228,
-      "type": "file"
-    },
-    {
-      "path": "src/grasp_generation/BODex/src/curobo/util/world_cfg_generator.py",
-      "accessCount": 1,
-      "lastAccessed": 1783582281333,
-      "type": "file"
-    },
-    {
-      "path": "src/experiment/reset/tabletop_pose.py",
-      "accessCount": 1,
-      "lastAccessed": 1783584552450,
-      "type": "file"
-    },
-    {
-      "path": "src/visualization/mesh_process/scene_grid_viewer.py",
-      "accessCount": 1,
-      "lastAccessed": 1783604116197,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/exec_grasp/corl_exec.py",
-      "accessCount": 1,
-      "lastAccessed": 1783616008322,
-      "type": "file"
-    },
-    {
-      "path": "src/process/batch_onboard_foundpose.py",
-      "accessCount": 1,
-      "lastAccessed": 1783730507745,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/gen_trial_masks.py",
-      "accessCount": 1,
-      "lastAccessed": 1783731564784,
-      "type": "file"
-    },
-    {
-      "path": "outputs/uncovered_overlay/washing_brush__sele__20260127_090911.png",
-      "accessCount": 1,
-      "lastAccessed": 1783929195640,
-      "type": "file"
-    },
-    {
-      "path": "outputs/uncovered_overlay/plant_mister__corl__20260326_162611.png",
-      "accessCount": 1,
-      "lastAccessed": 1783929226770,
-      "type": "file"
-    },
-    {
-      "path": "outputs/uncovered_overlay/beige_brush__corl__20260405_073010.png",
-      "accessCount": 1,
-      "lastAccessed": 1783930198728,
-      "type": "file"
-    },
-    {
-      "path": "outputs/uncovered_overlay/_beige073010_mask_check.png",
-      "accessCount": 1,
-      "lastAccessed": 1783930273421,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/overlay_saved_pose.py",
-      "accessCount": 1,
-      "lastAccessed": 1783956342664,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/transform_fix.py",
-      "accessCount": 1,
-      "lastAccessed": 1784020090102,
-      "type": "file"
-    },
-    {
-      "path": "src/dataset/recompute_refine.py",
-      "accessCount": 1,
-      "lastAccessed": 1784020267925,
+      "lastAccessed": 1786379933086,
       "type": "file"
     }
   ],

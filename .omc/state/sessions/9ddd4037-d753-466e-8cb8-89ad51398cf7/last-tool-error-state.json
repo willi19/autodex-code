@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"mount | grep -iE \\\"nas|robothome|nfs|cifs\\\" ; echo \\\"---\\\"; ls -d ~/shared_data* /mnt/* /media/* 2>/dev/null\",\"description\":\"Find NAS mounts\"}",
+  "error": "Exit code 1\n147.46.216.120:/data on /home/mingi/shared_data type nfs4 (rw,relatime,vers=4.1,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=147.46.15.72,local_lock=none,addr=147.46.216.120,_netdev)\n147.46.216.14:/volume1/robothome on /home/mingi/robothome type nfs4 (rw,relatime,vers=4.1,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=147.46.15.72,local_lock=none,addr=147.46.216.14,_netdev)\n---\n(eval):1: no ma...",
+  "timestamp": "2026-07-30T17:34:49.661Z",
+  "retry_count": 1
+}
