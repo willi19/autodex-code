@@ -15,6 +15,26 @@ robot_configs_path = os.path.join(project_dir, "content", "configs", "robot")
 obj_path = os.path.join(project_dir, "object", "paradex")
 urdf_path = os.path.join(project_dir, "content", "assets", "robot", "allegro_description")
 
+# v8 scenes + grasps were generated against the object_processing asset tree,
+# whose tabletop set and simplified mesh differ from the older paradex tree
+# (e.g. attached_container: paradex {000,001,006,009,016} vs op
+# {000,001,002,007,010}). Mixing the two mislabels pose_idx, so every
+# mesh/tabletop lookup on a v8 pool must resolve against object_processing.
+object_processing_path = os.path.join(shared_dir, "object_processing")
+
+# Candidate-pool versions whose meshes/tabletops live in object_processing.
+OP_VERSIONS = {"v8"}
+
+
+def get_obj_root(version: str = None) -> str:
+    """Asset root (mesh + processed_data/info/tabletop) for a candidate pool.
+
+    ``v8`` resolves to ``object_processing``; everything else (v7,
+    selected_100, table_only, reset, ...) keeps the legacy ``obj_path``.
+    Pass ``None`` to get the legacy root.
+    """
+    return object_processing_path if version in OP_VERSIONS else obj_path
+
 # Scenes are hand-specific: the obstacle gap (wall/shelf/box clearance) is
 # adapted per hand, so allegro and inspire scenes for the same object differ.
 # They live under the AutoDex NAS, keyed by hand first so different hands never

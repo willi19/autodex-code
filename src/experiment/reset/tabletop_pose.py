@@ -17,17 +17,21 @@ from autodex.utils.path import obj_path
 from autodex.utils.symmetry import get_cyl_axis_local
 
 
-_CACHE: Dict[str, list] = {}
+# Keyed by (obj_name, obj_root) — the paradex and object_processing trees hold
+# DIFFERENT tabletop sets for the same object, so the root is part of the key.
+_CACHE: Dict[tuple, list] = {}
 
 
-def _load_tabletop_poses(obj_name: str):
+def _load_tabletop_poses(obj_name: str, obj_root: Optional[str] = None):
     """Return list of (filename, 4x4 pose) for this object, cached."""
-    if obj_name in _CACHE:
-        return _CACHE[obj_name]
-    tabletop_dir = os.path.join(obj_path, obj_name, "processed_data",
+    root = obj_root or obj_path
+    key = (obj_name, root)
+    if key in _CACHE:
+        return _CACHE[key]
+    tabletop_dir = os.path.join(root, obj_name, "processed_data",
                                 "info", "tabletop")
     if not os.path.isdir(tabletop_dir):
-        _CACHE[obj_name] = []
+        _CACHE[key] = []
         return []
     files = sorted(glob.glob(os.path.join(tabletop_dir, "*.npy")))
     out = []
@@ -39,7 +43,7 @@ def _load_tabletop_poses(obj_name: str):
             T = np.eye(4)
             T[:3, :3] = pose
             out.append((os.path.basename(f), T))
-    _CACHE[obj_name] = out
+    _CACHE[key] = out
     return out
 
 
@@ -94,8 +98,14 @@ def _cyl_z_aligned_geodesic_deg(R_est: np.ndarray, R_tab: np.ndarray,
 
 
 def classify_tabletop_pose(pose_robot: np.ndarray,
-                            obj_name: str) -> Optional[Dict[str, Any]]:
+                            obj_name: str,
+                            obj_root: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Find the closest tabletop pose to ``pose_robot`` by rotation.
+
+    ``obj_root`` picks the tabletop set — pass ``get_obj_root(version)`` so a
+    v8 pool classifies against object_processing (its stems differ from the
+    legacy paradex tree, so mixing them mislabels pose_idx). Defaults to the
+    legacy ``obj_path``.
 
     Returns None if no tabletop poses are defined for the object. Otherwise:
         {
@@ -106,7 +116,7 @@ def classify_tabletop_pose(pose_robot: np.ndarray,
           "all_err_deg": list[float] # distance to every candidate
         }
     """
-    poses = _load_tabletop_poses(obj_name)
+    poses = _load_tabletop_poses(obj_name, obj_root)
     if not poses:
         return None
     R_est = pose_robot[:3, :3]

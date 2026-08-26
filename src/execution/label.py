@@ -39,7 +39,16 @@ def get_label():
             return None, note or "issue"
 
 
-def auto_label_charuco(image_dir: str, required_board: str = "1") -> Tuple[Optional[bool], dict]:
+# Charuco board the object sits on — the one success labelling checks for.
+# The floor board was swapped to the 10x7 (paradex calls it board "11":
+# 6X6_250, marker ids 70-104, 54 corners); the old 5x6 "1" is no longer on the
+# table, and asking for it makes every trial read as FAIL because no camera
+# ever detects it. paradex's own hand-eye solve tracks the same id in
+# src/calibration/handeye/calculate.py:FLOOR_BOARD — keep the two in step.
+CHARUCO_BOARD = "11"
+
+def auto_label_charuco(image_dir: str,
+                       required_board: str = CHARUCO_BOARD) -> Tuple[Optional[bool], dict]:
     """Multi-view charuco union check.
 
     Returns (success_or_None, info). success=True iff `required_board` has all
@@ -49,7 +58,14 @@ def auto_label_charuco(image_dir: str, required_board: str = "1") -> Tuple[Optio
     import cv2
     from paradex.image.aruco import detect_charuco, boardinfo_dict
 
-    paths = sorted(p for p in Path(image_dir).iterdir()
+    # A capture that wrote nothing leaves the directory ABSENT, not empty, so
+    # iterdir() raises FileNotFoundError and takes the whole run down with it.
+    # Missing and empty mean the same thing here: no images to label from.
+    d = Path(image_dir)
+    if not d.is_dir():
+        return None, {"reason": "no_images", "image_dir": str(image_dir),
+                      "detail": "directory does not exist"}
+    paths = sorted(p for p in d.iterdir()
                    if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
     if not paths:
         return None, {"reason": "no_images", "image_dir": str(image_dir)}

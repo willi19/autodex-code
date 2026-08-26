@@ -40,13 +40,13 @@ from tabletop_pose import _z_aligned_geodesic_deg as _zalign  # noqa: E402
 from autodex.utils.path import get_scene_dir  # noqa: E402
 HAND = "allegro"   # all executed grasps in the dataset are allegro
 
-DS_ROOTS = ["/home/mingi/shared_data/autodex_dataset/selected_100",
-            "/home/mingi/shared_data/autodex_dataset/corl_selected_100"]
-OBJROOT = "/home/mingi/shared_data/object_processing"
+DS_ROOTS = [os.path.expanduser("~/shared_data/autodex_dataset/selected_100"),
+            os.path.expanduser("~/shared_data/autodex_dataset/corl_selected_100")]
+OBJROOT = os.path.expanduser("~/shared_data/object_processing")
 SKIP_OBJS = set()   # keep apple (data intact); its high rot_err is just left as-is
-ARM_URDF = "/home/mingi/shared_data/AutoDex/content/assets/robot/allegro_description/xarm_allegro.urdf"
-HAND_URDF = ("/home/mingi/AutoDex/src/grasp_generation/BODex/src/curobo/content/assets/"
-             "robot/allegro_description/allegro_hand_description_right.urdf")
+ARM_URDF = os.path.expanduser("~/shared_data/AutoDex/content/assets/robot/allegro_description/xarm_allegro.urdf")
+HAND_URDF = os.path.expanduser("~/shared_data/AutoDex/content/assets/robot/"
+                               "allegro_description/allegro_hand_description_right.urdf")
 THRESH_DEG = 30.0
 GREEN = [70, 200, 90]     # the SELECTED executed grasp fits this scene
 YELLOW = [235, 205, 55]   # some executed grasp (any at this pose) fits
@@ -128,55 +128,57 @@ def extract_executed(obj):
 
 
 def scenes_by_pose(obj):
-    """Reconstruct ALLEGRO's actual v8 scenes. The on-disk scene/ dir is SHARED
-    across hands and holds only the last writer's gaps, but the scene the adaptive
-    run settled on is HAND-SPECIFIC (gap escalates with that hand's grasp success).
-    So read allegro's summary (per-scene final gap + success), map scene_id ->
-    (pose_idx, z_rot) via enumerate, and BUILD the scene at that final gap (geometry
-    is hand-independent). Group by matching the scene orientation to the current
-    tabletop pose. Returns {pose: [(scene_type, scene_dict)]}."""
+    """Build the v8 deployment scenes with PROPER obstacle geometry and group them
+    by tabletop pose_idx.
+
+    Rather than the raw on-disk cuboids (box = just a raised floor, no walls), we
+    rebuild each scene with the sg builders so obstacles render nicely:
+      box   -> 4 side walls (box_front/back/left/right)
+      shelf -> back / side / up panels (per its up/side/back flags)
+      wall  -> single wall panel
+    Geometry params come from each on-disk scene json's ``meta.param``
+    (gap / z_rotation_deg / up-side-back / height_offset) + the canonical tabletop
+    pose ({obj}/processed_data/info/tabletop/{pose_idx}.npy). No adaptive summary
+    needed. Returns {pose_idx: [(scene_type, scene_dict)]}; reorient_*/poseless
+    scenes skipped."""
     if obj in _SCENE_CACHE:
         return _SCENE_CACHE[obj]
+    tt = {os.path.basename(f)[:-4]: np.load(f)
+          for f in sorted(glob.glob(f"{OBJROOT}/{obj}/processed_data/info/tabletop/*.npy"))}
     try:
-        summ = json.load(open(f"{ALLEGRO_SUMMARY}/{obj}.json"))
         obb = json.load(open(f"{OBJROOT}/{obj}/processed_data/info/simplified.json"))
     except Exception:
-        _SCENE_CACHE[obj] = {}; return {}
-    tt = {os.path.basename(f)[:-4]: np.load(f)[:3, :3]
-          for f in sorted(glob.glob(f"{OBJROOT}/{obj}/processed_data/info/tabletop/*.npy"))}
+        obb = None
     idx = {}
     for st in SCENE_TYPES:
-        try:
-            cfgs = {c["id"]: c for c in enumerate_scene_configs(obj, st, OBJROOT, _SYM)}
-        except Exception:
-            continue
-        for sid, info in summ.get(st, {}).items():
-            fin = info.get("final", {})
-            if fin.get("status") != "success":
+        for f in sorted(glob.glob(f"{OBJROOT}/{obj}/scene/{st}/*.json")):
+            try:
+                d = json.load(open(f))
+            except Exception:
                 continue
-            cfg = cfgs.get(str(sid))
-            if cfg is None:
+            pose = str(d.get("meta", {}).get("pose_idx"))
+            if pose in ("None", "") or pose not in tt:
                 continue
-            g = fin.get("gap", 0.0)          # final gap (wall/shelf) or height_offset (box)
-            zr = float(cfg.get("z_rot", 0.0))
+            p = d.get("meta", {}).get("param", {})
+            ttp = tt[pose]
             try:
                 if st == "wall":
-                    scene = sg.get_wall_scene(obj, cfg["pose"], obb, zr, g)
+                    scene = sg.get_wall_scene(obj, ttp, obb,
+                                              p.get("z_rotation_deg", 0.0), p.get("gap", 0.0))
                 elif st == "shelf":
-                    scene = sg.get_shelf_scene(obj, cfg["pose"], obb, zr, g, True, True, True)
+                    scene = sg.get_shelf_scene(obj, ttp, obb,
+                                               p.get("z_rotation_deg", 0.0), p.get("gap", 0.0),
+                                               up=p.get("up", True), side=p.get("side", True),
+                                               back=p.get("back", True))
                 elif st == "box":
-                    scene = sg.get_box_scene(obj, cfg["pose"], g)
+                    scene = sg.get_box_scene(obj, ttp, p.get("height_offset", 0.0))
                 else:
                     continue
             except Exception:
                 continue
-            if scene is None or not tt:
+            if scene is None:
                 continue
-            R = cart2se3(np.array(scene["mesh"]["target"]["pose"], float))[:3, :3]
-            best = min(tt, key=lambda k: _zalign(R, tt[k]))
-            if _zalign(R, tt[best]) > 25.0:
-                continue
-            idx.setdefault(best, []).append((st, scene))
+            idx.setdefault(pose, []).append((st, scene))
     _SCENE_CACHE[obj] = idx
     return idx
 

@@ -29,6 +29,32 @@ from autodex.utils.conversion import se32cart
 from autodex.planner import GraspPlanner
 from autodex.executor import RealExecutor
 
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS (set_stream / set_record). The capture PCs
+    reject the old names outright, and the rejection LATCHES an error on every
+    camera that only a daemon-side reload clears -- so a single call from one
+    stale script leaves the next run with no frames at all.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--obj", type=str, required=True, help="Object name")
 parser.add_argument("--ref_idx", type=str, required=True, help="Reference index for pose estimation")
@@ -127,8 +153,7 @@ if __name__ == "__main__":
     executor = RealExecutor(mode=args.mode)
 
     # Start recording
-    rcc.start("video", True,
-              os.path.join("shared_data/AutoDex", "experiment", args.exp_name, args.obj, dir_idx, "raw"))
+    _rcc_start(rcc, "video", True, os.path.join("shared_data/AutoDex", "experiment", args.exp_name, args.obj, dir_idx, "raw"))
     timestamp_monitor.start(os.path.join(exp_dir, "raw", "timestamps"))
     executor.start_recording(os.path.join(exp_dir, "raw"))
     sync_generator.start(fps=30)

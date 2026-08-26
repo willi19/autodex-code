@@ -38,7 +38,7 @@ from paradex.io.camera_system.timestamp_monitor import TimestampMonitor
 from paradex.utils.system import network_info, get_pc_ip, get_camera_list
 from paradex.calibration.utils import save_current_camparam, save_current_C2R, load_c2r
 
-from autodex.utils.path import project_dir
+from autodex.utils.path import project_dir, get_obj_root
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import add_obstacles
 from autodex.planner.visualizer import ScenePlanVisualizer
@@ -49,7 +49,221 @@ from autodex.perception.snapshot_orchestrator import SnapshotOrchestrator
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.execution.label import auto_label_charuco, get_label
 
-CHARUCO_BOARD = "1"
+# Board id lives in src/execution/label.py — one place to swap.
+from src.execution.label import CHARUCO_BOARD  # noqa: E402
+
+# Candidate pools driven by precomputed scene coverage: the runner ranks
+# candidates by remaining-uncovered scenes, bounces to a reorient target when
+# the current tabletop is fully covered, and stops when nothing is left.
+# Other pools (selected_100, table_only, ...) have no coverage json and run
+# the plain candidate sweep instead.
+COVERAGE_VERSIONS = ("v7", "v8")
+
+
+def _is_coverage_pool(version: str) -> bool:
+    return version in COVERAGE_VERSIONS
+
+
+def _stop_with_timeout(name: str, fn, timeout: float = 20.0) -> bool:
+    """Run a shutdown call with a deadline, naming it if it does not return.
+
+    Every stop() on this path ends in an untimed Event.wait() -- rcc waits on
+    `sending_event`, the timestamp monitor on `event["stop"]` -- so a device
+    that died mid-capture hangs the whole trial with no clue which one it was.
+    An untimed wait is also not Ctrl-C interruptible, so the operator can only
+    kill the process. Run each in its own thread and move on if it overruns:
+    a leaked stop is far cheaper than a wedged experiment.
+
+    Returns True if it returned in time.
+    """
+    import threading
+    done = threading.Event()
+    err = []
+
+    def _run():
+        try:
+            fn()
+        except Exception as exc:      # a failing stop must not kill the trial
+            err.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True, name=f"stop-{name}").start()
+    if not done.wait(timeout):
+        print(f"[shutdown] {name}.stop() did not return in {timeout:.0f}s — "
+              f"leaving it and continuing")
+        return False
+    if err:
+        print(f"[shutdown] {name}.stop() raised: {err[0]!r}")
+    return True
+
+
+def _safe_timestamp_start(tsm, save_path) -> bool:
+    """Start the sync-timestamp monitor, refusing to block on a dead one.
+
+    TimestampMonitor.run() gives up when its camera cannot be opened: it logs
+    "continuing WITHOUT sync timestamps", sets error+connection+stop, and the
+    thread RETURNS. It guards stop() against that ("stop() blocks on this;
+    without it a later stop() would hang forever") but not start() -- which
+    ends in `self.event["acquisition"].wait()` with no timeout, waiting on a
+    thread that is already gone. The wait is not Ctrl-C interruptible, so the
+    trial hangs until the process is killed.
+
+    The error flag is one-shot (start() clears it via the "is in ERROR state"
+    branch), which is why the hang lands on the SECOND trial rather than the
+    first. Check the thread itself instead: no live capture thread means no
+    one will ever set `acquisition`.
+
+    Returns True if the monitor was started, False if it was skipped.
+    """
+    th = getattr(tsm, "capture_thread", None)
+    alive = th.is_alive() if th is not None else False
+    cam_ok = getattr(tsm, "camera", None) is not None
+    if not alive or not cam_ok:
+        print(f"[timestamp] monitor is dead (thread_alive={alive} "
+              f"camera={'ok' if cam_ok else 'None'}) — skipping, "
+              f"recording WITHOUT sync timestamps")
+        tsm._autodex_started = False
+        return False
+    tsm.start(save_path)
+    tsm._autodex_started = True
+    return True
+
+
+def _safe_timestamp_stop(tsm) -> None:
+    """Stop the monitor only if we actually started it.
+
+    stop() ends in an untimed event["stop"].wait(). When start() was skipped
+    there is nothing to stop and nobody left to set that event, so calling it
+    burns the full shutdown timeout on every trial for no reason.
+    """
+    if not getattr(tsm, "_autodex_started", False):
+        return
+    _stop_with_timeout("timestamp_monitor", tsm.stop)
+
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture now arms in 'acquire' and its
+    outputs are toggled as SINKS (set_stream / set_record). The capture PCs
+    reject the old names outright --
+        invalid mode 'stream': use 'image' (single frame) or 'acquire' + ...
+    -- which silently left every trial without frames. Keeping the old call
+    shape here means the trial flow below reads unchanged.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+        _warn_if_not_streaming(rcc)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
+
+def _warn_if_not_streaming(rcc, timeout_s: float = 4.0, poll_s: float = 0.5) -> bool:
+    """Warn if the cameras are not actually capturing after the stream is armed.
+
+    The failure this catches is silent: without a running capture the init
+    pipeline just sits on 0/20 masks until it times out. Poll rather than read
+    one status snapshot — ``running`` is reported by the daemons' health PUB and
+    lags the sink command by a beat, so a single read right after set_stream
+    reports False on healthy cameras.
+    """
+    deadline = time.time() + timeout_s
+    dead: list = []
+    while time.time() < deadline:
+        try:
+            dead = [pc for pc, s in (rcc.get_status().get("pc") or {}).items()
+                    if not s.get("running")]
+        except Exception as exc:
+            print(f"[rcc] status check failed: {exc!r}")
+            return True                      # don't block the run on telemetry
+        if not dead:
+            return True
+        time.sleep(poll_s)
+    print(f"[rcc] WARNING stream armed but not capturing on: {dead}")
+    return False
+
+
+def _ensure_camera_lock(rcc, settle_s: float = 1.5) -> bool:
+    """Make sure THIS controller owns the daemons, taking over if it does not.
+
+    A crashed run leaves its lock behind, and the next ``register`` is refused
+    ("locked by run_auto_<earlier>"). ``register()`` only logs that and sets
+    ``_registered = True`` anyway, so every later arm/set_stream is silently
+    dropped by the daemon: cameras never capture, the init pipeline waits out
+    its timeout on 0/20 masks, and nothing says why. Check ownership against
+    the daemons' own report instead of trusting registration.
+    """
+    time.sleep(settle_s)
+    try:
+        pcs = (rcc.get_status().get("pc") or {})
+        foreign = {pc: s.get("controller") for pc, s in pcs.items()
+                   if s.get("controller") and s.get("controller") != rcc.name}
+        if not foreign:
+            return True
+        print(f"[rcc] daemons held by another controller: {foreign}")
+        print("[rcc] forcing takeover")
+        rcc.force_takeover()
+        time.sleep(1.0)
+        pcs = (rcc.get_status().get("pc") or {})
+        still = {pc: s.get("controller") for pc, s in pcs.items()
+                 if s.get("controller") and s.get("controller") != rcc.name}
+        if still:
+            print(f"[rcc] TAKEOVER FAILED, still held by: {still}")
+            return False
+        print("[rcc] takeover ok")
+        return True
+    except Exception as exc:
+        print(f"[rcc] ownership check failed: {exc!r}")
+        return False
+
+
+def _clear_camera_errors(rcc, settle_s: float = 1.5, reload_wait_s: float = 6.0,
+                         attempts: int = 2) -> bool:
+    """Reload the capture daemons' cameras if they are stuck in an error state.
+
+    A camera that failed to start latches its error and never clears it: on the
+    error path ``Camera.start()`` returns BEFORE setting ``event["start"]``,
+    while ``error_reset()`` only fires from ``stop()`` when that same event was
+    set. So one bad start (e.g. a retired capture mode) poisons the camera for
+    every later run, and every ``start`` after it returns early — trials then
+    run with no frames at all. Reloading rebuilds the daemon's CameraLoader,
+    which is the only thing that clears it.
+
+    Returns True if the cameras are healthy when this returns.
+    """
+    time.sleep(settle_s)
+    if not rcc.is_error():
+        return True
+    for i in range(attempts):
+        print(f"[rcc] cameras in error state — reloading "
+              f"({i + 1}/{attempts})")
+        try:
+            rcc.force_takeover()      # a dead session may still hold the lock
+        except Exception as exc:
+            print(f"[rcc] force_takeover failed: {exc!r}")
+        try:
+            rcc.reload_cameras()
+        except Exception as exc:
+            print(f"[rcc] reload_cameras failed: {exc!r}")
+        time.sleep(reload_wait_s)
+        if not rcc.is_error():
+            print("[rcc] cameras recovered")
+            return True
+    print("[rcc] STILL in error after reload — check the capture PCs:\n"
+          f"      {rcc.get_status()}")
+    return False
+
 
 
 def _list_v7_scenes(hand: str, obj: str, version: str = "v7"):
@@ -108,7 +322,48 @@ def _scene_has_success(hand: str, version: str, obj: str,
 
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
-logging.getLogger("curobo").setLevel(logging.WARNING)
+
+
+def quiet_curobo(level=logging.WARNING) -> None:
+    """Silence cuRobo's per-solve chatter ("Updating problem kernel", "Ran TO",
+    "breaking reference", ...).
+
+    setLevel alone is not enough here: whichever library configures logging
+    first owns the root handler, and cuRobo's records still reach it by
+    propagation. Cutting propagate keeps them off stdout no matter who set up
+    the root, and the NullHandler stops the "no handlers" fallback from
+    printing them anyway. A single plan emits dozens of these lines, which bury
+    the [planner]/[place] output that actually says what happened.
+    """
+    lg = logging.getLogger("curobo")
+    lg.setLevel(level)
+    lg.propagate = False
+    if not lg.handlers:
+        lg.addHandler(logging.NullHandler())
+
+
+quiet_curobo()
+
+def _planner_robot(arm: str, hand: str) -> str:
+    """cuRobo robot config name for an (arm, hand) pair.
+
+    The xarm configs are keyed by hand alone (``xarm_allegro`` etc. are selected
+    inside GraspPlanner from the hand string), so xarm keeps passing the hand
+    through unchanged. The FR3 has its own config per hand.
+    """
+    if arm != "franka":
+        return hand
+    if hand == "inspire":
+        return "fr3_inspire"
+    # NOTE: GraspPlanner.HAND_CONFIGS.get(hand, allegro) SILENTLY falls back to
+    # the allegro xarm config for an unknown key, so an unsupported combination
+    # must be rejected here rather than planned with the wrong robot.
+    raise SystemExit(
+        f"--arm franka does not support --hand {hand}: no fr3 config for it "
+        f"(GraspPlanner.HAND_CONFIGS has fr3_inspire only, and "
+        f"{project_dir}/content/configs/robot/ ships fr3_inspire.yml only). "
+        f"Use --hand inspire.")
+
 
 DEFAULT_PC_LIST = ["capture1", "capture2", "capture3", "capture5", "capture6"]
 ASSETS_BASE = Path.home() / "shared_data/AutoDex/foundpose_assets"
@@ -135,8 +390,7 @@ def _wait_for_object_on_table(rcc, args, scene_prefix: str, trial_idx: int,
             project_dir, "experiment", args.exp_name, sub, args.obj,
             "_precheck", f"trial{trial_idx:03d}_{attempt:02d}", "raw", "images"
         )
-        try: rcc.stop()
-        except Exception: pass
+        _stop_with_timeout("rcc", rcc.stop)
         rcc.start("image", False, check_rel)
         rcc.stop()
         time.sleep(0.3)
@@ -146,12 +400,12 @@ def _wait_for_object_on_table(rcc, args, scene_prefix: str, trial_idx: int,
         # board_visible=None → no images / board not in cfg → start anyway (don't block).
         if board_visible is None:
             print(f"[precheck] {info.get('reason', 'unknown')} — proceeding without check")
-            rcc.start("stream", False, fps=args.stream_fps)
+            _rcc_start(rcc, "stream", False, fps=args.stream_fps)
             return True
         if not board_visible:
             print(f"[precheck] obj on table (board covered "
                   f"{info.get('covered')}/{info.get('expected')}). Starting trial.")
-            rcc.start("stream", False, fps=args.stream_fps)
+            _rcc_start(rcc, "stream", False, fps=args.stream_fps)
             return True
         print(f"[precheck] charuco fully visible "
               f"({info.get('covered')}/{info.get('expected')}) — no obj on table.")
@@ -200,7 +454,7 @@ def run_single_trial(
     scene_prefix: str,
     orch: InitOrchestrator,
     planner: GraspPlanner,
-    executor: RealExecutor,
+    executor,          # RealExecutor (xarm) or FrankaExecutor (fr3)
     rcc,
     sync_generator,
     timestamp_monitor,
@@ -215,6 +469,9 @@ def run_single_trial(
 
     obj = args.obj
     hand = args.hand
+    # xarm = 6, FR3 = 7. Every arm/hand column split below uses this instead of
+    # a literal 6, so the same trial body drives both arms.
+    adof = getattr(executor, "arm_dof", 6)
     dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     sub = f"{scene_prefix}/{hand}" if scene_prefix else hand
     img_dir = os.path.join(project_dir, "experiment", args.exp_name, sub, obj, dir_idx)
@@ -281,8 +538,7 @@ def run_single_trial(
     # (grasp obj, place at r=0.4, y=0 on the board).
     reposition_mode = False
     if args.auto:
-        try: rcc.stop()
-        except Exception: pass
+        _stop_with_timeout("rcc", rcc.stop)
         repo_check_rel = os.path.join(
             "shared_data", "AutoDex", "experiment", args.exp_name, sub, obj,
             dir_idx, "_repo_check", "raw"
@@ -295,7 +551,7 @@ def run_single_trial(
             repo_check_abs, required_board=CHARUCO_BOARD
         )
         timing["repo_charuco_before"] = board_info
-        rcc.start("stream", False, fps=args.stream_fps)
+        _rcc_start(rcc, "stream", False, fps=args.stream_fps)
         if board_vis is True:
             print(f"\n    [reposition] charuco "
                   f"{board_info.get('covered')}/{board_info.get('expected')} "
@@ -307,7 +563,12 @@ def run_single_trial(
     timing["planning_start"] = _ts()
     t0 = time.time()
     c2r = load_c2r(img_dir)
-    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj)
+    # Asset root for planning mesh + tabletop poses. v8 candidates/scenes were
+    # generated against object_processing, whose tabletop stems and simplified
+    # mesh differ from the legacy paradex tree — resolve by version so the two
+    # never mix (which would mislabel pose_idx).
+    obj_root = get_obj_root(args.grasp_version)
+    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj, obj_root)
     scene_cfg = add_obstacles(
         scene_cfg, args.scene,
         wall_gap=args.wall_gap, wall_angle=args.wall_angle,
@@ -325,7 +586,7 @@ def run_single_trial(
     from src.experiment.reset.tabletop_pose import classify_tabletop_pose
     from autodex.utils.symmetry import get_cyl_axis_local
     pose_robot = np.linalg.inv(c2r) @ pose_world
-    tb_before = classify_tabletop_pose(pose_robot, obj)
+    tb_before = classify_tabletop_pose(pose_robot, obj, obj_root)
     timing["tabletop_before"] = tb_before
     if tb_before is not None:
         scene_id = str(tb_before["idx"])
@@ -373,8 +634,8 @@ def run_single_trial(
         _plan_priority_map = None
         print(f"    [reposition] table_only candidates ranked by stats: "
               f"{len(_plan_candidate_order)} grasps")
-    elif args.grasp_version == "v7":
-        _eff_grasp_version = "v7"
+    elif _is_coverage_pool(args.grasp_version):
+        _eff_grasp_version = args.grasp_version
         _plan_scene_id = None
         # Trim to only scenes matching --scene (wall/shelf/box).
         _plan_scene_type_filter = (args.scene
@@ -394,21 +655,41 @@ def run_single_trial(
             from autodex.utils.coverage import load_v7_coverage_map
             _cov = load_v7_coverage_map(
                 obj, tabletop_pose_stem=pose_stem,
-                hand=hand, version=args.grasp_version) or {}
+                hand=hand, version=args.grasp_version, arm=args.arm)
+            if _cov is None:
+                # No coverage json at all. Without this the run reads as
+                # "0/0 candidates -> all scenes done" and stops, which looks
+                # identical to a finished object. It is a missing precompute.
+                sys.exit(
+                    f"[coverage] no coverage json for {obj}/{args.grasp_version}.\n"
+                    f"  expected: {project_dir}/experiment/{args.grasp_version}"
+                    f"/coverage/cov_{args.grasp_version}_cand_{obj}.json\n"
+                    f"  build it with:\n"
+                    f"    python src/dataset/compute_v8_coverage.py --obj {obj} "
+                    f"--hand {hand} --version {args.grasp_version}\n"
+                    f"  (and make sure candidates/{hand}/{args.grasp_version}/{obj}/ "
+                    f"is extracted from its .tar.gz first)")
             _useful = {k: v for k, v in _cov.items() if v > 0}
             _plan_candidate_order = sorted(_useful, key=lambda k: -_useful[k])
             _plan_priority_map = None
-            print(f"    [coverage] {len(_useful)}/{len(_cov)} candidates still "
-                  f"cover uncovered scenes (dropped {len(_cov)-len(_useful)} "
-                  f"fully-covered)")
+            # Dropped = remaining-uncovered == 0. Early on that is NOT
+            # "already covered" — those are grasps whose `covers` list is
+            # empty, i.e. collision-free in none of this tabletop's scenes.
+            # Only once successes accumulate does the count mean progress.
+            _n_drop = len(_cov) - len(_useful)
+            _n_empty = sum(1 for k, v in _cov.items() if v == 0)
+            print(f"    [coverage] {len(_useful)}/{len(_cov)} candidates open "
+                  f"uncovered scenes"
+                  + (f" (dropped {_n_drop}: cover nothing left)" if _n_drop else ""))
         # Pre-plan reorient check (skipped under --ignore_coverage).
         from autodex.utils.coverage import uncovered_scenes, pick_reorient_target
         _rem = (None if args.ignore_coverage else
                 uncovered_scenes(obj, pose_stem, hand=hand,
-                                  version=args.grasp_version))
+                                  version=args.grasp_version, arm=args.arm))
         if _rem is not None and len(_rem) == 0:
             target = pick_reorient_target(obj, pose_stem, hand=hand,
-                                           version=args.grasp_version)
+                                           version=args.grasp_version,
+                                           obj_root=obj_root, arm=args.arm)
             print(f"\n    [reorient] tabletop {pose_stem} fully covered.")
             if target is None:
                 print(f"    All tabletops covered — nothing left for {obj}.")
@@ -422,8 +703,12 @@ def run_single_trial(
             print(f"    target_j={j_int} (pose {stem}) has {n_rem} uncovered scenes.")
             _reorient_cmd = (f"python src/experiment/reset/reorient.py "
                              f"--obj {obj} --hand {hand} "
-                             f"--target_j {j_int} --auto")
+                             f"--target_j {j_int} --auto "
+                             f"--version {args.grasp_version}")
             print(f"    Suggested:\n      {_reorient_cmd}")
+            if args.arm == "franka":
+                print("    [reorient] NOTE: reorient.py drives the XARM "
+                      "(RealExecutor + xarm URDFs) — do not run it for the FR3.")
             try:
                 _cmd = input("    Press Enter to RUN reorient now, "
                              "'s' to skip-and-continue (you ran it manually), "
@@ -440,15 +725,18 @@ def run_single_trial(
                 done["all_done"] = True
                 done["reason"] = "user_quit_reorient"
             elif _cmd == "":
-                # Auto-launch reorient. Block until it returns, then let the
-                # outer loop try this obj again at its (hopefully) new pose.
-                import subprocess
-                print(f"    [auto] running: {_reorient_cmd}")
-                rc = subprocess.call(_reorient_cmd, shell=True)
-                done["reorient_subprocess_rc"] = rc
-                if rc != 0:
-                    print(f"    [auto] reorient returned {rc}; main loop "
-                          f"will continue but obj may still be at the same pose.")
+                # Auto-launch DISABLED: reorient is a human-supervised step —
+                # run_auto only reports the target and hands off. Print the
+                # command and let the operator run it, same as the 's' path.
+                # import subprocess
+                # print(f"    [auto] running: {_reorient_cmd}")
+                # rc = subprocess.call(_reorient_cmd, shell=True)
+                # done["reorient_subprocess_rc"] = rc
+                # if rc != 0:
+                #     print(f"    [auto] reorient returned {rc}; main loop "
+                #           f"will continue but obj may still be at the same pose.")
+                print(f"    [manual] auto-launch disabled — run it yourself:\n"
+                      f"      {_reorient_cmd}")
             # else: 's' = user already ran it manually, fall through
             with open(os.path.join(img_dir, "result.json"), "w") as f:
                 json.dump(done, f, indent=2, default=str)
@@ -489,10 +777,11 @@ def run_single_trial(
         if n_total == 0:
             print(f"    No grasp candidates left at tabletop {pose_stem} "
                   f"for {obj} ({args.grasp_version}).")
-            if args.grasp_version == "v7":
+            if _is_coverage_pool(args.grasp_version):
                 from autodex.utils.coverage import pick_reorient_target
                 target = pick_reorient_target(obj, pose_stem, hand=hand,
-                                               version=args.grasp_version)
+                                               version=args.grasp_version,
+                                               obj_root=obj_root, arm=args.arm)
                 if target is None:
                     print(f"    No reorient target with uncovered scenes — "
                           f"nothing left for {obj}.")
@@ -507,7 +796,8 @@ def run_single_trial(
                       f"has {n_rem} uncovered scenes.")
                 print(f"    Suggested:")
                 print(f"      python src/experiment/reset/reorient.py "
-                      f"--obj {obj} --hand {hand} --target_j {j_int} --auto")
+                      f"--obj {obj} --hand {hand} --target_j {j_int} --auto "
+                      f"--version {args.grasp_version}")
                 try:
                     _cmd = input("    Run reorient then press Enter (q to quit): "
                                  ).strip().lower()
@@ -577,7 +867,8 @@ def run_single_trial(
             cyl_yaw_grid=_cyl_grid,
             skip_scenes_with_success=_skip_scenes_eff,
         )
-        fv = ScenePlanVisualizer(scene_cfg, None, port=8080, hand=hand)
+        fv = ScenePlanVisualizer(scene_cfg, None, port=8080,
+                                 hand=_planner_robot(args.arm, hand))
         fv.add_candidates(wrist_se3, grasp_pose, filtered, ik_failed=ik_failed)
         fv.start_viewer(use_thread=True)
         _active_vis = fv
@@ -587,7 +878,7 @@ def run_single_trial(
         # rotate around vertical. If any (r, yaw) makes ≥1 candidate
         # IK-feasible, prefer that (rotate_obj_yaw) over reorienting
         # to a different tabletop.
-        if args.grasp_version == "v7":
+        if _is_coverage_pool(args.grasp_version):
             _ros_yaw = None
             _ros_x = None
             try:
@@ -630,7 +921,7 @@ def run_single_trial(
                              f"--obj {obj} --hand {hand} "
                              f"--target_yaw_deg {_ros_yaw:.0f} "
                              f"--target_x {_ros_x:.2f} "
-                             f"--grasp_version v7")
+                             f"--grasp_version {args.grasp_version}")
                 print(f"    Suggested (same-tabletop, no reorient):\n      {_cmd_ros}")
                 try:
                     _cmd = input("    Press Enter to RUN rotate_obj_yaw now, "
@@ -656,7 +947,8 @@ def run_single_trial(
                 return _stamp_end(fail_record)
             from autodex.utils.coverage import pick_reorient_target
             target = pick_reorient_target(obj, pose_stem, hand=hand,
-                                           version=args.grasp_version)
+                                           version=args.grasp_version,
+                                           obj_root=obj_root, arm=args.arm)
             if target is not None:
                 j_int, stem, n_rem = target
                 print(f"\n    [reorient] all candidates at tabletop {pose_stem} "
@@ -665,7 +957,8 @@ def run_single_trial(
                       f"uncovered scenes.")
                 print(f"    Suggested:")
                 print(f"      python src/experiment/reset/reorient.py "
-                      f"--obj {obj} --hand {hand} --target_j {j_int} --auto")
+                      f"--obj {obj} --hand {hand} --target_j {j_int} --auto "
+                      f"--version {args.grasp_version}")
                 try:
                     _cmd = input("    Run reorient then press Enter (q to quit): "
                                  ).strip().lower()
@@ -707,7 +1000,8 @@ def run_single_trial(
 
     if args.viz:
         print("    Launching visualizer (http://localhost:8080)...")
-        sv = ScenePlanVisualizer(scene_cfg, result, port=8080, hand=hand)
+        sv = ScenePlanVisualizer(scene_cfg, result, port=8080,
+                                 hand=_planner_robot(args.arm, hand))
         # Pre-compute lift / repose / place trajectories so viz shows the
         # entire planned motion before execution starts. Obj follows the
         # wrist rigidly through these phases.
@@ -732,7 +1026,7 @@ def run_single_trial(
                 return T
 
             grasp_end_qpos = np.asarray(result.traj[-1], dtype=np.float32)
-            grasp_end_arm = grasp_end_qpos[:6]
+            grasp_end_arm = grasp_end_qpos[:adof]
             T_wrist_grasp_end = _fk_wrist(grasp_end_qpos)
             # Use FK-derived wrist so obj viz at grasp end exactly matches
             # scene_cfg obj pose (no jump at lift start).
@@ -764,9 +1058,9 @@ def run_single_trial(
                             obj_traj={"mesh_target": lift_obj_traj})
 
                 # 2. Repose traj (only for v7)
-                if args.grasp_version == "v7" and result.scene_info is not None:
+                if _is_coverage_pool(args.grasp_version) and result.scene_info is not None:
                     lift_end_qpos = np.asarray(lift_traj[-1], dtype=np.float32)
-                    lift_end_arm = lift_end_qpos[:6]
+                    lift_end_arm = lift_end_qpos[:adof]
                     T_wrist_lift_end = _fk_wrist(lift_end_qpos)
                     T_obj_lift_end = T_wrist_lift_end @ T_obj_in_wrist
                     R_PLACE_VIZ = 0.55
@@ -793,7 +1087,7 @@ def run_single_trial(
 
                         # 3. Place traj — wrist z descend
                         repo_end_qpos = np.asarray(repo_traj[-1], dtype=np.float32)
-                        repo_end_arm = repo_end_qpos[:6]
+                        repo_end_arm = repo_end_qpos[:adof]
                         T_wrist_repo_end = _fk_wrist(repo_end_qpos)
                         place_wrist = T_wrist_repo_end.copy()
                         place_wrist[2, 3] -= 0.10
@@ -827,8 +1121,8 @@ def run_single_trial(
     exec_rel = os.path.join(raw_rel, "exec")
     place_rel = os.path.join(raw_rel, "place")
     raw_dir = os.path.join(img_dir, "raw")
-    rcc.start("video", True, exec_rel)
-    timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
+    _rcc_start(rcc, "video", True, exec_rel)
+    _safe_timestamp_start(timestamp_monitor, os.path.join(raw_dir, "timestamps"))
     executor.start_recording(raw_dir)
     sync_generator.start(fps=30)
 
@@ -851,17 +1145,18 @@ def run_single_trial(
             executor.reset_fallback(result)
         except Exception as _re:
             print(f"    [recovery] reset_fallback FAILED: {_re!r}")
-        try: executor.stop_recording()
-        except Exception: pass
-        try: sync_generator.stop()
-        except Exception: pass
-        try: timestamp_monitor.stop()
-        except Exception: pass
+        _stop_with_timeout("executor.recording", executor.stop_recording)
+        # timestamp_monitor FIRST: its stop() waits on event["stop"], which the
+        # capture loop only sets after camera.get_timestamp() returns — and that
+        # blocks for the next frame. Kill the trigger first and no frame ever
+        # arrives, so stop() waits forever. (Every other call site in this file
+        # already stops it in this order.)
+        _safe_timestamp_stop(timestamp_monitor)
+        _stop_with_timeout("sync_generator", sync_generator.stop)
         # NOTE: rcc.stop() pauses the current capture (record / stream).
         # Do NOT call rcc.end() here — that tears down the remote camera
         # controller, which the next trial still needs.
-        try: rcc.stop()
-        except Exception: pass
+        _stop_with_timeout("rcc", rcc.stop)
         # Persist per-candidate fail so we don't pick the same one again.
         if result.scene_info is not None:
             sei = result.scene_info
@@ -874,6 +1169,7 @@ def run_single_trial(
                 try:
                     with open(cand_result_path, "w") as _f:
                         json.dump({"success": False, "dir_idx": dir_idx,
+                                   "arm": args.arm,
                                    "reason": f"execute_{type(_exec_e).__name__}"
                                    }, _f)
                 except Exception: pass
@@ -891,8 +1187,7 @@ def run_single_trial(
     auto_succ_lift = None
     auto_label_info = {}
     if args.auto:
-        try: rcc.stop()
-        except Exception: pass
+        _stop_with_timeout("rcc", rcc.stop)
         label_lift_rel = os.path.join("shared_data", "AutoDex", "experiment",
                                        args.exp_name, sub, obj, dir_idx,
                                        "label_at_lift", "raw")
@@ -912,14 +1207,21 @@ def run_single_trial(
         # Charuco fail → don't place, recover via reset_hybrid (self-collision
         # + placed-obj collision aware). Record fail to candidate dir so this
         # grasp is skip_done-filtered on the next trial.
+        # None = the label could not be JUDGED (no images captured), which is
+        # not the robot failing. Recording it as a candidate failure would
+        # blacklist a grasp that may well have worked, so the trial is voided
+        # instead: recover the arm, write nothing to the candidate dir.
+        _label_unjudgeable = auto_succ_lift is None
         if not auto_succ_lift:
-            print("    [auto-label] charuco FAIL — recovering (reset_hybrid)")
-            try: executor.stop_recording()
-            except Exception: pass
-            try: timestamp_monitor.stop()
-            except Exception: pass
-            try: sync_generator.stop()
-            except Exception: pass
+            if _label_unjudgeable:
+                print(f"    [auto-label] UNJUDGEABLE "
+                      f"({auto_label_info.get('reason')}) — voiding this trial, "
+                      f"candidate NOT marked failed")
+            else:
+                print("    [auto-label] charuco FAIL — recovering (reset_hybrid)")
+            _stop_with_timeout("executor.recording", executor.stop_recording)
+            _safe_timestamp_stop(timestamp_monitor)
+            _stop_with_timeout("sync_generator", sync_generator.stop)
             # Release (squeeze→grasp→pregrasp gradient) so reset_hybrid's
             # pregrasp→openpose slow interp starts from the right state.
             try:
@@ -937,9 +1239,10 @@ def run_single_trial(
                 except Exception as fe:
                     timing["retract_error"] = repr(fe)
                     print(f"    reset_hybrid FAILED: {fe!r}")
-            rcc.start("stream", False, fps=args.stream_fps)
+            _rcc_start(rcc, "stream", False, fps=args.stream_fps)
             # Persist fail to the candidate dir (skip_done filter on next trial).
-            if result.scene_info is not None:
+            # Skipped when the label was unjudgeable — see above.
+            if result.scene_info is not None and not _label_unjudgeable:
                 from autodex.utils.path import get_candidate_path
                 sei = result.scene_info
                 if isinstance(sei, (list, tuple)) and len(sei) == 3:
@@ -949,16 +1252,19 @@ def run_single_trial(
                     )
                     with open(cand_result_path, "w") as f:
                         json.dump({"success": False, "dir_idx": dir_idx,
+                                   "arm": args.arm,
                                    "reason": "charuco_fail"}, f)
             fail = {"dir_idx": dir_idx, "scene_type": args.scene,
-                    "success": False, "reason": "charuco_fail",
+                    "success": None if _label_unjudgeable else False,
+                    "reason": ("label_unjudgeable" if _label_unjudgeable
+                               else "charuco_fail"),
                     "auto_label": auto_label_info, "timing": timing}
             with open(os.path.join(img_dir, "result.json"), "w") as f:
                 json.dump(fail, f, indent=2, default=str)
             return _stamp_end(fail)
 
         # Resume video for place phase.
-        rcc.start("video", True, place_rel)
+        _rcc_start(rcc, "video", True, place_rel)
 
     # Reposition obj at (x=R_PLACE, y=0, current_z) before place. For v7,
     # pick yaw that makes the NEXT cov-greedy grasp IK-reachable. Hold z so
@@ -984,11 +1290,35 @@ def run_single_trial(
 
     chosen_yaw = 0.0
     yaw_feasible_n = 0
-    if args.grasp_version == "v7" and result.scene_info is not None:
+    _repos = None
+    if _is_coverage_pool(args.grasp_version) and pose_stem is not None:
+        # Coverage-driven placement: score every (r, yaw) by the UNION of
+        # scenes the grasps it makes reachable would newly cover, instead of
+        # only chasing the single next set-cover pick below.
+        from autodex.utils.reposition import pick_reposition_target, describe
+        try:
+            _repos = pick_reposition_target(
+                obj, pose_stem, hand, args.grasp_version,
+                planner=planner, R_obj_robot=R_obj_now, obj_z=obj_z,
+                x_preferred=R_PLACE_DEFAULT,
+            )
+        except Exception as _re:
+            print(f"    [place_yaw] reposition search failed: {_re!r}")
+            _repos = None
+        print(f"    [place_yaw] coverage: {describe(_repos)}")
+        if _repos is not None:
+            R_PLACE = _repos["x"]
+            chosen_yaw = _repos["yaw_rad"]
+            yaw_feasible_n = _repos["n_feasible_grasps"]
+
+    # Fallback: no coverage json (or nothing left to open) — aim the placement
+    # at whichever grasp the set-cover would pick next, as before.
+    if _repos is None and _is_coverage_pool(args.grasp_version) \
+            and result.scene_info is not None:
         cur_key = tuple(str(x) for x in result.scene_info)
         next_key = next_grasp_after_success(
             obj, cur_key, tabletop_pose_stem=pose_stem,
-            hand=hand, version=args.grasp_version,
+            hand=hand, version=args.grasp_version, arm=args.arm,
         )
         if next_key is not None:
             next_path = os.path.join(
@@ -1048,7 +1378,7 @@ def run_single_trial(
                           @ executor._link6_to_wrist)
     T_wrist_target[2, 3] = T_wrist_now_world[2, 3]
     start_full = np.concatenate([
-        np.asarray(executor.arm.get_data()["qpos"][:6], dtype=np.float32),
+        np.asarray(executor.arm.get_data()["qpos"][:adof], dtype=np.float32),
         np.asarray(result.grasp_pose, dtype=np.float32),
     ])
     if _precomputed_repo_traj is not None:
@@ -1066,7 +1396,7 @@ def run_single_trial(
     timing["place_yaw_deg"] = round(np.degrees(chosen_yaw), 1)
     timing["place_yaw_feasible_n"] = yaw_feasible_n
     if traj_repose is not None:
-        arm_repose = traj_repose[:, :6]
+        arm_repose = traj_repose[:, :adof]
         # Hold hand at squeeze pose during repose (planner traj's hand
         # portion = grasp_pose which is less closed than s_hand and would
         # open fingers mid-motion → drop obj).
@@ -1077,7 +1407,17 @@ def run_single_trial(
     else:
         print(f"    [reposition] plan_pose_constrained failed — placing here")
 
-    place_info = executor.place(result)            # descend with stop_on_stall
+    # planner+scene_cfg → cuRobo straight descent (mirror of lift), with the
+    # cartesian admittance descent kept as the fallback.
+    # In reposition mode the arm was moved AFTER the lift, so the planned grasp
+    # wrist is no longer above the object. The xarm's place always descends from
+    # where it is; the FR3's default target is the planned grasp wrist, so tell
+    # it to descend from the current wrist instead.
+    _place_kw = {}
+    if args.arm == "franka" and reposition_mode:
+        _place_kw["use_current_wrist"] = True
+    place_info = executor.place(result, planner=planner, scene_cfg=scene_cfg,
+                                debug_dump_dir=DEBUG_DUMP_DIR, **_place_kw)
     timing["execute_s"] = round(time.time() - t0, 2)
     timing["execution_states"] = executor.state_timestamps
     timing["place"] = place_info
@@ -1097,9 +1437,9 @@ def run_single_trial(
     # STOP order: rcc (cameras) first WHILE sync_generator still pulsing
     # — cameras need pulses to flush buffers during stop. Then timestamp
     # and sync last.
-    rcc.stop()
-    timestamp_monitor.stop()
-    sync_generator.stop()
+    _stop_with_timeout("rcc", rcc.stop)
+    _safe_timestamp_stop(timestamp_monitor)
+    _stop_with_timeout("sync_generator", sync_generator.stop)
 
     # Place hit contact mid-descent → object didn't reach the table. Stay at
     # current (mid-descent) height, keep grasp, go straight to reset chain.
@@ -1116,8 +1456,7 @@ def run_single_trial(
         print(f"    [place] EARLY contact stop "
               f"({_descended*1000:.1f}mm of "
               f"{_target_d*1000:.1f}mm) — recovering (no release)")
-        try: executor.stop_recording()
-        except Exception: pass
+        _stop_with_timeout("executor.recording", executor.stop_recording)
         try:
             fb_log = executor.reset(result, planner, scene_cfg)
             timing["retract"] = fb_log
@@ -1129,7 +1468,7 @@ def run_single_trial(
             except Exception as fe:
                 timing["retract_error"] = repr(fe)
                 print(f"    reset_hybrid FAILED: {fe!r}")
-        rcc.start("stream", False, fps=args.stream_fps)
+        _rcc_start(rcc, "stream", False, fps=args.stream_fps)
         if reposition_mode:
             # Reposition fail (contact stop) → update stats with fail.
             if result.scene_info is not None:
@@ -1155,6 +1494,7 @@ def run_single_trial(
                 with open(cand_result_path, "w") as f:
                     json.dump({"success": bool(auto_succ_lift),
                                "dir_idx": dir_idx,
+                               "arm": args.arm,
                                "reason": "place_early_contact"}, f)
         # Grasp success criterion = charuco at LIFT (auto_succ_lift). Place
         # quality is a separate metric — early contact during descent does
@@ -1180,8 +1520,7 @@ def run_single_trial(
         if reposition_mode:
             # Reposition success = obj covers the charuco board after place
             # (= board NOT fully visible).
-            try: rcc.stop()
-            except Exception: pass
+            _stop_with_timeout("rcc", rcc.stop)
             repo_post_rel = os.path.join(
                 "shared_data", "AutoDex", "experiment", args.exp_name, sub,
                 obj, dir_idx, "_repo_check_post", "raw"
@@ -1271,6 +1610,7 @@ def run_single_trial(
     trial_result = {
         "dir_idx": dir_idx,
         "scene_type": args.scene,
+        "arm": args.arm,
         "success": succ,
         "scene_info": result.scene_info,
         "candidate_idx": result.timing.get("candidate_idx") if result.timing else None,
@@ -1297,13 +1637,14 @@ def run_single_trial(
                 sei[0], sei[1], sei[2], "result.json",
             )
             with open(cand_result_path, "w") as f:
-                json.dump({"success": succ, "dir_idx": dir_idx}, f)
+                json.dump({"success": succ, "dir_idx": dir_idx,
+                           "arm": args.arm}, f)
 
     status = "SUCCESS" if succ else ("ISSUE" if succ is None else "FAIL")
     print(f"    Result: {status}  saved to {img_dir}/result.json")
 
     # Resume the stream so the next trial's init has live SHM frames.
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
 
     return _stamp_end(trial_result)
 
@@ -1317,6 +1658,10 @@ def main():
     parser.add_argument("--exp_name", type=str, default=None, help="Defaults to grasp_version")
     parser.add_argument("--hand", type=str, default="allegro",
                         choices=["allegro", "inspire", "inspire_left"])
+    parser.add_argument("--arm", type=str, default="xarm",
+                        choices=["xarm", "franka"],
+                        help="franka = FR3 + inspire (planner robot fr3_inspire, "
+                             "7-DOF arm, FrankaExecutor)")
     parser.add_argument("--scene", type=str, default="table",
                         choices=["table", "wall", "shelf", "cluttered"])
     parser.add_argument("--success_only", action="store_true")
@@ -1356,7 +1701,10 @@ def main():
     parser.add_argument("--prompt", type=str, default="object on the checkerboard")
     parser.add_argument("--sil_iters", type=int, default=100)
     parser.add_argument("--sil_lr", type=float, default=0.002)
-    parser.add_argument("--init_timeout_s", type=float, default=120.0)
+    parser.add_argument("--init_timeout_s", type=float, default=60.0,
+                        help="Max wait for masks+poses. Ctrl-C during the "
+                             "wait cuts it short and continues with "
+                             "whatever arrived.")
     parser.add_argument("--calib_dir", type=str, default=None,
                         help="Camera calib dir. Default: latest under ~/shared_data/cam_param/.")
     parser.add_argument("--stream_fps", type=int, default=10)
@@ -1379,6 +1727,16 @@ def main():
     if not (assets_root / "object_repre/v1" / args.obj / "1/repre.pth").exists():
         sys.exit(f"repre.pth missing for {args.obj} (expected under {assets_root})")
 
+    # FoundPose estimates the pose of MESH_BASE's mesh; for v8 the planner
+    # places the object_processing mesh. Those roots must agree on geometry or
+    # every grasp is silently offset by their frame difference.
+    from src.execution.scene_cfg import check_mesh_frame_match
+    _frame_ok, _frame_msg = check_mesh_frame_match(
+        args.obj, str(mesh_path), get_obj_root(args.grasp_version))
+    if not _frame_ok:
+        sys.exit(f"[mesh_frame] {_frame_msg}")
+    print(f"[mesh_frame] {_frame_msg}")
+
     # Calibration.
     if args.calib_dir:
         calib_dir = Path(args.calib_dir).expanduser()
@@ -1395,12 +1753,19 @@ def main():
     print(f"  {len(intrinsics_full)} cams active across {len(args.pc_list)} PCs  ({H}x{W})")
 
     # Hardware init.
-    rcc = remote_camera_controller("run_auto", pc_list=args.pc_list)
+    # stall_timeout > the arm-to-trigger gap. Cameras are armed with
+    # syncMode=True and produce nothing until sync_generator.start() runs a
+    # few statements later, so the default 3 s logs a 20-camera "no new
+    # frames" block on every single trial that means nothing.
+    rcc = remote_camera_controller("run_auto", pc_list=args.pc_list,
+                                   stall_timeout=15.0)
+    _ensure_camera_lock(rcc)
+    _clear_camera_errors(rcc)
     sync_generator = UTGE900(**network_info["signal_generator"]["param"])
     timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
 
     print(f"[stream] starting on {len(args.pc_list)} PCs @ {args.stream_fps} FPS...")
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
     if args.stream_warmup_s > 0:
         time.sleep(args.stream_warmup_s)
 
@@ -1417,10 +1782,23 @@ def main():
         image_hw=(H, W), mode="live", pc_serials=pc_serials,
     )
 
-    print("[planner] warming up...")
-    planner = GraspPlanner(hand=args.hand)
-    print("[executor] connecting to robot...")
-    executor = RealExecutor(hand_name=args.hand)
+    # The planner's robot config keys on arm+hand; the CANDIDATE pool keys on
+    # hand alone (fr3 and xarm share the inspire grasp pools), which is why
+    # planner.plan() below still gets args.hand.
+    planner_robot = _planner_robot(args.arm, args.hand)
+    print(f"[planner] warming up ({planner_robot})...")
+    planner = GraspPlanner(hand=planner_robot)
+    quiet_curobo()   # GraspPlanner init re-runs curobo's own logger setup
+    print(f"[executor] connecting to robot ({args.arm})...")
+    if args.arm == "franka":
+        from src.execution.franka_executor import FrankaExecutor
+        executor = FrankaExecutor(hand_name=args.hand)
+        # Park OUT of the cameras' view before the first perception so the arm
+        # never occludes the object (the xarm's INIT pose is already clear).
+        print("[executor] homing to clear-view...")
+        executor.home(clear_view=True)
+    else:
+        executor = RealExecutor(hand_name=args.hand)
 
     def _cleanup():
         print("\n[cleanup] Stopping hardware...")
@@ -1455,15 +1833,17 @@ def main():
 
             # Coverage snapshot BEFORE the trial — used to compute how
             # many new scenes the trial just covered.
-            if args.grasp_version == "v7":
+            if _is_coverage_pool(args.grasp_version):
                 from autodex.utils.coverage import (
                     uncovered_scenes, _tabletop_stems,
                 )
-                _stems_before = _tabletop_stems(args.obj)
+                _stems_before = _tabletop_stems(
+                    args.obj, get_obj_root(args.grasp_version))
                 _rem_before = {}
                 for _s in _stems_before:
                     _u = uncovered_scenes(args.obj, _s, hand=args.hand,
-                                          version=args.grasp_version)
+                                          version=args.grasp_version,
+                                          arm=args.arm)
                     _rem_before[_s] = (len(_u) if _u is not None else None)
 
             tr = run_single_trial(
@@ -1479,14 +1859,15 @@ def main():
             # After-trial coverage summary (v7 only). Show per-tabletop
             # remaining uncovered count + how many scenes this trial just
             # covered (delta vs before).
-            if args.grasp_version == "v7" and tr.get("success"):
+            if _is_coverage_pool(args.grasp_version) and tr.get("success"):
                 from autodex.utils.coverage import uncovered_scenes
                 lines = []
                 total_now = 0
                 total_before = 0
                 for _s, _b in _rem_before.items():
                     _u = uncovered_scenes(args.obj, _s, hand=args.hand,
-                                          version=args.grasp_version)
+                                          version=args.grasp_version,
+                                          arm=args.arm)
                     _n = (len(_u) if _u is not None else None)
                     if _b is None or _n is None:
                         lines.append(f"      pose={_s}: N/A")

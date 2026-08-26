@@ -83,6 +83,12 @@ class FrankaExecutor:
         self._link6_to_wrist = np.asarray(FR3_INSPIRE_LINK_TO_WRIST, dtype=np.float64)
         self._convert = _convert_inspire
         self.state_timestamps = []
+        # run_auto drives both arms through the same trial code; it reads this
+        # to slice arm vs hand columns instead of hard-coding the xarm's 6.
+        self.arm_dof = 7
+        # set by _follow when a descent stopped on the wrench threshold — place()
+        # reports it in place_info (run_auto's early-contact check reads it).
+        self._last_stop_on_contact = False
 
         from paradex.io.robot_controller import get_arm, get_hand
         self.arm = get_arm("franka")
@@ -119,6 +125,15 @@ class FrankaExecutor:
             except Exception as e:
                 print(f"[franka] set_collision_behavior attempt {attempt+1} failed: {e!r}")
                 time.sleep(0.5)
+        else:
+            # Continuing without the configured collision thresholds is unsafe,
+            # and a failed call is commonly the first symptom of a lost
+            # libfranka TCP session.  Fail here instead of turning a missing
+            # state sample into an unrelated TypeError in home().
+            raise RuntimeError(
+                "FR3 is not accepting commands: set_collision_behavior failed "
+                "three times. Check the franka daemon, robot network/FCI state, "
+                "then clear any Desk fault before retrying.")
 
     # ── low-level ────────────────────────────────────────────────────────────
 
@@ -170,7 +185,13 @@ class FrankaExecutor:
         there are no obstacles (home / clear-view / init). Verifies arrival."""
         ss = self.arm_speed_scale if speed_scale is None else speed_scale
         target = np.asarray(target_qpos, dtype=np.float64)[:7]
-        self.arm.move(target, is_servo=False, speed_scale=ss)
+        try:
+            self.arm.move(target, is_servo=False, speed_scale=ss)
+        except Exception as e:
+            raise RuntimeError(
+                f"{what}: FR3 move command failed ({e}). The daemon lost or "
+                "cannot use its libfranka connection; verify robot power/network, "
+                "Desk Execution mode, unlocked joints, and active FCI.") from e
         if self.arm.is_error():
             self.arm.error_recovery()
         # The FR3 state PUB lags the blocking move() return by a moment, so a qpos
@@ -179,7 +200,13 @@ class FrankaExecutor:
         err = None
         for _ in range(30):
             time.sleep(0.05)
-            err = float(np.linalg.norm(self.arm.get_data()["qpos"] - target))
+            data = self.arm.get_data()
+            qpos = None if data is None else data.get("qpos")
+            if qpos is None:
+                raise RuntimeError(
+                    f"{what}: FR3 state is unavailable after move. The daemon is "
+                    "not receiving robot state (check its libfranka connection).")
+            err = float(np.linalg.norm(np.asarray(qpos, dtype=np.float64) - target))
             if err < threshold:
                 return
         raise RuntimeError(
@@ -227,6 +254,7 @@ class FrankaExecutor:
         ``land_tol`` (skipping it avoids a stream→position mode switch, which is
         what makes the clunk between segments)."""
         traj = np.atleast_2d(np.asarray(arm_traj, dtype=np.float64))[:, :7]
+        self._last_stop_on_contact = False
         n = len(traj)
         if n == 0:
             return
@@ -323,6 +351,7 @@ class FrankaExecutor:
                     wz = float(self.arm.get_data()["wrench"][2])
                     if abs(wz) > stop_wrench_z:
                         print(f"[franka] contact wrench_z={wz:.1f}N — stop descent")
+                        self._last_stop_on_contact = True
                         return                          # stop here (no final land)
                 if self.arm.is_error():
                     self.arm.set_joint_velocity(np.zeros(7), duration_ms=50)
@@ -396,9 +425,16 @@ class FrankaExecutor:
         self._move_to(target, what="home")
 
     def execute(self, plan_result: PlanResult, planner=None, scene_cfg=None,
-                lift_height: float = 0.10, skip_lift: bool = False):
+                lift_height: float = 0.10, skip_lift: bool = False,
+                debug_dump_dir: Optional[str] = None,
+                lift_traj_override: Optional[np.ndarray] = None):
         """init -> approach -> pregrasp -> grasp -> squeeze -> lift.
-        (mirrors real.py execute). Returns the squeezed hand action or None."""
+        (mirrors real.py execute). Returns the squeezed hand action or None.
+
+        ``debug_dump_dir`` / ``lift_traj_override`` exist so run_auto can drive
+        this executor with the same call it makes for the xarm: the override is
+        the lift trajectory the viz already planned (so what the user previewed
+        is what runs), and the dump dir goes to plan_pose_constrained."""
         if not plan_result.success:
             print("[franka] plan failed — nothing to execute")
             return None
@@ -461,10 +497,16 @@ class FrankaExecutor:
             start_full = np.concatenate([
                 np.asarray(self.arm.get_data()["qpos"][:7], dtype=np.float32),
                 np.asarray(plan_result.grasp_pose, dtype=np.float32)])
-            print("[franka] planning constrained lift ...", flush=True)
-            traj_lift = planner.plan_pose_constrained(
-                start_full, wrist_lift, hold_vec_weight=[1, 1, 1, 1, 1, 0],
-                scene_cfg=scene_cfg, include_obj_obstacle=False)
+            if lift_traj_override is not None:
+                print(f"[franka] using precomputed lift traj "
+                      f"{np.shape(lift_traj_override)}", flush=True)
+                traj_lift = np.asarray(lift_traj_override)
+            else:
+                print("[franka] planning constrained lift ...", flush=True)
+                traj_lift = planner.plan_pose_constrained(
+                    start_full, wrist_lift, hold_vec_weight=[1, 1, 1, 1, 1, 0],
+                    scene_cfg=scene_cfg, include_obj_obstacle=False,
+                    debug_dump_dir=debug_dump_dir)
             if traj_lift is not None:
                 hold = np.tile(s_hand, (len(traj_lift), 1))
                 self._follow(traj_lift[:, :7], hold)
@@ -513,8 +555,12 @@ class FrankaExecutor:
             self._move_hand(pg_hand * (1 - t) + init_hand * t)
             time.sleep(0.01 * slow_factor)
 
-    def place(self, planner=None, scene_cfg=None, grasp_wrist=None, hand_qpos=None,
-              pregrasp_qpos=None, z_force_thresh: float = 12.0):
+    def place(self, plan_result: Optional[PlanResult] = None, planner=None,
+              scene_cfg=None, grasp_wrist=None, hand_qpos=None,
+              pregrasp_qpos=None, lift_height: float = 0.10,
+              debug_dump_dir: Optional[str] = None,
+              use_current_wrist: bool = False,
+              z_force_thresh: float = 12.0) -> dict:
         """Descend the held object back to where it was grasped and release.
 
         Target = the PLANNED grasp wrist (base_link) pose (``grasp_wrist`` =
@@ -523,8 +569,28 @@ class FrankaExecutor:
         from ``O_T_EE @ link6_to_wrist`` (that double-applied the hand offset and
         drove the goal into the table -> world-collision plan failure). JOINT-SPACE
         (plan_pose_constrained + velocity follow), NO cartesian (FR3 rejects it
-        from the singular lifted pose). Stop on table reaction (``wrench[2]``)."""
+        from the singular lifted pose). Stop on table reaction (``wrench[2]``).
+
+        ``plan_result`` is first so run_auto's ``executor.place(result, ...)``
+        call works unchanged for both arms; the explicit ``grasp_wrist`` /
+        ``hand_qpos`` / ``pregrasp_qpos`` keywords still win when given.
+
+        ``use_current_wrist=True`` descends ``lift_height`` from where the wrist
+        IS instead of returning to the planned grasp pose — needed when the arm
+        was repositioned after the lift (run_auto's reposition mode), where the
+        original grasp wrist is no longer above the object.
+
+        Returns a place_info dict (``descended`` / ``target`` /
+        ``stopped_on_contact``) in the same shape as real.py's place, which
+        run_auto reads for its early-contact check."""
         self._log("place")
+        if plan_result is not None:
+            if grasp_wrist is None:
+                grasp_wrist = plan_result.wrist_se3
+            if hand_qpos is None:
+                hand_qpos = plan_result.grasp_pose
+            if pregrasp_qpos is None:
+                pregrasp_qpos = plan_result.pregrasp_pose
 
         def _release():
             """Ramp squeeze -> grasp -> pregrasp and STOP there. Falls back to a
@@ -539,11 +605,21 @@ class FrankaExecutor:
                 # exactly this config and holds the fingers there
                 self._last_hand_qpos = np.asarray(pregrasp_qpos, dtype=np.float64)
 
-        if planner is None or grasp_wrist is None:
+        if planner is None or (grasp_wrist is None and not use_current_wrist):
             _release()                                        # can't descend — just release
             self._log("place_done")
-            return
-        wrist_low = np.asarray(grasp_wrist, dtype=np.float64).copy()   # grasp pose = on table
+            return {"descended": 0.0, "target": 0.0, "stopped_on_contact": False,
+                    "mode": "release_only"}
+        if use_current_wrist:
+            # descend lift_height from HERE (arm was moved after the lift)
+            wrist_low = self.arm.get_data()["position"] @ self._link6_to_wrist
+            wrist_low = np.asarray(wrist_low, dtype=np.float64).copy()
+            wrist_low[2, 3] -= float(lift_height)
+        else:
+            wrist_low = np.asarray(grasp_wrist, dtype=np.float64).copy()  # grasp pose = on table
+        z_start = float((self.arm.get_data()["position"]
+                         @ self._link6_to_wrist)[2, 3])
+        z_target = float(wrist_low[2, 3])
         hand = (np.asarray(hand_qpos, dtype=np.float32) if hand_qpos is not None
                 else np.zeros(6, dtype=np.float32))
         start_full = np.concatenate([
@@ -551,16 +627,25 @@ class FrankaExecutor:
         print("[franka] planning place descend ...", flush=True)
         traj = planner.plan_pose_constrained(
             start_full, wrist_low, hold_vec_weight=[1, 1, 1, 1, 1, 0],
-            scene_cfg=scene_cfg, include_obj_obstacle=False)
+            scene_cfg=scene_cfg, include_obj_obstacle=False,
+            debug_dump_dir=debug_dump_dir)
         if traj is None:
             print("[franka] place descend plan failed — releasing in place")
             _release()
             self._log("place_done")
-            return
+            return {"descended": 0.0, "target": abs(z_start - z_target),
+                    "stopped_on_contact": False, "mode": "plan_failed"}
         # hold the hand (still squeezed) during descent; stop on table contact.
         self._follow(traj[:, :7], stop_wrench_z=z_force_thresh)
+        contact = bool(self._last_stop_on_contact)
+        z_end = float((self.arm.get_data()["position"]
+                       @ self._link6_to_wrist)[2, 3])
         _release()                                            # squeeze -> grasp -> pregrasp
         self._log("place_done")
+        return {"descended": float(abs(z_start - z_end)),
+                "target": float(abs(z_start - z_target)),
+                "stopped_on_contact": contact,
+                "mode": "current_wrist" if use_current_wrist else "grasp_wrist"}
 
     def release(self, plan_result: Optional[PlanResult] = None,
                 slow_factor: float = 1.0):
@@ -585,7 +670,7 @@ class FrankaExecutor:
         self._log("reset")
         if not plan_result.success or planner is None:
             self.home(clear_view=True)
-            return
+            return {"mode": "home_direct", "reason": "no_plan_or_planner"}
 
         # snapshot released object pose (robot frame) under rigid grasp
         T_obj_grasp = cart2se3(scene_cfg["mesh"]["target"]["pose"])
@@ -611,7 +696,7 @@ class FrankaExecutor:
         if retract is None:
             print("[franka] reset re-plan failed — direct clear-view move")
             self.home(clear_view=True)
-            return
+            return {"mode": "home_direct", "reason": "replan_failed"}
         # Follow the PLANNED hand columns too: plan_js_to_init goes from the
         # hand's current config (pregrasp, where release stopped) to the fully
         # open init config, so the fingers open along the retract on a path the
@@ -622,6 +707,37 @@ class FrankaExecutor:
         self._follow(retract[:, :7], hand_traj)
         self._last_hand_qpos = self._hand_init.copy()
         self._log("reset_done")
+        return {"mode": "plan_js_to_init", "n_waypoints": int(len(retract))}
+
+    # ── run_auto compatibility ───────────────────────────────────────────────
+    # run_auto drives the xarm through reset -> reset_hybrid -> reset_fallback,
+    # each a further fallback when the previous one raises. The FR3 has ONE
+    # retract path (plan_js_to_init, with a direct clear-view move built in when
+    # the plan fails), so both extra rungs map onto it rather than duplicating a
+    # second planner strategy that was never validated on this arm.
+
+    def reset_hybrid(self, plan_result: PlanResult, planner=None,
+                     scene_cfg: dict = None) -> dict:
+        """xarm's reset_hybrid equivalent — same retract as ``reset``."""
+        return self.reset(plan_result, planner, scene_cfg)
+
+    def reset_fallback(self, plan_result: Optional[PlanResult] = None) -> dict:
+        """Last-resort recovery: open the hand, then a free-space blocking move
+        to clear-view. No planning — this is what runs when execute() itself
+        raised, so the arm may be anywhere along the approach."""
+        self._log("reset_fallback")
+        try:
+            self.release(plan_result)
+        except Exception as e:
+            print(f"[franka] reset_fallback release failed: {e!r}")
+        self.home(clear_view=True)
+        return {"mode": "reset_fallback"}
+
+    def _move_joints(self, arm_traj, hand_traj=None, **_ignored):
+        """xarm RealExecutor's dense-trajectory follower, mapped onto _follow.
+        run_auto's reposition path calls this directly."""
+        self._follow(np.asarray(arm_traj)[:, :7],
+                     None if hand_traj is None else np.asarray(hand_traj))
 
     def shutdown(self):
         # leave the daemon in a non-streaming state so the NEXT process's

@@ -45,6 +45,8 @@ from autodex.utils.path import project_dir
 from autodex.perception.init_orchestrator import InitOrchestrator
 
 from src.experiment.num_camera.run_auto import (
+    _rcc_start,
+
     DEFAULT_PC_LIST, ASSETS_BASE, MESH_BASE, CAM_PARAM_ROOT, _load_calib,
 )
 
@@ -120,7 +122,7 @@ def main():
     # Hardware: stream so daemons get live SHM frames.
     rcc = remote_camera_controller("compute_adds", pc_list=args.pc_list)
     print(f"[stream] starting on {len(args.pc_list)} PCs...")
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
     if args.stream_warmup_s > 0:
         time.sleep(args.stream_warmup_s)
 

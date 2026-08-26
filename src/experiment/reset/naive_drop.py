@@ -57,6 +57,32 @@ from src.execution.run_auto import (
 )
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
 
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS (set_stream / set_record). The capture PCs
+    reject the old names outright, and the rejection LATCHES an error on every
+    camera that only a daemon-side reload clears -- so a single call from one
+    stale script leaves the next run with no frames at all.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
+
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 logging.getLogger("curobo").setLevel(logging.WARNING)
 
@@ -152,7 +178,7 @@ def main():
     rcc = remote_camera_controller(client_name, pc_list=PC_LIST)
     print(f"[stream] starting on {len(PC_LIST)} PCs @ {STREAM_FPS} FPS "
           f"(client={client_name})...")
-    rcc.start("stream", False, fps=STREAM_FPS)
+    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
     time.sleep(STREAM_WARMUP_S)
 
     sync_generator = UTGE900(**network_info["signal_generator"]["param"])
@@ -349,7 +375,8 @@ def main():
                 scene_id = str(tb_before["idx"])
                 print(f"[cycle {cycle}] Planning (scene={SCENE}, tabletop_idx={scene_id})...")
                 t0 = time.time()
-                scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
+                scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj,
+                                            get_obj_root(GRASP_VERSION))
                 scene_cfg = add_obstacles(scene_cfg, SCENE)
                 pose_stem = tb_before["filename"].replace(".npy", "")
                 # Cylinder freedom (continuous-revolute objects only) — expand
@@ -428,7 +455,7 @@ def main():
                     "AutoDex", "experiment", EXP_NAME,
                     sub, args.obj, trial_ts, "raw",
                 )
-                rcc.start("video", True, video_rel)
+                _rcc_start(rcc, "video", True, video_rel)
                 timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
                 sync_generator.start(fps=VIDEO_FPS)
                 video_started = True
@@ -469,7 +496,7 @@ def main():
                         try:
                             _stop_video(rcc, sync_generator, timestamp_monitor)
                             video_started = False
-                            rcc.start("stream", False, fps=STREAM_FPS)
+                            _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
                         except Exception as ce:
                             cleanup_errs.append(f"video_stop_or_stream: {ce!r}")
                     if cleanup_errs:
@@ -544,7 +571,7 @@ def main():
                 time.sleep(0.5)   # let capture PCs flush PNGs to NFS
 
                 # Stream back on for post-drop perception (init_daemon needs SHM).
-                rcc.start("stream", False, fps=STREAM_FPS)
+                _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
 
                 if POST_DROP_SETTLE_S > 0:
                     time.sleep(POST_DROP_SETTLE_S)
@@ -640,7 +667,7 @@ def main():
                 try:
                     _stop_video(rcc, sync_generator, timestamp_monitor)
                     video_started = False
-                    rcc.start("stream", False, fps=STREAM_FPS)
+                    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
                 except Exception as ce:
                     cycle_cleanup_errs.append(f"video_cleanup: {ce!r}")
             if cycle_cleanup_errs:

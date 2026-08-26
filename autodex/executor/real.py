@@ -15,6 +15,7 @@ Usage:
 """
 import datetime
 import os
+import sys
 import time
 from typing import Optional
 import numpy as np
@@ -664,11 +665,80 @@ class RealExecutor:
         self._move_joints(arm_traj, hand_traj)        # no monitor: arm carries the object
         self._log_state("lift_done")
 
+    def _place_planned(self, plan_result: PlanResult, planner, scene_cfg,
+                       target_descend: float, mcc_model_path: str,
+                       debug_dump_dir: str = None) -> "Optional[dict]":
+        """Descend by replaying a cuRobo straight-line trajectory. Mirror of lift.
+
+        ``lift`` plans ``wrist z + h`` with ``plan_pose_constrained`` and
+        replays it in joint space; the descent is the same motion with the sign
+        flipped. Doing it this way instead of streaming Cartesian setpoints
+        means the straight line is *checked before the arm moves* (a plan that
+        cannot be made returns None here) rather than being left to the
+        controller's internal IK, which is free to bend it.
+
+        Contact stop is preserved: ``_move_joints`` ticks the ContactMonitor
+        between waypoints and raises ``ContactDetected``, so the arm freezes
+        where it touched instead of pushing through.
+
+        Returns the same dict ``place()`` does, or None if no trajectory could
+        be planned (caller falls back to the Cartesian admittance descent).
+        """
+        link6_now = self.arm.get_data()["position"].copy()
+        wrist_place_pose = link6_now @ self._link6_to_wrist
+        wrist_place_pose[2, 3] -= target_descend
+        start_z = float(link6_now[2, 3])
+
+        start_full = np.concatenate([
+            np.asarray(self.arm.get_data()["qpos"][:6], dtype=np.float32),
+            np.asarray(plan_result.grasp_pose, dtype=np.float32),
+        ])
+        traj = planner.plan_pose_constrained(
+            start_full, wrist_place_pose,
+            hold_vec_weight=[1, 1, 1, 1, 1, 0],     # same as lift: hold pose, free z
+            scene_cfg=scene_cfg,
+            include_obj_obstacle=False,
+            debug_dump_dir=debug_dump_dir,
+        )
+        if traj is None:
+            print("[place] constrained descent plan failed — "
+                  "falling back to cartesian admittance")
+            return None
+        print(f"[place] planned straight descent, {len(traj)} waypoints")
+
+        mon = ContactMonitor(self.arm.arm, mcc_model_path,
+                             watch_joints=(1, 2), thresh_nm=10.0)
+        mon.warmup(seconds=1.0)
+
+        arm_traj = traj[:, :6]
+
+        contact = False
+        try:
+            # No hand trajectory: the squeeze pose set during execute() stays
+            # commanded (the hand controller re-sends its last action at 100 Hz),
+            # so the grip is held to the end of the descent. Feeding the
+            # planner's hand columns instead would command grasp_pose, which is
+            # less closed and would open the fingers mid-descent.
+            self._move_joints(arm_traj, None, monitor=mon)
+        except ContactDetected as exc:
+            contact = True
+            print(f"[place] CONTACT — {exc}")
+
+        final_z = float(self.arm.get_data()["position"][2, 3])
+        descended = start_z - final_z
+        print(f"[place] descended {descended*1000:.1f}mm of target "
+              f"{target_descend*1000:.0f}mm  (contact={contact})")
+        return {"descended": float(descended),
+                "stopped_on_contact": bool(contact),
+                "target": float(target_descend),
+                "mode": "planned"}
+
     def place(self, plan_result: PlanResult, lift_height: float = 0.10,
               overshoot: float = 0.0,
               mcc_model_path: str = None,
               descend_time_s: float = 4.0,
               total_time_s: float = 6.4,
+              planner=None, scene_cfg=None, debug_dump_dir: str = None,
               log_path: str = None) -> dict:
         """Descend with mcc_minimal admittance control. Target z = lift_pose -
         (lift_height + overshoot) — i.e. with overshoot=0, the arm targets the
@@ -690,6 +760,18 @@ class RealExecutor:
 
         self._log_state("place")
         target_descend = lift_height + overshoot
+
+        # Preferred path: plan the straight descent with cuRobo and replay it in
+        # joint space — the mirror of lift. Only if that cannot be planned do we
+        # fall through to streaming Cartesian setpoints below, the same way lift
+        # falls back to _move_cartesian.
+        if planner is not None:
+            planned = self._place_planned(
+                plan_result, planner, scene_cfg, target_descend,
+                mcc_model_path, debug_dump_dir=debug_dump_dir)
+            if planned is not None:
+                return planned
+
         start_pose = self.arm.get_data()["position"].copy()   # 4x4 homo, link6 in world
         current_pos = start_pose.copy()
         target_pose = start_pose.copy()
@@ -826,15 +908,20 @@ class RealExecutor:
                 sustained += 1
             else:
                 sustained = 0
-            # Periodic dump every 0.2s so torque evolution is visible.
+            # Periodic dump every 0.2s so torque evolution is visible. One
+            # self-overwriting line: at 5 dumps/s a 6.4s descent is 30+ lines
+            # of scrollback that bury the result of the trial.
             if t - last_print_t >= 0.2:
                 last_print_t = t
-                print(f"[place] t={t:5.2f}s  tau_dev={tau_dev.round(2)}  "
-                      f"ratio={ratio.round(2)}", flush=True)
+                line = (f"[place] t={t:5.2f}s  tau_dev={tau_dev.round(2)}  "
+                        f"ratio={ratio.round(2)}")
+                sys.stdout.write("\r" + line.ljust(110))
+                sys.stdout.flush()
 
             if (not contact) and (sustained >= SUSTAINED_TICKS):
                 contact = True
                 contact_t = t
+                sys.stdout.write("\n")
                 print(f"[place] CONTACT at t={t:.2f}s (watching joints {[i+1 for i in CONTACT_JOINTS]})")
                 print(f"  tau_dev = {tau_dev.round(2)}")
                 print(f"  ratio   = {ratio.round(2)}")
@@ -856,6 +943,7 @@ class RealExecutor:
                 log.append((t, *q, *tau_dev, 0))
 
         if not contact:
+            sys.stdout.write("\n")
             print(f"[place] no contact within {total_time_s}s — reached target. final pose held.")
 
         # Optional CSV log.

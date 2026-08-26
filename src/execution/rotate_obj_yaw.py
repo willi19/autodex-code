@@ -43,17 +43,51 @@ from autodex.utils.coverage import table_only_grasp_order_by_stats
 from autodex.utils.symmetry import get_cyl_axis_local, get_cyl_yaw_grid
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import add_obstacles
-from autodex.executor.real import RealExecutor
+from autodex.utils.path import get_obj_root
 from autodex.perception.init_orchestrator import InitOrchestrator
 
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
 
 
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS. The capture PCs reject the old names, and the
+    rejection LATCHES an error on every camera that only a daemon-side reload
+    clears -- so one call from a stale script poisons the next run too.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
+
+
 DEFAULT_PC_LIST = ["capture1", "capture2", "capture3", "capture5", "capture6"]
 ASSETS_BASE = Path.home() / "shared_data/AutoDex/foundpose_assets"
 MESH_BASE = Path.home() / "shared_data/AutoDex/object/paradex"
 CAM_PARAM_ROOT = Path.home() / "shared_data/cam_param"
+
+
+def _planner_robot(arm: str, hand: str) -> str:
+    """Return the cuRobo config for the selected physical arm/hand pair."""
+    if arm == "xarm":
+        return hand
+    if hand != "inspire":
+        raise SystemExit("FR3 rotation currently supports only --hand inspire")
+    return "fr3_inspire"
 
 
 def _load_calib(calib_dir):
@@ -81,6 +115,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--obj", required=True)
     p.add_argument("--hand", default="inspire_left")
+    p.add_argument("--arm", choices=["xarm", "franka"], default="xarm",
+                   help="Physical arm used for the grasp/repose cycle.")
     p.add_argument("--target_yaw_deg", type=float, required=True,
                    help="Rotate obj by this angle around world z (degrees).")
     p.add_argument("--target_x", type=float, default=0.50,
@@ -102,6 +138,7 @@ def main():
     p.add_argument("--stream_fps", type=int, default=10)
     p.add_argument("--stream_warmup_s", type=float, default=2.0)
     args = p.parse_args()
+    planner_robot = _planner_robot(args.arm, args.hand)
 
     target_yaw_rad = np.deg2rad(args.target_yaw_deg)
     print(f"[rotate] target yaw = {args.target_yaw_deg:.1f}° around world z")
@@ -125,7 +162,7 @@ def main():
 
     rcc = remote_camera_controller("rotate_yaw", pc_list=args.pc_list)
     print(f"[stream] start...")
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
     time.sleep(args.stream_warmup_s)
 
     print(f"[orch] init for {args.obj}...")
@@ -140,10 +177,19 @@ def main():
         image_hw=(H, W), mode="live", pc_serials=pc_serials,
     )
 
-    print("[planner] warmup...")
-    planner = GraspPlanner(hand=args.hand)
+    print(f"[planner] warmup ({planner_robot})...")
+    planner = GraspPlanner(hand=planner_robot)
     print("[executor] connect...")
-    executor = RealExecutor(hand_name=args.hand)
+    if args.arm == "franka":
+        from src.execution.franka_executor import FrankaExecutor
+        executor = FrankaExecutor(hand_name=args.hand)
+        # Match run_auto: keep the FR3 outside the camera views before the
+        # perception snapshot that establishes the object pose.
+        executor.home(clear_view=True)
+    else:
+        from autodex.executor.real import RealExecutor
+        executor = RealExecutor(hand_name=args.hand)
+    adof = getattr(executor, "arm_dof", 6)
 
     dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(project_dir) / "experiment" / "rotate_obj_yaw" / args.obj / dir_idx
@@ -169,9 +215,12 @@ def main():
 
     # 2. Plan grasp
     print(f"[2/4] plan grasp (version={args.grasp_version}) ...")
-    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
+    # v8 candidates were generated against object_processing; planning with
+    # the paradex mesh instead makes every candidate read as colliding.
+    obj_root = get_obj_root(args.grasp_version)
+    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj, obj_root)
     scene_cfg = add_obstacles(scene_cfg, "table")
-    tb = classify_tabletop_pose(pose_robot, args.obj)
+    tb = classify_tabletop_pose(pose_robot, args.obj, obj_root)
     pose_stem = tb["filename"].replace(".npy", "") if tb else None
     cyl_axis = get_cyl_axis_local(args.obj)
     cyl_grid = get_cyl_yaw_grid(args.obj)
@@ -188,10 +237,10 @@ def main():
             load_v7_coverage_map, _disk_success_keys,
         )
         succ_keys = _disk_success_keys(
-            args.obj, args.hand, args.grasp_version)
+            args.obj, args.hand, args.grasp_version, arm=args.arm)
         cov_map = load_v7_coverage_map(
             args.obj, tabletop_pose_stem=pose_stem,
-            hand=args.hand, version=args.grasp_version) or {}
+            hand=args.hand, version=args.grasp_version, arm=args.arm) or {}
         # Boost successful keys by +1000 so they always outrank cov-only.
         priority_map = {k: (1000 if k in succ_keys else 0) + cov_map.get(k, 0)
                         for k in set(cov_map) | set(succ_keys)}
@@ -255,7 +304,7 @@ def main():
                 candidate_order=cand_order,
                 run_ik=True,
             )
-            fv = ScenePlanVisualizer(scene_cfg, None, port=8080, hand=args.hand)
+            fv = ScenePlanVisualizer(scene_cfg, None, port=8080, hand=planner_robot)
             fv.add_candidates(wse, preg, filt, ik_failed=ikf)
             fv.start_viewer(use_thread=True)
             print(f"  [viz] http://localhost:8080  "
@@ -307,7 +356,7 @@ def main():
     T_wrist_target[2, 3] = T_wrist_now_world[2, 3]
 
     start_full = np.concatenate([
-        np.asarray(executor.arm.get_data()["qpos"][:6], dtype=np.float32),
+        np.asarray(executor.arm.get_data()["qpos"][:adof], dtype=np.float32),
         np.asarray(result.grasp_pose, dtype=np.float32),
     ])
     traj_repose = planner.plan_pose_constrained(
@@ -316,7 +365,7 @@ def main():
         scene_cfg=scene_cfg, include_obj_obstacle=False,
     )
     if traj_repose is not None:
-        arm_repose = traj_repose[:, :6]
+        arm_repose = traj_repose[:, :adof]
         hand_repose = np.tile(s_hand, (len(traj_repose), 1))
         executor._move_joints(arm_repose, hand_repose)
         print(f"  repose OK")
@@ -324,9 +373,19 @@ def main():
         print(f"  repose plan failed — place at current pose without rotating")
 
     # Place + release + retract
-    place_info = executor.place(result)
+    place_kwargs = {}
+    if args.arm == "franka":
+        # After the yaw reposition the FR3 is no longer above the original
+        # grasp pose. Its place() therefore must descend from the current
+        # wrist, exactly as run_auto's reposition path does.
+        place_kwargs["use_current_wrist"] = True
+    place_info = executor.place(result, planner=planner, scene_cfg=scene_cfg,
+                                **place_kwargs)
     print(f"  place: {place_info}")
-    executor.release(result)
+    # FrankaExecutor.place() owns the controlled squeeze -> release ramp.
+    # Calling release() again would run a second, unnecessary hand trajectory.
+    if args.arm != "franka":
+        executor.release(result)
     try:
         executor.reset(result, planner, scene_cfg)
     except Exception as e:

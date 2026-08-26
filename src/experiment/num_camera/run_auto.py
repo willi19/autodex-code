@@ -54,6 +54,32 @@ from autodex.perception.init_orchestrator import InitOrchestrator
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.execution.label import auto_label_charuco
 
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS (set_stream / set_record). The capture PCs
+    reject the old names outright, and the rejection LATCHES an error on every
+    camera that only a daemon-side reload clears -- so a single call from one
+    stale script leaves the next run with no frames at all.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
+
 CHARUCO_BOARD = "1"
 
 
@@ -430,7 +456,7 @@ def run_single_trial(
 
     raw_rel = os.path.join("AutoDex", "experiment", args.exp_name, sub, obj, dir_idx, "raw")
     raw_dir = os.path.join(img_dir, "raw")
-    rcc.start("video", True, raw_rel)
+    _rcc_start(rcc, "video", True, raw_rel)
     timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
     executor.start_recording(raw_dir)
     sync_generator.start(fps=30)
@@ -517,7 +543,7 @@ def run_single_trial(
     print(f"    Result: {status}  saved to {img_dir}/result.json")
 
     # Resume the stream so the next trial's init has live SHM frames.
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
 
     return _stamp_end(trial_result)
 
@@ -613,7 +639,7 @@ def main():
     timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
 
     print(f"[stream] starting on {len(args.pc_list)} PCs @ {args.stream_fps} FPS...")
-    rcc.start("stream", False, fps=args.stream_fps)
+    _rcc_start(rcc, "stream", False, fps=args.stream_fps)
     if args.stream_warmup_s > 0:
         time.sleep(args.stream_warmup_s)
 

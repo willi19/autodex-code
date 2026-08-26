@@ -18,6 +18,7 @@ scene's pose_idx is covered by a capture, RED otherwise) + obstacle cuboids
     python src/visualization/coverage_viewer.py --port 8091
 """
 import os
+import sys
 import json
 import time
 import glob
@@ -26,10 +27,14 @@ import numpy as np
 import trimesh
 import viser
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "mesh_process"))
+import scene_grid_viewer as sg  # noqa: E402
+
 from autodex.utils.conversion import cart2se3
 
-DS = "/home/mingi/shared_data/autodex_dataset/selected_100"
-OBJROOT = "/home/mingi/shared_data/object_processing"
+DS = os.path.expanduser("~/shared_data/autodex_dataset/selected_100")
+OBJROOT = os.path.expanduser("~/shared_data/object_processing")
 THRESH_DEG = 30.0
 SCENE_TYPES = ["wall", "shelf", "box"]
 
@@ -45,6 +50,34 @@ def load_mesh(obj):
 def tabletop_poses(obj):
     fs = sorted(glob.glob(f"{OBJROOT}/{obj}/processed_data/info/tabletop/*.npy"))
     return {os.path.basename(f)[:-4]: np.load(f) for f in fs}
+
+
+def build_scene(obj, scene_type, d, tts, obb):
+    """Rebuild a scene with PROPER obstacle geometry (same as
+    coverage_grid_viewer): the on-disk cuboids are table+floor only, so a box
+    scene draws as a raised floor with no walls. The sg builders reconstruct
+    the real obstacles from the scene json's ``meta.param``:
+      box -> 4 side walls, shelf -> back/side/up panels, wall -> one panel.
+    Returns None if it cannot be rebuilt (caller falls back to the raw scene)."""
+    pose = str(d.get("meta", {}).get("pose_idx"))
+    if pose not in tts:
+        return None
+    p = d.get("meta", {}).get("param", {})
+    ttp = tts[pose]
+    try:
+        if scene_type == "wall":
+            return sg.get_wall_scene(obj, ttp, obb,
+                                     p.get("z_rotation_deg", 0.0), p.get("gap", 0.0))
+        if scene_type == "shelf":
+            return sg.get_shelf_scene(obj, ttp, obb,
+                                      p.get("z_rotation_deg", 0.0), p.get("gap", 0.0),
+                                      up=p.get("up", True), side=p.get("side", True),
+                                      back=p.get("back", True))
+        if scene_type == "box":
+            return sg.get_box_scene(obj, ttp, p.get("height_offset", 0.0))
+    except Exception as e:
+        print(f"[coverage_viewer] scene rebuild failed ({obj}/{scene_type}): {e!r}")
+    return None
 
 
 def covered_poses(obj, ttv):
@@ -105,6 +138,12 @@ def main():
         state["cov"] = covered_poses(obj, ttv)
         state["mesh"] = load_mesh(obj)
         state["ntt"] = len(tts)
+        state["tts"] = tts
+        try:
+            state["obb"] = json.load(
+                open(f"{OBJROOT}/{obj}/processed_data/info/simplified.json"))
+        except Exception:
+            state["obb"] = None
 
     def refresh_files():
         obj, st = dd_obj.value, dd_st.value
@@ -131,7 +170,9 @@ def main():
             return
         f = files[int(sl.value)]
         d = json.load(open(f))
-        scene = d["scene"]
+        # rebuilt obstacles (walls/panels), not the table-only on-disk cuboids
+        scene = build_scene(dd_obj.value, dd_st.value, d,
+                            state.get("tts", {}), state.get("obb")) or d["scene"]
         pidx = d.get("meta", {}).get("pose_idx")
         is_cov = pidx in state["cov"]
 
