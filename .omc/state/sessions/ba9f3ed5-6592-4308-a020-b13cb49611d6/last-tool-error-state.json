@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /home/mingi/AutoDex/autodex/planner/src/curobo/content/configs/robot && diff <(grep -A30 \\\"collision_link_names\\\" inspire_left_floating.yml | head -32) <(grep -A30 \\\"collision_link_name...",
+  "error": "Exit code 1\n3,7c3,7\n<           \"left_thumb_1\", \"left_thumb_2\", \"left_thumb_3\", \"left_thumb_4\",\n<           \"left_index_1\", \"left_index_2\",\n<           \"left_middle_1\", \"left_middle_2\",\n<           \"left_ring_1\", \"left_ring_2\",\n<           \"left_little_1\", \"left_little_2\"\n---\n>           \"right_thumb_1\", \"right_thumb_2\", \"right_thumb_3\", \"right_thumb_4\",\n>           \"right_index_1\", \"right_index_2\",\n>           \"right_middle_1\", \"right_middle_2\",\n>           \"right_ring_1\", \"right_ring_2\",\n>    ...",
+  "timestamp": "2026-08-11T10:48:52.503Z",
+  "retry_count": 1
+}

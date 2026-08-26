@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls ~/AutoDex/logging/adaptive/inspire/v8/ | grep -i french; echo \\\"--- exists? ---\\\"; ls -d ~/AutoDex/logging/adaptive/inspire/v8/french_mustard 2>&1; echo \\\"=== sample obj ===\\\"; ls ~/Aut...",
+  "error": "Exit code 2\nfrench_mustard.json\n--- exists? ---\nls: cannot access '/home/mingi/AutoDex/logging/adaptive/inspire/v8/french_mustard': No such file or directory\n=== sample obj ===\nls: cannot access '/home/mingi/AutoDex/logging/adaptive/inspire/v8/apple/': No such file or directory",
+  "timestamp": "2026-08-11T22:09:07.563Z",
+  "retry_count": 1
+}

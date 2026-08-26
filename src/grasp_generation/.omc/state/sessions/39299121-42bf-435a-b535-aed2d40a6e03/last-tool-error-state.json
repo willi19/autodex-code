@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls ~/AutoDex/logging/adaptive/inspire/ 2>/dev/null; echo \\\"=== v8 objs w/ summary ===\\\"; ls ~/AutoDex/logging/adaptive/inspire/v8/ 2>/dev/null | wc -l; ls ~/AutoDex/logging/adaptive/inspir...",
+  "error": "Exit code 2\nv8\n=== v8 objs w/ summary ===\n103",
+  "timestamp": "2026-08-11T22:09:01.463Z",
+  "retry_count": 1
+}

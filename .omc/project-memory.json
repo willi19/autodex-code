@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1786373495356,
+  "lastScanned": 1786485334923,
   "projectRoot": "/home/mingi/AutoDex",
   "techStack": {
     "languages": [
@@ -46,7 +46,7 @@
       "path": "Visualization",
       "purpose": null,
       "fileCount": 9,
-      "lastAccessed": 1786373495352,
+      "lastAccessed": 1786485334922,
       "keyFiles": [
         "README.md",
         "bodex_output.py",
@@ -59,7 +59,7 @@
       "path": "autodex",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1786373495353,
+      "lastAccessed": 1786485334922,
       "keyFiles": [
         "README.md",
         "__init__.py"
@@ -69,7 +69,7 @@
       "path": "autodex.egg-info",
       "purpose": null,
       "fileCount": 4,
-      "lastAccessed": 1786373495353,
+      "lastAccessed": 1786485334922,
       "keyFiles": [
         "PKG-INFO",
         "SOURCES.txt",
@@ -81,28 +81,28 @@
       "path": "bodex_outputs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334922,
       "keyFiles": []
     },
     "candidates": {
       "path": "candidates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334922,
       "keyFiles": []
     },
     "data": {
       "path": "data",
       "purpose": "Data files",
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334922,
       "keyFiles": []
     },
     "docs": {
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 2,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334922,
       "keyFiles": [
         "coverage_pipeline_logic.md",
         "distributed_tracking.md"
@@ -112,28 +112,28 @@
       "path": "logging",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334923,
       "keyFiles": []
     },
     "order": {
       "path": "order",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334923,
       "keyFiles": []
     },
     "outputs": {
       "path": "outputs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334923,
       "keyFiles": []
     },
     "patches": {
       "path": "patches",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1786373495354,
+      "lastAccessed": 1786485334923,
       "keyFiles": [
         "MV-GoTrack-renderer-fix.patch"
       ]
@@ -142,7 +142,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 27,
-      "lastAccessed": 1786373495355,
+      "lastAccessed": 1786485334923,
       "keyFiles": [
         "allegro.csv",
         "allegro.tsv",
@@ -155,7 +155,7 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 1,
-      "lastAccessed": 1786373495355,
+      "lastAccessed": 1786485334923,
       "keyFiles": [
         "readme.md"
       ]
@@ -164,7 +164,7 @@
       "path": "autodex/utils",
       "purpose": "Utility functions",
       "fileCount": 9,
-      "lastAccessed": 1786373495355,
+      "lastAccessed": 1786485334923,
       "keyFiles": [
         "__init__.py",
         "conversion.py",
@@ -174,15 +174,9 @@
   },
   "hotPaths": [
     {
-      "path": "src/grasp_generation/reorient/gen_all.py",
-      "accessCount": 1,
-      "lastAccessed": 1786379868424,
-      "type": "file"
-    },
-    {
-      "path": "src/grasp_generation/reorient/gen_scene.py",
-      "accessCount": 1,
-      "lastAccessed": 1786379933086,
+      "path": "src/experiment/reset/reorient.py",
+      "accessCount": 3,
+      "lastAccessed": 1786485903494,
       "type": "file"
     }
   ],
