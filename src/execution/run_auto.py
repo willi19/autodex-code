@@ -917,8 +917,11 @@ def run_single_trial(
             except Exception as _se:
                 print(f"    [pose_search] failed: {_se!r}")
             if _ros_yaw is not None:
+                # --arm MUST be forwarded: rotate_obj_yaw defaults to xarm,
+                # so without it an FR3 run launches XArmController and dies on
+                # "connect socket failed" (there is no xarm on this setup).
                 _cmd_ros = (f"python src/execution/rotate_obj_yaw.py "
-                             f"--obj {obj} --hand {hand} "
+                             f"--obj {obj} --hand {hand} --arm {args.arm} "
                              f"--target_yaw_deg {_ros_yaw:.0f} "
                              f"--target_x {_ros_x:.2f} "
                              f"--grasp_version {args.grasp_version}")
