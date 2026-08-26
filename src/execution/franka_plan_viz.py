@@ -25,7 +25,7 @@ import viser
 from autodex.planner import GraspPlanner
 from autodex.planner.planner import _to_curobo_world  # noqa: F401
 from autodex.utils.conversion import cart2se3
-from autodex.utils.path import obj_path, project_dir
+from autodex.utils.path import obj_path, project_dir, get_obj_root
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 
 
@@ -44,7 +44,8 @@ def main():
     print(f"[viz] trial: {trial}")
     pose_world = np.load(trial / "pose_world.npy")
     c2r = np.load(trial / "C2R.npy")
-    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
+    scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj,
+                                        get_obj_root(args.version))
     obj_T = cart2se3(np.array(scene_cfg["mesh"]["target"]["pose"], float))
 
     planner = GraspPlanner(hand=args.hand)

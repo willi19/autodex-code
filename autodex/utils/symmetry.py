@@ -115,6 +115,55 @@ def _load_tabletop_pose(tt_dir: Path, idx: int) -> Optional[np.ndarray]:
     return None
 
 
+_asset_sym_cache: dict = {}
+
+
+def get_asset_symmetry(obj_name: str, obj_root=None):
+    """Symmetry from the asset tree's ``processed_data/info/symmetry.json``.
+
+    This is object_processing's own detector output and the only place some
+    objects declare their symmetry — apple, for instance, is ``Cinf`` about a
+    near-y axis there and has nothing in the paradex-side registry. Ignoring it
+    makes every comparison of that object's tabletop poses meaningless: a body
+    of revolution rests the same way at any angle about its axis, so two poses
+    that differ only by that rotation ARE the same pose.
+
+    Returns a list of ``(axis (3,), fold)`` — ``fold=None`` means continuous
+    (Cinf), an int is a discrete order — or ``None`` when nothing is declared.
+    """
+    from autodex.utils.path import obj_path as _default_root
+    root = Path(obj_root) if obj_root is not None else Path(_default_root)
+    key = (obj_name, str(root))
+    if key in _asset_sym_cache:
+        return _asset_sym_cache[key]
+
+    f = root / obj_name / "processed_data" / "info" / "symmetry.json"
+    out = None
+    if f.is_file():
+        try:
+            d = json.load(open(f))
+            got = []
+            for ax in (d.get("axes") or []):
+                a = np.asarray(ax.get("axis"), dtype=float).reshape(3)
+                n = np.linalg.norm(a)
+                if n <= 1e-9:
+                    continue
+                fold = ax.get("fold")
+                fold = None if fold in ("inf", "Cinf", None) else int(fold)
+                got.append((a / n, fold))
+            if got:
+                # ALL axes, not just the first. A Dinf object (pringles) is a
+                # cylinder that also reads the same flipped end-over-end: its
+                # entry is [Cinf about z, 2-fold, 2-fold]. Keeping only the Cinf
+                # axis leaves the flip unfolded, and the two trees' poses then
+                # sit exactly 180 deg apart and fail to match.
+                out = got
+        except Exception:
+            out = None
+    _asset_sym_cache[key] = out
+    return out
+
+
 def get_cyl_axis_local(obj_name: str) -> Optional[np.ndarray]:
     """Return the object-frame symmetry axis as a (3,) unit vector, or ``None``
     if no symmetry is registered.

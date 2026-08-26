@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -40,14 +41,43 @@ def _to_home_relative(p) -> str:
 
 
 def _parse_multipart(parts: List[bytes]) -> Tuple[Optional[Dict], List[bytes]]:
-    """paradex DataPublisher format: [b'data', metadata_json, *blobs]."""
+    """paradex envelope format: [topic, msgpack_header{seq,ts,src,meta,n}, *bufs].
+
+    The transport migrated from the OLD ``[b'data', metadata_json, *blobs]`` JSON
+    layout to a msgpack envelope — parsing parts[1] as JSON silently dropped every
+    payload (masks/poses 0/N). Use paradex's own decoder; ``msg.meta`` is the same
+    per-item metadata that ``send_data(metadata, data)`` published, ``msg.bufs``
+    the raw blobs. Falls back to the old JSON layout for safety."""
+    try:
+        from paradex.io.capture_pc.envelope import decode
+        msg = decode(parts)
+        return msg.meta, list(msg.bufs)
+    except Exception:
+        pass
+    # legacy fallback: [b'data', metadata_json, *blobs]
     if len(parts) < 2 or parts[0] != b"data":
         return None, []
     try:
-        meta_msg = json.loads(parts[1].decode("utf-8"))
+        return json.loads(parts[1].decode("utf-8")), list(parts[2:])
     except Exception:
         return None, []
-    return meta_msg, list(parts[2:])
+
+
+def _progress(elapsed: float, n_mask: int, n_pose: int, n_expected: int,
+              done: bool = False) -> None:
+    """One self-overwriting progress line (\r), like tqdm.
+
+    A wait can run tens of seconds at ~2 prints/s; on its own line each that is
+    a hundred lines of scrollback burying whatever came before. Ends with a
+    newline once, when done.
+    """
+    line = (f"  ... [{elapsed:5.1f}s] masks {n_mask}/{n_expected}  "
+            f"poses {n_pose}/{n_expected}")
+    # Pad to clear a previously longer line, since \r only moves the cursor.
+    sys.stdout.write("\r" + line.ljust(72))
+    if done:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 class _Buffer:
@@ -81,23 +111,53 @@ class _SubThread(threading.Thread):
             self.sock.connect(f"tcp://{ip}:{port}")
         self.buffer = buffer
         self.on_message = on_message
-        self._stop = threading.Event()
+        # NOT `self._stop`: threading.Thread uses that name internally, and
+        # shadowing it with an Event makes join() raise
+        # "'Event' object is not callable" — the thread can never be waited on.
+        self._stop_evt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self):
-        while not self._stop.is_set():
+        try:
+            self._run()
+        finally:
+            # The socket MUST be closed from the thread that polls it, and it
+            # must be closed at all: zmq's context.term() blocks until every
+            # socket in the context is closed, so leaking this one hangs
+            # shutdown forever.
+            try:
+                self.sock.setsockopt(zmq.LINGER, 0)
+                self.sock.close()
+            except Exception:
+                pass
+
+    def _run(self):
+        while not self._stop_evt.is_set():
             try:
                 if self.sock.poll(timeout=100):
                     parts = self.sock.recv_multipart(flags=zmq.NOBLOCK)
                     msg, blobs = _parse_multipart(parts)
                     if msg is None or self.on_message is None:
                         continue
-                    for item, blob in zip(msg.get("items", []), blobs):
-                        self.on_message(item, blob)
+                    # New paradex envelope: msg.meta is a LIST of per-item dicts
+                    # ([{"req_id","serial",...}]) with one blob per item. Support
+                    # the old dict-wrapped ({"items":[...]}) and flat-dict layouts too.
+                    if isinstance(msg, list):
+                        for item, blob in zip(msg, blobs):
+                            self.on_message(item, blob)
+                    elif isinstance(msg, dict) and "items" in msg:
+                        for item, blob in zip(msg["items"], blobs):
+                            self.on_message(item, blob)
+                    elif isinstance(msg, dict):
+                        self.on_message(msg, blobs[0] if blobs else b"")
             except zmq.Again:
                 pass
+            except zmq.ContextTerminated:
+                # Someone tore the context down under us — nothing left to
+                # read. Return quietly so the finally: above closes the socket.
+                return
             except Exception as exc:
                 logger.warning(f"[{self.name}] {exc}")
 
@@ -291,9 +351,14 @@ class InitOrchestrator:
         first_mask_t = None; first_pose_t = None
         last_print = 0.0
         last_n_mask = -1; last_n_pose = -1
+        interrupted = False
         while time.perf_counter() < deadline:
-            masks_now = self.mask_buf.get(request_id)
-            poses_now = self.pose_buf.get(request_id)
+            try:
+                masks_now = self.mask_buf.get(request_id)
+                poses_now = self.pose_buf.get(request_id)
+            except KeyboardInterrupt:
+                interrupted = True
+                break
             if first_mask_t is None and masks_now:
                 first_mask_t = time.perf_counter()
             if first_pose_t is None and poses_now:
@@ -303,13 +368,25 @@ class InitOrchestrator:
                     or len(masks_now) != last_n_mask
                     or len(poses_now) != last_n_pose):
                 elapsed = now - t_dispatch
-                print(f"  ... [{elapsed:5.1f}s] masks {len(masks_now)}/{n_expected}  "
-                      f"poses {len(poses_now)}/{n_expected}", flush=True)
+                _progress(elapsed, len(masks_now), len(poses_now), n_expected)
                 last_print = now
                 last_n_mask = len(masks_now); last_n_pose = len(poses_now)
             if len(masks_now) >= n_expected and len(poses_now) >= n_expected:
                 break
-            time.sleep(0.01)
+            try:
+                time.sleep(0.01)
+            except KeyboardInterrupt:
+                interrupted = True
+                break
+        if interrupted:
+            # Ctrl-C during the wait = "stop waiting, use what arrived", not
+            # "kill the run": the caller still has partial masks/poses and the
+            # robot is mid-trial.
+            sys.stdout.write("\n")
+            logger.warning("[orch] wait interrupted by user — "
+                           "continuing with whatever arrived")
+        _progress(time.perf_counter() - t_dispatch, len(self.mask_buf.get(request_id)),
+                  len(self.pose_buf.get(request_id)), n_expected, done=True)
         masks = self.mask_buf.get(request_id)
         poses = self.pose_buf.get(request_id)
         t_collected = time.perf_counter()
@@ -449,9 +526,14 @@ class InitOrchestrator:
         first_mask_t = None; first_pose_t = None
         last_print = 0.0
         last_n_mask = -1; last_n_pose = -1
+        interrupted = False
         while time.perf_counter() < deadline:
-            masks_now = self.mask_buf.get(request_id)
-            poses_now = self.pose_buf.get(request_id)
+            try:
+                masks_now = self.mask_buf.get(request_id)
+                poses_now = self.pose_buf.get(request_id)
+            except KeyboardInterrupt:
+                interrupted = True
+                break
             if first_mask_t is None and masks_now:
                 first_mask_t = time.perf_counter()
             if first_pose_t is None and poses_now:
@@ -461,13 +543,25 @@ class InitOrchestrator:
                     or len(masks_now) != last_n_mask
                     or len(poses_now) != last_n_pose):
                 elapsed = now - t_dispatch
-                print(f"  ... [{elapsed:5.1f}s] masks {len(masks_now)}/{n_expected}  "
-                      f"poses {len(poses_now)}/{n_expected}", flush=True)
+                _progress(elapsed, len(masks_now), len(poses_now), n_expected)
                 last_print = now
                 last_n_mask = len(masks_now); last_n_pose = len(poses_now)
             if len(masks_now) >= n_expected and len(poses_now) >= n_expected:
                 break
-            time.sleep(0.01)
+            try:
+                time.sleep(0.01)
+            except KeyboardInterrupt:
+                interrupted = True
+                break
+        if interrupted:
+            # Ctrl-C during the wait = "stop waiting, use what arrived", not
+            # "kill the run": the caller still has partial masks/poses and the
+            # robot is mid-trial.
+            sys.stdout.write("\n")
+            logger.warning("[orch] wait interrupted by user — "
+                           "continuing with whatever arrived")
+        _progress(time.perf_counter() - t_dispatch, len(self.mask_buf.get(request_id)),
+                  len(self.pose_buf.get(request_id)), n_expected, done=True)
         masks = self.mask_buf.get(request_id)
         poses = self.pose_buf.get(request_id)
         t_collected = time.perf_counter()
@@ -577,16 +671,32 @@ class InitOrchestrator:
         # "exit" and kills the daemons, which we want to keep alive across
         # interactive sessions. Just close the local sockets.
         self._mask_thread.stop(); self._pose_thread.stop()
+        # Wait for them to actually exit — stop() only sets a flag, and each
+        # closes its SUB socket on the way out. Closing those sockets from
+        # here instead would be a cross-thread close, which zmq forbids.
+        for t in (self._mask_thread, self._pose_thread):
+            try:
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    logger.warning(f"[close] {t.name} did not exit in 3s")
+            except Exception:
+                pass
         try:
             # LINGER=0 so close() doesn't wait for queued messages to drain to
-            # a dead daemon — otherwise context.term() hangs indefinitely on
-            # any REQ socket left mid-cycle (wait=False sends).
+            # a dead daemon — otherwise it hangs indefinitely on any REQ socket
+            # left mid-cycle (wait=False sends).
             for s in self.cmd.sockets.values():
                 try:
                     s.setsockopt(zmq.LINGER, 0)
                 except Exception:
                     pass
                 s.close()
-            self.cmd.context.term()
         except Exception:
             pass
+        # Deliberately NOT calling self.cmd.context.term(): CommandSender uses
+        # zmq.Context.instance(), the process-wide singleton that the camera
+        # controller and timestamp monitor also share. Terminating it kills
+        # THEIR sockets too ("Context was terminated"), and it blocks until
+        # every socket in the process is closed — which is what made shutdown
+        # hang. Our own sockets are closed above; the rest is the OS's job at
+        # exit.

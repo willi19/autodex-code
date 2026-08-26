@@ -30,14 +30,71 @@ CYLINDER_OBJECTS = [
 SPHERE_OBJECTS = ["baseball", "tennis_ball"]
 
 
-def find_planning_mesh(obj_name: str) -> str:
-    p = os.path.join(obj_path, obj_name, "processed_data", "mesh", "simplified.obj")
+def find_planning_mesh(obj_name: str, obj_root: Optional[str] = None) -> str:
+    """Planning mesh for ``obj_name`` under ``obj_root`` (default: legacy obj_path).
+
+    Pass ``get_obj_root(version)`` to resolve a v8 pool against
+    object_processing — its simplified.obj is a different mesh frame than the
+    paradex one, so the root must match the candidate pool.
+    """
+    root = obj_root or obj_path
+    p = os.path.join(root, obj_name, "processed_data", "mesh", "simplified.obj")
     if os.path.exists(p):
         return p
-    p2 = os.path.join(obj_path, obj_name, "raw_mesh", f"{obj_name}.obj")
+    p2 = os.path.join(root, obj_name, "raw_mesh", f"{obj_name}.obj")
     if os.path.exists(p2):
         return p2
-    raise FileNotFoundError(f"No planning mesh for {obj_name}")
+    raise FileNotFoundError(f"No planning mesh for {obj_name} under {root}")
+
+
+def check_mesh_frame_match(obj_name: str, perception_mesh: str,
+                           obj_root: Optional[str] = None,
+                           tol_m: float = 0.002) -> tuple:
+    """Verify the perception mesh and the planning asset tree share one frame.
+
+    FoundPose estimates the pose of ``perception_mesh``; the planner places
+    ``find_planning_mesh(obj, obj_root)``. If the two roots hold *different
+    geometry* for the object, the estimated pose is expressed in the wrong
+    frame and every grasp is silently offset.
+
+    For 98 of 104 objects the paradex and object_processing ``raw_mesh`` files
+    are byte-identical, so the check is free. The rest (paradex shipped a crude
+    primitive, op has a real scan) genuinely need re-onboarding against op.
+
+    Returns ``(ok: bool, msg: str)``.
+    """
+    import filecmp
+
+    root = obj_root or obj_path
+    if os.path.realpath(root) == os.path.realpath(obj_path):
+        return True, "planning root == legacy obj_path"
+
+    ref = os.path.join(root, obj_name, "raw_mesh", f"{obj_name}.obj")
+    if not os.path.exists(ref):
+        return True, f"no raw_mesh under {root} — cannot compare, assuming ok"
+    if not os.path.exists(perception_mesh):
+        return False, f"perception mesh missing: {perception_mesh}"
+    if filecmp.cmp(perception_mesh, ref, shallow=False):
+        return True, "raw_mesh byte-identical across roots"
+
+    # Different bytes: fall back to geometry. Same frame => same vertex count
+    # and a centroid/extent match well under a grasp-relevant tolerance.
+    a = trimesh.load(perception_mesh, process=False)
+    b = trimesh.load(ref, process=False)
+    if isinstance(a, trimesh.Scene):
+        a = a.dump(concatenate=True)
+    if isinstance(b, trimesh.Scene):
+        b = b.dump(concatenate=True)
+    d_cent = float(np.linalg.norm(np.asarray(a.centroid) - np.asarray(b.centroid)))
+    d_ext = float(np.max(np.abs(np.asarray(a.extents) - np.asarray(b.extents))))
+    if d_cent <= tol_m and d_ext <= tol_m:
+        return True, f"geometry matches (dcentroid={d_cent:.4f} dextent={d_ext:.4f})"
+    return False, (
+        f"{obj_name}: perception mesh and planning root disagree "
+        f"(dcentroid={d_cent:.4f}m dextent={d_ext:.4f}m, "
+        f"V {len(a.vertices)} vs {len(b.vertices)}). Re-onboard FoundPose "
+        f"against {ref} before running this pool."
+    )
 
 
 def _snap_z_to_table(pose_robot: np.ndarray, mesh_path: str) -> np.ndarray:
@@ -57,8 +114,10 @@ def _snap_z_to_table(pose_robot: np.ndarray, mesh_path: str) -> np.ndarray:
     return pose_robot
 
 
-def _snap_cylinder_pose(pose_robot: np.ndarray, obj_name: str) -> np.ndarray:
-    tabletop_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+def _snap_cylinder_pose(pose_robot: np.ndarray, obj_name: str,
+                        obj_root: Optional[str] = None) -> np.ndarray:
+    tabletop_dir = os.path.join(obj_root or obj_path, obj_name,
+                                "processed_data", "info", "tabletop")
     if not os.path.isdir(tabletop_dir):
         return pose_robot
     tabletop_files = sorted(glob.glob(os.path.join(tabletop_dir, "*.npy")))
@@ -92,8 +151,10 @@ def _snap_cylinder_pose(pose_robot: np.ndarray, obj_name: str) -> np.ndarray:
     return pose_robot
 
 
-def _snap_sphere_pose(pose_robot: np.ndarray, obj_name: str) -> np.ndarray:
-    tabletop_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+def _snap_sphere_pose(pose_robot: np.ndarray, obj_name: str,
+                      obj_root: Optional[str] = None) -> np.ndarray:
+    tabletop_dir = os.path.join(obj_root or obj_path, obj_name,
+                                "processed_data", "info", "tabletop")
     if not os.path.isdir(tabletop_dir):
         return pose_robot
     tabletop_files = sorted(glob.glob(os.path.join(tabletop_dir, "*.npy")))
@@ -107,18 +168,24 @@ def _snap_sphere_pose(pose_robot: np.ndarray, obj_name: str) -> np.ndarray:
     return pose_robot
 
 
-def pose_world_to_scene_cfg(pose_world: np.ndarray, c2r: np.ndarray, obj_name: str) -> dict:
-    """Convert world-frame 4x4 pose to a scene_cfg dict for GraspPlanner.plan()."""
+def pose_world_to_scene_cfg(pose_world: np.ndarray, c2r: np.ndarray, obj_name: str,
+                            obj_root: Optional[str] = None) -> dict:
+    """Convert world-frame 4x4 pose to a scene_cfg dict for GraspPlanner.plan().
+
+    ``obj_root`` selects which asset tree the planning mesh and the tabletop
+    snap poses come from — pass ``get_obj_root(version)`` so a v8 pool reads
+    object_processing. Defaults to the legacy ``obj_path``.
+    """
     pose_robot = np.linalg.inv(c2r) @ pose_world
     if obj_name in SPHERE_OBJECTS:
-        pose_robot = _snap_sphere_pose(pose_robot, obj_name)
+        pose_robot = _snap_sphere_pose(pose_robot, obj_name, obj_root)
     elif obj_name in CYLINDER_OBJECTS:
-        pose_robot = _snap_cylinder_pose(pose_robot, obj_name)
+        pose_robot = _snap_cylinder_pose(pose_robot, obj_name, obj_root)
     return {
         "mesh": {
             "target": {
                 "pose": se32cart(pose_robot).tolist(),
-                "file_path": find_planning_mesh(obj_name),
+                "file_path": find_planning_mesh(obj_name, obj_root),
             }
         },
         "cuboid": {

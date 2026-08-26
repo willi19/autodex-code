@@ -2019,7 +2019,6 @@ class GraspPlanner:
         # 3. Filter: backward + hand-table collision
         t0 = _time.time()
         backward = np.zeros(len(wrist_se3), dtype=bool) if self._hand.startswith("inspire") else (wrist_se3[:, :3, :3] @ self._link6_y_in_wrist)[:, 2] < 0.3
-        print(f"[backward] wrist x-axis z: {wrist_se3[:, 0, 2]}")
         collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
         valid = np.where(~(backward | collision))[0]
         t_filter = _time.time() - t0

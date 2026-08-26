@@ -59,7 +59,7 @@ from paradex.io.camera_system.timestamp_monitor import TimestampMonitor
 from paradex.utils.system import network_info, get_pc_ip, get_camera_list
 from paradex.calibration.utils import save_current_camparam, save_current_C2R, load_c2r
 
-from autodex.utils.path import project_dir, obj_path
+from autodex.utils.path import project_dir, obj_path, get_obj_root
 from autodex.utils.conversion import cart2se3
 from autodex.planner import GraspPlanner
 from autodex.planner.planner import (
@@ -130,7 +130,33 @@ STREAM_WARMUP_S = 2.0
 VIDEO_FPS = 30
 CYCLE_SLEEP_S = 2.0
 POST_DROP_SETTLE_S = 1.0
-CHARUCO_BOARD = "1"
+# Board id lives in src/execution/label.py — one place to swap.
+from src.execution.label import CHARUCO_BOARD  # noqa: E402
+
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS. The capture PCs reject the old names, and the
+    rejection LATCHES an error on every camera that only a daemon-side reload
+    clears -- so one call from a stale script poisons the next run too.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
 
 
 class _SoftSkip(Exception):
@@ -269,13 +295,20 @@ def _pose_int_from_filename(filename: str) -> int:
     return int(filename.replace(".npy", ""))
 
 
-def _autoselect_h_cm(hand: str, obj: str, target_j: int | None = None) -> int | None:
+def _autoselect_h_cm(hand: str, obj: str, target_j: int | None = None,
+                     obj_root: str | None = None) -> int | None:
     """Pick the smallest ``reorient_{h_cm}`` folder that contains at least one
     ``*_{target_j}`` cell. If ``target_j`` is None, fall back to the smallest
-    ``reorient_{h_cm}`` folder regardless of cell contents."""
+    ``reorient_{h_cm}`` folder regardless of cell contents.
+
+    ``target_j`` is numbered in ``obj_root``'s tabletop tree; the cell dirs are
+    numbered in the legacy paradex tree, so it is mapped first."""
+    from autodex.utils.tabletop_map import to_reset_index
     reset_root = Path(project_dir) / "candidates" / hand / "reset" / obj
     if not reset_root.exists():
         return None
+    if target_j is not None:
+        target_j = to_reset_index(obj, target_j, obj_root)
     cands = []
     for p in reset_root.iterdir():
         if not p.is_dir() or not p.name.startswith("reorient_"):
@@ -298,14 +331,20 @@ def _autoselect_h_cm(hand: str, obj: str, target_j: int | None = None) -> int | 
     return sorted(cands, key=lambda kv: kv[0])[0][0]
 
 
-def _load_target_tabletop_pose(obj: str, target_j: int) -> np.ndarray:
+def _load_target_tabletop_pose(obj: str, target_j: int,
+                               obj_root: str | None = None) -> np.ndarray:
     """Load 4x4 tabletop pose (robot frame) for filename int ``target_j``.
-    Files are zero-padded 3-digit (``002.npy``)."""
+    Files are zero-padded 3-digit (``002.npy``).
+
+    ``obj_root`` must match the pool that produced ``target_j`` — a v8
+    target_j indexes object_processing stems, which differ from the legacy
+    paradex ones (see ``autodex.utils.path.get_obj_root``)."""
+    root = obj_root or obj_path
     fname = f"{target_j:03d}.npy"
-    p = Path(obj_path) / obj / "processed_data" / "info" / "tabletop" / fname
+    p = Path(root) / obj / "processed_data" / "info" / "tabletop" / fname
     if not p.exists():
         # try un-padded fallback
-        p2 = Path(obj_path) / obj / "processed_data" / "info" / "tabletop" / f"{target_j}.npy"
+        p2 = Path(root) / obj / "processed_data" / "info" / "tabletop" / f"{target_j}.npy"
         if p2.exists():
             p = p2
         else:
@@ -319,7 +358,8 @@ def _load_target_tabletop_pose(obj: str, target_j: int) -> np.ndarray:
 
 
 def _load_reset_seeds(hand: str, obj: str, h_cm: int, i_int: int, j_int: int,
-                      T_obj_world: np.ndarray) -> dict | None:
+                      T_obj_world: np.ndarray,
+                      obj_root: str | None = None) -> dict | None:
     """Load reset grasp seeds for cell (i_int, j_int) under reorient_{h_cm}.
 
     Files on disk are in **object frame**; this transforms wrist_se3 to world
@@ -332,8 +372,14 @@ def _load_reset_seeds(hand: str, obj: str, h_cm: int, i_int: int, j_int: int,
     Output dict mirrors ``GraspPlanner.solve_ik``'s candidate-related
     fields plus ``openpose_start`` and ``openpose_target``.
     """
+    # Cell dirs and openpose_*.npy are numbered in the legacy paradex tree
+    # (plan_reset.py generated them off obj_path); i_int/j_int arrive in
+    # obj_root's numbering, so map before touching the filesystem.
+    from autodex.utils.tabletop_map import to_reset_index
+    i_cell = to_reset_index(obj, i_int, obj_root)
+    j_cell = to_reset_index(obj, j_int, obj_root)
     cell_dir = (Path(project_dir) / "candidates" / hand / "reset" / obj
-                / f"reorient_{h_cm}" / f"{i_int}_{j_int}")
+                / f"reorient_{h_cm}" / f"{i_cell}_{j_cell}")
     if not cell_dir.exists():
         return None
     # Order by stats.json priority desc (Laplace-smoothed success rate),
@@ -368,14 +414,14 @@ def _load_reset_seeds(hand: str, obj: str, h_cm: int, i_int: int, j_int: int,
     op_start = []
     op_target = []
     for g in grasp_dirs:
-        op_s_path = g / f"openpose_{i_int:03d}.npy"
-        op_t_path = g / f"openpose_{j_int:03d}.npy"
+        op_s_path = g / f"openpose_{i_cell:03d}.npy"
+        op_t_path = g / f"openpose_{j_cell:03d}.npy"
         op_start.append(np.load(op_s_path) if op_s_path.exists() else None)
         op_target.append(np.load(op_t_path) if op_t_path.exists() else None)
     wrist_world = T_obj_world[None] @ wrist_obj
     scene_info = [{
         "grasp_idx": int(g.name),
-        "cell": f"{i_int}_{j_int}",
+        "cell": f"{i_cell}_{j_cell}",
         "h_cm": h_cm,
         "source": str(g),
     } for g in grasp_dirs]
@@ -637,9 +683,15 @@ def main():
                              "and file {target_j:03d}.npy).")
     parser.add_argument("--auto", action="store_true",
                         help="Skip per-cycle Enter prompt, fully autonomous.")
+    parser.add_argument("--version", type=str, default="v7",
+                        help="Candidate pool whose tabletop indexing target_j "
+                             "refers to. v8 resolves against object_processing, "
+                             "whose stems differ from the legacy paradex tree.")
     parser.add_argument("--viz", action="store_true")
     parser.add_argument("--port_viser", type=int, default=8080)
     args = parser.parse_args()
+
+    asset_root = get_obj_root(args.version)
 
     # Asset sanity.
     mesh_path = MESH_BASE / args.obj / "raw_mesh" / f"{args.obj}.obj"
@@ -650,7 +702,7 @@ def main():
         sys.exit(f"repre.pth missing for {args.obj}")
 
     # Auto-select smallest reorient_{h_cm} folder containing target_j cells.
-    h_cm = _autoselect_h_cm(args.hand, args.obj, args.target_j)
+    h_cm = _autoselect_h_cm(args.hand, args.obj, args.target_j, asset_root)
     if h_cm is None:
         sys.exit(
             f"no reset/reorient_*/ folder with target_j={args.target_j} cells at "
@@ -661,7 +713,8 @@ def main():
           f"(RELEASE_HEIGHT_M={RELEASE_HEIGHT_M:.2f}m, LIFT_HEIGHT_M={LIFT_HEIGHT_M:.2f}m)")
 
     # Target tabletop pose (robot frame, fixed for the whole run).
-    target_tabletop_robot = _load_target_tabletop_pose(args.obj, args.target_j)
+    target_tabletop_robot = _load_target_tabletop_pose(
+        args.obj, args.target_j, asset_root)
     R_target_robot = target_tabletop_robot[:3, :3]
     print(f"[target] target_j={args.target_j} "
           f"(file {args.target_j:03d}.npy or {args.target_j}.npy)")
@@ -682,7 +735,7 @@ def main():
     rcc = remote_camera_controller(client_name, pc_list=PC_LIST)
     print(f"[stream] starting on {len(PC_LIST)} PCs @ {STREAM_FPS} FPS "
           f"(client={client_name})...")
-    rcc.start("stream", False, fps=STREAM_FPS)
+    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
     time.sleep(STREAM_WARMUP_S)
 
     sync_generator = UTGE900(**network_info["signal_generator"]["param"])
@@ -867,7 +920,8 @@ def main():
                 # 2. Tabletop classification (before).
                 c2r = load_c2r(str(cdir))
                 pose_robot_before = np.linalg.inv(c2r) @ pose_world
-                tb_before = classify_tabletop_pose(pose_robot_before, args.obj)
+                tb_before = classify_tabletop_pose(pose_robot_before, args.obj,
+                                                   asset_root)
                 rec["tabletop_before"] = tb_before
                 if not tb_before:
                     rec["progress"]["tabletop_before"] = "no_tabletop_data"
@@ -895,7 +949,7 @@ def main():
                       f"reorient_{h_cm}/{i_int}_{args.target_j}...")
                 seeds = _load_reset_seeds(
                     args.hand, args.obj, h_cm, i_int, args.target_j,
-                    pose_robot_before,
+                    pose_robot_before, asset_root,
                 )
                 if seeds is None:
                     rec["progress"]["plan"] = f"no_cell ({i_int}_{args.target_j})"
@@ -941,7 +995,8 @@ def main():
                 #    reorient → descent) on reset seeds.
                 print(f"[cycle {cycle}] Planning (scene={SCENE})...")
                 t0 = time.time()
-                scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
+                scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj,
+                                                    asset_root)
                 scene_cfg = add_obstacles(scene_cfg, SCENE)
                 _write_json(cdir / "scene_cfg.json", scene_cfg)
 
@@ -1412,7 +1467,7 @@ def main():
                     "AutoDex", "experiment", EXP_NAME,
                     sub, args.obj, trial_ts, "raw",
                 )
-                rcc.start("full", True, video_rel)
+                _rcc_start(rcc, "full", True, video_rel)
                 timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
                 sync_generator.start(fps=VIDEO_FPS)
                 video_started = True
@@ -1449,7 +1504,7 @@ def main():
                         try:
                             _stop_video(rcc, sync_generator, timestamp_monitor)
                             video_started = False
-                            rcc.start("stream", False, fps=STREAM_FPS)
+                            _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
                         except Exception as ce:
                             cleanup_errs.append(f"video_stop_or_stream: {ce!r}")
                     if cleanup_errs:
@@ -1530,7 +1585,7 @@ def main():
                             video_started = False
                         except Exception:
                             pass
-                    rcc.start("stream", False, fps=STREAM_FPS)
+                    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
                     try:
                         fb_log = executor.reset_fallback(result)
                         rec["reset"] = fb_log
@@ -1637,7 +1692,7 @@ def main():
                 rcc.start("image", False, image_rel)
                 rcc.stop()
                 time.sleep(0.5)
-                rcc.start("stream", False, fps=STREAM_FPS)
+                _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
 
                 if POST_DROP_SETTLE_S > 0:
                     time.sleep(POST_DROP_SETTLE_S)
@@ -1665,7 +1720,8 @@ def main():
                     rec["status"] = "ok"
 
                     pose_robot_after = np.linalg.inv(c2r) @ pose_world_after
-                    tb_after = classify_tabletop_pose(pose_robot_after, args.obj)
+                    tb_after = classify_tabletop_pose(pose_robot_after, args.obj,
+                                                      asset_root)
                     rec["tabletop_after"] = tb_after
                     rec["progress"]["tabletop_after"] = (
                         f"idx={tb_after['idx']} ({tb_after['rot_err_deg']:.1f}°)"
@@ -1748,7 +1804,7 @@ def main():
                 try:
                     _stop_video(rcc, sync_generator, timestamp_monitor)
                     video_started = False
-                    rcc.start("stream", False, fps=STREAM_FPS)
+                    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
                 except Exception as ce:
                     cycle_cleanup_errs.append(f"video_cleanup: {ce!r}")
             if cycle_cleanup_errs:

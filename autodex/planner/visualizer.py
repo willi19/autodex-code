@@ -28,6 +28,13 @@ HAND_URDF = {
         os.path.join(_ASSET_ROOT, "inspire_left_description", "xarm_inspire_left.urdf"),
         os.path.join(_ASSET_ROOT, "inspire_description", "inspire_hand_left.urdf"),
     ),
+    # FR3 arm + inspire right hand. Keyed by the PLANNER ROBOT name (not the
+    # hand) because the arm is what changes the full URDF; the floating-hand
+    # URDF is shared with "inspire".
+    "fr3_inspire": (
+        os.path.join(_ASSET_ROOT, "fr3_inspire_description", "fr3_inspire.urdf"),
+        os.path.join(_ASSET_ROOT, "inspire_description", "inspire_hand_right.urdf"),
+    ),
 }
 
 

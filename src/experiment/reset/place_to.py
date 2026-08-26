@@ -81,7 +81,34 @@ INIT_TIMEOUT_S = 120.0
 STREAM_FPS = 30
 STREAM_WARMUP_S = 2.0
 VIDEO_FPS = 30
-CHARUCO_BOARD = "1"
+# Board id lives in src/execution/label.py — one place to swap.
+from src.execution.label import CHARUCO_BOARD  # noqa: E402
+
+
+def _rcc_start(rcc, mode, sync_mode, save_path=None, fps=30):
+    """Start a capture, translating the retired 'stream'/'video' modes.
+
+    paradex's camera API dropped both: a capture arms in 'acquire' and its
+    outputs are toggled as SINKS (set_stream / set_record). The capture PCs
+    reject the old names outright, and the rejection LATCHES an error on every
+    camera that only a daemon-side reload clears -- so a single call from one
+    stale script leaves the next run with no frames at all.
+    """
+    if mode == "stream":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_stream(True)
+    elif mode == "full":
+        # "full" was video AVI + SHM stream at once (snapshot_daemon reads the
+        # stream while the AVI records). Both are just sinks now.
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+        rcc.set_stream(True)
+    elif mode == "video":
+        rcc.arm(syncMode=sync_mode, fps=fps)
+        rcc.set_record(save_path=save_path, on=True)
+    else:                       # 'image' is still a real capture mode
+        rcc.start(mode, sync_mode, save_path, fps=fps)
+
 
 
 def _now() -> str:
@@ -126,7 +153,7 @@ def main():
 
     client_name = f"place_to_{os.getpid()}"
     rcc = remote_camera_controller(client_name, pc_list=PC_LIST)
-    rcc.start("stream", False, fps=STREAM_FPS)
+    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
     time.sleep(STREAM_WARMUP_S)
     sync_generator = UTGE900(**network_info["signal_generator"]["param"])
     timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
@@ -217,14 +244,16 @@ def main():
             # yaw to it for the placement target.
             c2r = load_c2r(str(cdir))
             pose_robot = np.linalg.inv(c2r) @ pose_world
-            tb_before = classify_tabletop_pose(pose_robot, args.obj)
+            tb_before = classify_tabletop_pose(pose_robot, args.obj,
+                                              get_obj_root(GRASP_VERSION))
             scene_id = (str(tb_before["idx"]) if tb_before is not None else None)
             pose_stem = (tb_before["filename"].replace(".npy", "")
                           if tb_before is not None else None)
             rec["tabletop_before"] = tb_before
 
             # 3. Plan — solve_ik on table_only candidates for current pose.
-            scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj)
+            scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, args.obj,
+                                            get_obj_root(GRASP_VERSION))
             scene_cfg = add_obstacles(scene_cfg, SCENE)
             t0 = time.time()
             if planner._motion_gen is not None:
@@ -367,7 +396,7 @@ def main():
             rcc.stop()
             video_rel = os.path.join("AutoDex", "experiment", EXP_NAME,
                                       args.hand, args.obj, trial_ts, "raw")
-            rcc.start("full", True, video_rel)
+            _rcc_start(rcc, "full", True, video_rel)
             timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
             sync_generator.start(fps=VIDEO_FPS)
             executor.start_recording(raw_dir)
@@ -456,7 +485,7 @@ def main():
             except Exception: pass
             try: sync_generator.stop()
             except Exception: pass
-            rcc.start("stream", False, fps=STREAM_FPS)
+            _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
             rec["status"] = "ok"
             print(f"    placed at (r={args.r}, z={args.z}, yaw={args.yaw}°)")
         finally:

@@ -47,6 +47,8 @@ from autodex.utils.path import project_dir, obj_path
 from autodex.perception.init_orchestrator import InitOrchestrator
 
 from src.execution.run_auto import (
+    _rcc_start,
+
     DEFAULT_PC_LIST, ASSETS_BASE, MESH_BASE, CAM_PARAM_ROOT, _load_calib,
 )
 
@@ -144,7 +146,7 @@ def main():
 
     # Stream + orchestrator.
     rcc = remote_camera_controller(f"perception_debug_{os.getpid()}", pc_list=DEFAULT_PC_LIST)
-    rcc.start("stream", False, fps=STREAM_FPS)
+    _rcc_start(rcc, "stream", False, fps=STREAM_FPS)
     time.sleep(STREAM_WARMUP_S)
 
     orch = InitOrchestrator(
