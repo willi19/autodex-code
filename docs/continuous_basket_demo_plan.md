@@ -86,8 +86,16 @@ bring-up fallback if the GoTrack daemons are not available.
 Before turning on the robot, do all of the following.
 
 1. Pick 3–6 objects with `v8` successful grasps for the intended hand and
-   create FoundPose assets plus GoTrack anchor banks for every one. The runner
-   refuses to start if a mesh or `repre.pth` is absent.
+   create FoundPose assets plus GoTrack anchor banks for every one. Run the
+   offline readiness check first; it fails before robot motion when an asset,
+   successful grasp record, or anchor is absent:
+
+   ```bash
+   python src/demo/continuous_basket/preflight.py \
+     --objects banana wood_organizer='wood organizer' beige_brush='beige brush' \
+     --hand inspire --version v8
+   ```
+
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
 2. Place a shallow basket at a comfortable robot-frame center. Set

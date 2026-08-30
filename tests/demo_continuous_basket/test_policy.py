@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -13,6 +16,7 @@ from src.demo.continuous_basket.policy import (
     PoseVerifier,
     Verification,
 )
+from src.demo.continuous_basket.preflight import build_report
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 
 
@@ -77,6 +81,41 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertEqual(intrinsics["serial"]["K"], np.eye(3).tolist())
         self.assertEqual(intrinsics["serial"]["width"], 640)
         self.assertEqual(extrinsics["serial"], np.eye(4).tolist())
+
+    def test_preflight_requires_each_runtime_asset(self):
+        """The offline check has no ParaDex/robot dependency."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obj_root = root / "objects"
+            assets = root / "assets"
+            candidates = root / "candidates"
+            anchors = root / "anchors"
+            obj = "banana"
+            (obj_root / obj / "raw_mesh").mkdir(parents=True)
+            (obj_root / obj / "raw_mesh" / f"{obj}.obj").touch()
+            repre = assets / obj / "object_repre" / "v1" / obj / "1"
+            repre.mkdir(parents=True)
+            (repre / "repre.pth").touch()
+            grasp = candidates / obj / "table" / "0" / "0"
+            grasp.mkdir(parents=True)
+            (grasp / "wrist_se3.npy").touch()
+            (grasp / "result.json").write_text(json.dumps({"success": True}))
+
+            rows = build_report(
+                parse_catalog([obj]), object_root=obj_root, assets_base=assets,
+                candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
+            )
+            self.assertFalse(rows[0].ready)
+            self.assertEqual(rows[0].missing, ["gotrack_anchor_bank"])
+
+            anchors.mkdir()
+            (anchors / f"{obj}.npz").touch()
+            rows = build_report(
+                parse_catalog([obj]), object_root=obj_root, assets_base=assets,
+                candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
+            )
+            self.assertTrue(rows[0].ready)
+            self.assertEqual(rows[0].successful_candidate_count, 1)
 
 if __name__ == "__main__":
     unittest.main()
