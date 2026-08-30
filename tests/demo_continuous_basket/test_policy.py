@@ -36,6 +36,7 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertTrue(decision.retry)
         self.assertEqual(decision.reason, "retry_same_object_in_place")
         self.assertEqual(decision.candidate_order, tuple(keys[1:]))
+        self.assertEqual(policy.remaining_candidates(), tuple(keys[1:]))
 
     def test_uncertain_lift_never_blindly_retries(self):
         policy = LocalRetryPolicy([("table", "0", "0"), ("table", "0", "1")])

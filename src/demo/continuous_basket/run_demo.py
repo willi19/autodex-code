@@ -241,6 +241,10 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
         return None, {"reason": "plan_failed", "planner": result.timing,
                       "tabletop": tabletop_stem, "candidate_order": allowed}, None
 
+    # Keep this key even when the following dry-run fails: it lets the local
+    # retry policy remove the bad candidate before the robot ever moves.
+    selected_key = tuple(result.scene_info)
+
     # Preflight before squeezing: a grasp is only allowed if a raised carry to
     # the basket has a collision-checked trajectory.  This prevents the old
     # failure mode of discovering an unreachable drop only after holding it.
@@ -259,7 +263,8 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
         scene_cfg=scene_cfg, include_obj_obstacle=False,
     )
     if lift_traj is None:
-        return None, {"reason": "lift_plan_failed", "tabletop": tabletop_stem}, None
+        return None, {"reason": "lift_plan_failed", "tabletop": tabletop_stem,
+                      "candidate": selected_key}, None
     lift_end = np.asarray(lift_traj[-1], dtype=np.float32)
     T_wrist_lift = _fk_wrist(planner, lift_end)
     obj_z_lift = float((T_wrist_lift @ T_obj_in_wrist)[2, 3])
@@ -271,7 +276,8 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
     ])
     feasible = np.asarray(planner.ik_pose_batch(carry_candidates)).reshape(-1)
     if not feasible.any():
-        return None, {"reason": "basket_ik_infeasible", "tabletop": tabletop_stem}, None
+        return None, {"reason": "basket_ik_infeasible", "tabletop": tabletop_stem,
+                      "candidate": selected_key}, None
     yaw = float(yaws[np.flatnonzero(feasible)[0]])
     carry_target = _place_wrist(T_obj, T_obj_in_wrist, basket_xyz, yaw, obj_z_lift,
                                  float(T_wrist_lift[2, 3]))
@@ -280,10 +286,11 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
         scene_cfg=scene_cfg, include_obj_obstacle=False,
     )
     if carry_traj is None:
-        return None, {"reason": "carry_plan_failed", "tabletop": tabletop_stem}, None
+        return None, {"reason": "carry_plan_failed", "tabletop": tabletop_stem,
+                      "candidate": selected_key}, None
     return result, {
         "tabletop": tabletop, "tabletop_stem": tabletop_stem,
-        "candidate_order": allowed, "candidate": tuple(result.scene_info),
+        "candidate_order": allowed, "candidate": selected_key,
         "place_yaw_deg": yaw, "scene_cfg": scene_cfg,
     }, {"lift_traj": lift_traj, "carry_traj": carry_traj,
          "object_in_wrist": T_obj_in_wrist, "place_yaw": yaw}
@@ -446,14 +453,17 @@ def main() -> None:
                 continue
 
             attempt = 0
+            drop_retries = 0
             retry: Optional[LocalRetryPolicy] = None
+            reuse_observation = True  # catalogue-stage pose for attempt one
             while True:
                 attempt += 1
                 attempt_dir = run_dir / "init" / f"{cycle:03d}_{attempt:02d}"
                 t0 = cycle_t0 if attempt == 1 else time.perf_counter()
-                if attempt > 1:
+                if not reuse_observation:
                     pose_world, perception = _observe_fast(orch, item, attempt_dir, args,
                                                            c2r, pick_bounds)
+                reuse_observation = False
                 if pose_world is None:
                     _write_trial(run_dir, {"cycle": cycle, "attempt": attempt,
                                             "object": item.name, "status": "perception_failed",
@@ -465,14 +475,20 @@ def main() -> None:
                                                                 before_robot, args.arm)
                     retry = LocalRetryPolicy(order, max_attempts=args.max_retries)
                 result, plan_info, prepared = _plan_attempt(
-                    planner, executor, item, retry.candidate_order if not retry.attempted else
-                    retry.next_after_failure(None, Verification.NOT_HELD).candidate_order,
+                    planner, executor, item, retry.remaining_candidates(),
                     pose_world, c2r, basket_xyz, args,
                 )
                 if result is None:
+                    failed_key = tuple(plan_info["candidate"]) if plan_info.get("candidate") else None
+                    decision = (retry.next_after_failure(failed_key, Verification.NOT_HELD)
+                                if failed_key is not None else None)
                     _write_trial(run_dir, {"cycle": cycle, "attempt": attempt, "object": item.name,
                                             "status": plan_info["reason"], "perception": perception,
-                                            "plan": plan_info})
+                                            "plan": plan_info,
+                                            "retry": decision.__dict__ if decision else None})
+                    if decision is not None and decision.retry:
+                        print(f"  {plan_info['reason']}: trying the next grasp in place")
+                        continue
                     break
                 # First automatic outcome: re-observe after the physical lift.
                 executor.execute(result, planner=planner, scene_cfg=plan_info["scene_cfg"],
@@ -545,6 +561,14 @@ def main() -> None:
                 drop_check = verifier.after_drop(drop_evidence, tuple(basket_xyz[:2]))
                 success = drop_check is Verification.IN_BASKET
                 successes += int(success)
+                recovery_pose = None
+                recovery_timing = None
+                if not success and drop_retries < args.max_retries:
+                    # A dropped object that missed the basket but remains in
+                    # the pick workspace is a normal next pick, not a reason
+                    # to reset home or stop the take.
+                    recovery_pose, recovery_timing = _observe_fast(
+                        orch, item, attempt_dir / "drop_recovery", args, c2r, pick_bounds)
                 _write_trial(run_dir, {"cycle": cycle, "attempt": attempt, "object": item.name,
                                         "status": "success" if success else drop_check.value,
                                         "catalog": selected_match.__dict__,
@@ -552,8 +576,15 @@ def main() -> None:
                                         "perception": perception, "lift_check": lift_timing,
                                         "drop_check": drop_timing, "place": place,
                                         "retreat_ok": retreat_ok,
+                                        "drop_recovery": recovery_timing,
                                         "pipeline_s": time.perf_counter() - t0})
                 print(f"  {'SUCCESS' if success else drop_check.value}: {successes}/{args.max_successes}")
+                if recovery_pose is not None:
+                    drop_retries += 1
+                    pose_world, perception, retry = recovery_pose, recovery_timing, None
+                    reuse_observation = True
+                    print("  dropped object remains in pick workspace: retrying without home reset")
+                    continue
                 break
     finally:
         if recognizer is not None:

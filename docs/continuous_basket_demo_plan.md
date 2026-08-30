@@ -47,12 +47,14 @@ ParaDex snapshot
      (so accumulated basket contents are not treated as the next instance)
      -> quality selection, no silhouette
   -> select successful pose-compatible grasp + preflight lift/carry
+     -> preflight failure: remove that candidate and try the next one in place
   -> execute lift
   -> fast pose re-observation
        -> still on table: remove attempted grasp, replan from measured raised pose
        -> lifted: live carry to basket, drop, retreat up
        -> ambiguous: stop raised for a manual safety check
   -> fast basket re-observation and JSON record
+       -> missed basket but object is back in pick workspace: re-grasp in place
 ```
 
 Three supporting pieces are intentionally independent of hardware:

@@ -37,11 +37,15 @@ class LocalRetryPolicy:
     max_attempts: int = 3
     attempted: List[Tuple[str, str, str]] = field(default_factory=list)
 
+    def remaining_candidates(self) -> Tuple[Tuple[str, str, str], ...]:
+        """Candidates not yet tried by this local retry episode."""
+        return tuple(key for key in self.candidate_order if key not in self.attempted)
+
     def next_after_failure(self, candidate: Optional[Tuple[str, str, str]],
                            verification: Verification) -> RetryDecision:
         if candidate is not None and candidate not in self.attempted:
             self.attempted.append(candidate)
-        remaining = tuple(key for key in self.candidate_order if key not in self.attempted)
+        remaining = self.remaining_candidates()
         if verification is Verification.UNCERTAIN:
             # A lost camera view is not proof the hand is empty.  Keeping the
             # arm in a safe raised pose and asking for intervention is safer
