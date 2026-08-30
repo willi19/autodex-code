@@ -427,14 +427,19 @@ class FrankaExecutor:
     def execute(self, plan_result: PlanResult, planner=None, scene_cfg=None,
                 lift_height: float = 0.10, skip_lift: bool = False,
                 debug_dump_dir: Optional[str] = None,
-                lift_traj_override: Optional[np.ndarray] = None):
+                lift_traj_override: Optional[np.ndarray] = None,
+                start_from_current: bool = False):
         """init -> approach -> pregrasp -> grasp -> squeeze -> lift.
         (mirrors real.py execute). Returns the squeezed hand action or None.
 
         ``debug_dump_dir`` / ``lift_traj_override`` exist so run_auto can drive
         this executor with the same call it makes for the xarm: the override is
         the lift trajectory the viz already planned (so what the user previewed
-        is what runs), and the dump dir goes to plan_pose_constrained."""
+        is what runs), and the dump dir goes to plan_pose_constrained.
+
+        ``start_from_current`` is for a continuous loop whose planner was
+        seeded with measured joints. It skips the legacy return to ``FR3_INIT``
+        so a verified empty-grasp retry stays local to the object."""
         if not plan_result.success:
             print("[franka] plan failed — nothing to execute")
             return None
@@ -444,9 +449,11 @@ class FrankaExecutor:
         pg_hand = self._convert(plan_result.pregrasp_pose)
         g_hand = self._convert(plan_result.grasp_pose)
 
-        # 1. Init: move to FR3_INIT (the trajectory's start). Free-space.
-        self._log("init")
-        self._move_to(self._arm_init, what="execute-init")
+        # 1. Legacy trials start from FR3_INIT. Continuous retries have a
+        # trajectory from the measured state and must not silently undo that.
+        self._log("current_start" if start_from_current else "init")
+        if not start_from_current:
+            self._move_to(self._arm_init, what="execute-init")
 
         # 2. Approach — stream the planned arm path; hand follows the plan's hand
         #    columns. Abort (don't grasp) if the reflex trips en route.

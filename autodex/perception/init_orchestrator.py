@@ -28,6 +28,8 @@ import cv2
 import numpy as np
 import zmq
 
+from autodex.fast_selection import select_best_pose_by_quality
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,6 +214,7 @@ class InitOrchestrator:
                 entry["pose_world"] = np.frombuffer(blob, dtype=np.float64).reshape(4, 4).copy()
                 entry["quality"] = float(item.get("quality", 0.0))
                 entry["inliers"] = int(item.get("inliers", 0))
+                entry["mask_pixels"] = int(item.get("mask_pixels", 0))
             self.pose_buf.put(req, s, entry)
 
         self._mask_thread = _SubThread("init_mask", capture_ips, port_mask,
@@ -243,8 +246,9 @@ class InitOrchestrator:
         image_hw: Tuple[int, int],
         mode: str = "live",
         pc_serials: Optional[Dict[str, List[str]]] = None,
+        load_silhouette: bool = True,
     ) -> None:
-        """Send init to all capture daemons + load mesh/sil optimizer here.
+        """Send init to all capture daemons and optionally load silhouette state.
 
         intrinsics_full : {serial: {K_orig (3x3), K_undist (3x3), dist_params (5,), width, height}}
         extrinsics_full : {serial: 4x4 world->cam}
@@ -308,6 +312,12 @@ class InitOrchestrator:
             with contextlib.redirect_stdout(io.StringIO()):
                 self.cmd.send_command("init", wait=False, cmd_info=info)
             logger.info(f"[orch] init dispatched in {time.perf_counter()-t0:.1f}s")
+
+        # The quality path used by the continuous demo never renders a mesh or
+        # optimises a silhouette, so avoid paying to construct its CUDA state.
+        # Keep the legacy default for existing callers and evaluation scripts.
+        if not load_silhouette:
+            return
 
         # Load silhouette optimizer locally (once per object).
         from autodex.perception.silhouette import SilhouetteOptimizer
@@ -411,12 +421,18 @@ class InitOrchestrator:
         sil_loss_threshold: float = 0.003,
         save_capture_dir: Optional[str] = None,
         sil_debug: bool = False,
+        selection_mode: str = "iou",
     ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-        """IoU + sil refine on already-collected payloads, restricted to subset.
+        """Select/refine already-collected payloads, restricted to a subset.
 
         subset_serials=None → use every serial known to the orchestrator.
+        ``selection_mode='quality'`` chooses the highest FoundPose quality
+        directly and intentionally does no mesh rendering or silhouette
+        refinement.  It is for latency-sensitive live retries; ``'iou'``
+        preserves the previous evaluation-grade behaviour.
         """
-        from autodex.perception.pose_select import select_best_pose_by_iou
+        if selection_mode not in {"iou", "quality"}:
+            raise ValueError("selection_mode must be 'iou' or 'quality'")
 
         if subset_serials is None:
             subset = set(self.intrinsics_undist.keys())
@@ -433,10 +449,30 @@ class InitOrchestrator:
             s: m["mask"] for s, m in masks.items()
             if s in subset and m.get("mask") is not None and m["mask"].any()
         }
-        if not candidates or not masks_bool:
+        if not candidates or (selection_mode == "iou" and not masks_bool):
             return None, {"reason": "no_candidates_or_masks",
                           "n_candidates": len(candidates),
-                          "n_masks": len(masks_bool)}
+                          "n_masks": len(masks_bool),
+                          "selection_mode": selection_mode}
+
+        if selection_mode == "quality":
+            best_serial, best_pose, per_cand = select_best_pose_by_quality(
+                candidates, poses)
+            return best_pose, {
+                "selection_mode": "quality",
+                "sil_skipped": True,
+                "iou_select_s": 0.0,
+                "sil_refine_s": 0.0,
+                "n_candidates": len(candidates),
+                "n_masks": len(masks_bool),
+                "best_serial": best_serial,
+                "best_quality": float(per_cand.get(best_serial, 0.0)),
+                "per_cand": per_cand,
+            }
+
+        from autodex.perception.pose_select import select_best_pose_by_iou
+        if self._sil is None:
+            raise RuntimeError("IoU selection requires init_object(load_silhouette=True)")
 
         t_iou0 = time.perf_counter()
         intr_subset = {s: self.intrinsics_undist[s] for s in masks_bool}
@@ -450,6 +486,16 @@ class InitOrchestrator:
         t_iou = time.perf_counter() - t_iou0
         if best_pose is None:
             return None, {"reason": "iou_select_failed", "per_cand": per_cand}
+
+        if sil_iters <= 0:
+            return np.asarray(best_pose, dtype=np.float64), {
+                "selection_mode": "iou",
+                "sil_skipped": True,
+                "iou_select_s": t_iou, "sil_refine_s": 0.0,
+                "n_candidates": len(candidates), "n_masks": len(masks_bool),
+                "best_serial": best_serial, "best_iou": float(best_iou),
+                "pre_sil_pose": np.asarray(best_pose, dtype=np.float64).tolist(),
+            }
 
         t_sil0 = time.perf_counter()
         views = [
@@ -495,12 +541,17 @@ class InitOrchestrator:
         capture_dir: Optional[str] = None,
         save_capture_dir: Optional[str] = None,
         sil_loss_threshold: float = 0.003,
+        selection_mode: str = "iou",
     ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-        """Trigger one init across all capture PCs and refine on robot.
+        """Trigger one init across all capture PCs and select a pose on robot.
 
         Returns (pose_world, timing_dict). pose_world is None on failure.
+        Pass ``selection_mode='quality'`` for the low-latency path: it selects
+        the best FoundPose view by its quality/inlier metadata and skips both
+        cross-view silhouette rendering and iterative silhouette refinement.
         """
-        from autodex.perception.pose_select import select_best_pose_by_iou
+        if selection_mode not in {"iou", "quality"}:
+            raise ValueError("selection_mode must be 'iou' or 'quality'")
 
         if request_id is None:
             request_id = int(time.time() * 1000) & 0x7fffffff
@@ -587,13 +638,38 @@ class InitOrchestrator:
             s: m["mask"] for s, m in masks.items()
             if m.get("mask") is not None and m["mask"].any()
         }
-        if not candidates or not masks_bool:
+        if not candidates or (selection_mode == "iou" and not masks_bool):
             self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
             return None, {
                 "reason": "no_candidates_or_masks",
                 "n_candidates": len(candidates), "n_masks": len(masks_bool),
                 "dispatch_to_collected_s": t_collected - t_dispatch,
+                "selection_mode": selection_mode,
             }
+
+        if selection_mode == "quality":
+            best_serial, best_pose, per_cand = select_best_pose_by_quality(
+                candidates, poses)
+            timing = {
+                "dispatch_to_collected_s": t_collected - t_dispatch,
+                "first_mask_arrived_s": (first_mask_t - t_dispatch) if first_mask_t else None,
+                "first_pose_arrived_s": (first_pose_t - t_dispatch) if first_pose_t else None,
+                "iou_select_s": 0.0,
+                "sil_refine_s": 0.0,
+                "total_s": time.perf_counter() - t_dispatch,
+                "n_candidates": len(candidates), "n_masks": len(masks_bool),
+                "best_serial": best_serial,
+                "best_quality": float(per_cand.get(best_serial, 0.0)),
+                "per_cand": per_cand,
+                "selection_mode": "quality", "sil_skipped": True,
+            }
+            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
+            return best_pose, timing
+
+        from autodex.perception.pose_select import select_best_pose_by_iou
+        if self._sil is None:
+            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
+            raise RuntimeError("IoU selection requires init_object(load_silhouette=True)")
 
         # Cross-view IoU select.
         t_iou0 = time.perf_counter()
@@ -614,6 +690,21 @@ class InitOrchestrator:
         if best_pose is None:
             self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
             return None, {"reason": "iou_select_failed", "per_cand": per_cand}
+
+        if sil_iters <= 0:
+            timing = {
+                "dispatch_to_collected_s": t_collected - t_dispatch,
+                "first_mask_arrived_s": (first_mask_t - t_dispatch) if first_mask_t else None,
+                "first_pose_arrived_s": (first_pose_t - t_dispatch) if first_pose_t else None,
+                "iou_select_s": t_iou, "sil_refine_s": 0.0,
+                "total_s": time.perf_counter() - t_dispatch,
+                "n_candidates": len(candidates), "n_masks": len(masks_bool),
+                "best_serial": best_serial, "best_iou": float(best_iou),
+                "pre_sil_pose": np.asarray(best_pose, dtype=np.float64).tolist(),
+                "selection_mode": "iou", "sil_skipped": True,
+            }
+            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
+            return np.asarray(best_pose, dtype=np.float64), timing
 
         # Sil refine on robot PC using collected masks.
         t_sil0 = time.perf_counter()

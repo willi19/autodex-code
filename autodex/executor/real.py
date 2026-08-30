@@ -516,7 +516,7 @@ class RealExecutor:
     def execute(self, plan_result: PlanResult, lift_height: float = 0.10,
                 skip_lift: bool = False, planner=None,
                 scene_cfg=None, debug_dump_dir=None,
-                lift_traj_override=None):
+                lift_traj_override=None, start_from_current: bool = False):
         """
         Execute: init -> approach -> pregrasp -> grasp -> squeeze -> lift.
         State timestamps stored in self.state_timestamps.
@@ -530,6 +530,9 @@ class RealExecutor:
         when the caller wants to perform a joint-space lift via the planner
         (avoids ``_move_cartesian`` / ``set_servo_cartesian_aa`` kinematic-
         error spam at extreme wrist orientations).
+
+        ``start_from_current`` preserves the measured raised state for a
+        continuous retry whose planner was seeded with those joints.
         """
         if not plan_result.success:
             print("Planning failed — nothing to execute.")
@@ -543,22 +546,23 @@ class RealExecutor:
 
         sl = self.squeeze_level
 
-        # 1. Return to init pose — full sequential reset, not just joint 0.
-        #    If the previous cycle's reset cut short, joints 1-5 could be off
-        #    too. Order [1, 2, 5, 0, 3, 4] mirrors the reset/clear-view order.
-        self._log_state("init")
-        order = [1, 2, 5, 0, 3, 4]
-        if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
-            order = [2, 1, 5, 0, 3, 4]
-        self._move_joint_sequential(self._xarm_init[:6], order, threshold=0.06)
-        init_err = float(np.linalg.norm(self.arm.get_data()["qpos"]
-                                        - self._xarm_init[:6]))
-        if init_err > 0.1:
-            raise RuntimeError(
-                f"execute(): init step finished with err={init_err:.3f} > 0.1 "
-                f"— arm not at XARM_INIT, refusing to approach. "
-                f"final_qpos={self.arm.get_data()['qpos'].round(3)}"
-            )
+        # 1. Legacy trials return to init first. A continuous retry has a
+        # trajectory from the physical raised state, so returning home here
+        # would discard the local replanning benefit.
+        self._log_state("current_start" if start_from_current else "init")
+        if not start_from_current:
+            order = [1, 2, 5, 0, 3, 4]
+            if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
+                order = [2, 1, 5, 0, 3, 4]
+            self._move_joint_sequential(self._xarm_init[:6], order, threshold=0.06)
+            init_err = float(np.linalg.norm(self.arm.get_data()["qpos"]
+                                            - self._xarm_init[:6]))
+            if init_err > 0.1:
+                raise RuntimeError(
+                    f"execute(): init step finished with err={init_err:.3f} > 0.1 "
+                    f"— arm not at XARM_INIT, refusing to approach. "
+                    f"final_qpos={self.arm.get_data()['qpos'].round(3)}"
+                )
         # Threshold raised 50→70 Nm because inertia spikes (joint 2
         # shoulder ~50-60Nm during free-space motion) were aborting valid
         # approaches.

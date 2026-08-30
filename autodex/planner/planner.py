@@ -222,6 +222,24 @@ class GraspPlanner:
         self._hand = hand
         self._use_cuda_graph = use_cuda_graph
 
+    def set_start_state(self, qpos: np.ndarray) -> None:
+        """Use the robot's measured full configuration for the next plan.
+
+        The historical execution loop always planned from ``_init_state`` and
+        consequently had to reset home after a miss.  A continuous demo needs
+        the opposite: after a raised, empty-handed miss it should re-observe
+        and choose another grasp *from where the arm already is*.  Updating
+        this state does not rebuild cuRobo's world or roadmap.
+        """
+        q = np.asarray(qpos, dtype=np.float32).reshape(-1)
+        if q.shape != self._init_state.shape:
+            raise ValueError(
+                f"start state has {len(q)} joints, expected {len(self._init_state)}"
+            )
+        if not np.isfinite(q).all():
+            raise ValueError("start state contains non-finite joint values")
+        self._init_state = q.copy()
+
     def _snap_arm(self, arm_q: np.ndarray, ref) -> np.ndarray:
         """In-place ±2π snap of the wide-limit arm joints toward ``ref``.
 
