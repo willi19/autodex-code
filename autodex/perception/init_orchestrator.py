@@ -183,13 +183,20 @@ class InitOrchestrator:
         port_pose: int = 5007,
         port_cmd: int = 6893,
         device: str = "cuda:0",
+        command_timeout_ms: int = 60000,
+        command_retries: int = 3,
     ):
         from paradex.io.capture_pc.command_sender import CommandSender
 
         assert len(pc_list) == len(capture_ips)
+        if command_timeout_ms < 1 or command_retries < 1:
+            raise ValueError("command timeout and retries must be positive")
         self.pc_list = pc_list
         self.capture_ips = capture_ips
-        self.cmd = CommandSender(pc_list=pc_list, port=port_cmd)
+        self.cmd = CommandSender(
+            pc_list=pc_list, port=port_cmd, timeout=int(command_timeout_ms),
+            retries=int(command_retries),
+        )
 
         self.mask_buf = _Buffer()
         self.pose_buf = _Buffer()

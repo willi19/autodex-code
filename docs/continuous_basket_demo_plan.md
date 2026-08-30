@@ -81,6 +81,11 @@ checks. This is the path intended to stay below the 20-second inference
 budget. `--verification-mode foundpose` remains an intentionally slower
 bring-up fallback if the GoTrack daemons are not available.
 
+The continuous runner uses a bounded 5-second init-daemon command deadline
+and 3-second GoTrack-daemon command deadline (one attempt each). A missing
+capture PC therefore fails before the robot moves instead of silently spending
+minutes in a transport retry loop; both thresholds remain CLI-configurable.
+
 ## Bring-up checklist
 
 Before turning on the robot, do all of the following.

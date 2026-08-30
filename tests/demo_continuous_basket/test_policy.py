@@ -147,6 +147,8 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertEqual(intrinsics["serial"]["K"], np.eye(3).tolist())
         self.assertEqual(intrinsics["serial"]["width"], 640)
         self.assertEqual(extrinsics["serial"], np.eye(4).tolist())
+        self.assertEqual(session.command_timeout_ms, 3000)
+        self.assertEqual(session.command_retries, 1)
 
     def test_preflight_requires_each_runtime_asset(self):
         """The offline check has no ParaDex/robot dependency."""

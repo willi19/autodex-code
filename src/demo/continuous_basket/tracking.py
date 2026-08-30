@@ -48,7 +48,11 @@ class LiveGoTrackSession:
         port_cmd: int = 6892,
         min_cams_per_frame: int = 6,
         min_inliers: int = 12,
+        command_timeout_ms: int = 3000,
+        command_retries: int = 1,
     ):
+        if command_timeout_ms < 1 or command_retries < 1:
+            raise ValueError("command timeout and retries must be positive")
         self.pc_list = list(pc_list)
         self.capture_ips = list(capture_ips)
         self.intrinsics = intrinsics
@@ -59,6 +63,8 @@ class LiveGoTrackSession:
         self.port_cmd = int(port_cmd)
         self.min_cams_per_frame = int(min_cams_per_frame)
         self.min_inliers = int(min_inliers)
+        self.command_timeout_ms = int(command_timeout_ms)
+        self.command_retries = int(command_retries)
 
         self._cmd = None
         self._tracker = None
@@ -106,7 +112,10 @@ class LiveGoTrackSession:
         from autodex.perception.gotrack_tracker import GoTrackTracker
 
         intrinsics, extrinsics = self._payload_calibration()
-        self._cmd = CommandSender(pc_list=self.pc_list, port=self.port_cmd)
+        self._cmd = CommandSender(
+            pc_list=self.pc_list, port=self.port_cmd,
+            timeout=self.command_timeout_ms, retries=self.command_retries,
+        )
         info = {
             "mesh_path": self._home_relative(Path(mesh_path)),
             "anchor_bank_path": self._home_relative(anchor),

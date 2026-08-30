@@ -372,12 +372,16 @@ def main() -> None:
     p.add_argument("--catalog-min-score", type=float, default=0.25)
     p.add_argument("--catalog-gpu", type=int, default=0)
     p.add_argument("--init-timeout-s", type=float, default=10.0)
+    p.add_argument("--init-command-timeout-s", type=float, default=5.0,
+                   help="per-capture-PC init-daemon command deadline; fail before robot motion")
     p.add_argument("--verification-mode", choices=["gotrack", "foundpose"], default="gotrack",
                    help="gotrack keeps normal cycles under the 20s inference target; foundpose is a daemon-free fallback")
     p.add_argument("--tracking-timeout-s", type=float, default=1.5,
                    help="max wait for a post-action GoTrack pose")
     p.add_argument("--tracking-warmup-s", type=float, default=3.0,
                    help="max wait for first GoTrack pose after a FoundPose init")
+    p.add_argument("--tracking-command-timeout-s", type=float, default=3.0,
+                   help="per-capture-PC GoTrack daemon command deadline")
     p.add_argument("--tracking-anchor-root", default=str(
         Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/MV-GoTrack/anchor_banks"),
                    help="per-object GoTrack .npz anchor-bank directory")
@@ -395,7 +399,8 @@ def main() -> None:
     p.add_argument("--exp-name", default="continuous_basket_demo")
     args = p.parse_args()
     if (args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1
-            or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0):
+            or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0
+            or args.init_command_timeout_s <= 0 or args.tracking_command_timeout_s <= 0):
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
@@ -444,7 +449,11 @@ def main() -> None:
 
     rcc = remote_camera_controller("continuous_basket_demo", pc_list=args.pc_list,
                                    stall_timeout=15.0)
-    orch = InitOrchestrator(pc_list=args.pc_list, capture_ips=pc_ips)
+    orch = InitOrchestrator(
+        pc_list=args.pc_list, capture_ips=pc_ips,
+        command_timeout_ms=round(args.init_command_timeout_s * 1000),
+        command_retries=1,
+    )
     tracking = None
     recognizer = None
     executor = None
@@ -465,6 +474,8 @@ def main() -> None:
                 port_obs=args.port_track_obs, port_prior=args.port_track_prior,
                 port_cmd=args.port_track_cmd, min_cams_per_frame=args.track_min_cams,
                 min_inliers=args.track_min_inliers,
+                command_timeout_ms=round(args.tracking_command_timeout_s * 1000),
+                command_retries=1,
             )
         if args.arm == "franka":
             from src.execution.franka_executor import FrankaExecutor
