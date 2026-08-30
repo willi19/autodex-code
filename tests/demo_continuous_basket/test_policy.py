@@ -22,6 +22,11 @@ from src.demo.continuous_basket.policy import (
 from src.demo.continuous_basket.preflight import build_report, require_ready
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 
+try:
+    from autodex.perception.init_orchestrator import InitOrchestrator
+except ModuleNotFoundError:  # lightweight policy env intentionally has no OpenCV
+    InitOrchestrator = None
+
 
 class CatalogPolicyTest(unittest.TestCase):
     def test_catalog_requires_multi_view_agreement(self):
@@ -70,6 +75,31 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertEqual(serial, "early")
         self.assertTrue(np.array_equal(pose, candidates["early"]))
         self.assertEqual(scores, {"late": 0.6, "early": 0.6})
+
+    @unittest.skipIf(InitOrchestrator is None, "OpenCV/ZeroMQ init environment unavailable")
+    def test_quality_refinement_skips_masks_renderer_and_silhouette(self):
+        """The <20s continuous route stays independent of the IoU stack."""
+        orch = object.__new__(InitOrchestrator)
+        orch.intrinsics_undist = {"best": np.eye(3), "other": np.eye(3)}
+        # A sentinel rather than an optimizer proves this route does not touch
+        # GPU renderer state or call silhouette optimisation.
+        orch._sil = object()
+        best_pose = np.eye(4)
+        best_pose[0, 3] = 0.42
+        pose, timing = orch.refine_from_payloads(
+            masks={},
+            poses={
+                "best": {"ok": True, "pose_world": best_pose,
+                         "quality": 0.9, "inliers": 40, "mask_pixels": 900},
+                "other": {"ok": True, "pose_world": np.eye(4),
+                          "quality": 0.4, "inliers": 80, "mask_pixels": 2},
+            },
+            selection_mode="quality",
+        )
+        self.assertTrue(np.array_equal(pose, best_pose))
+        self.assertTrue(timing["sil_skipped"])
+        self.assertEqual(timing["iou_select_s"], 0.0)
+        self.assertEqual(timing["sil_refine_s"], 0.0)
 
     def test_other_tabletop_success_is_default_varied_pose_fallback(self):
         other = [("table", "1", "2")]
