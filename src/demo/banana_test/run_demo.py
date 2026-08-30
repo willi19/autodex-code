@@ -89,7 +89,7 @@ CAM_PARAM_ROOT = Path.home() / "shared_data/cam_param"
 # Capture the place marker was last triangulated from. Reused by default so a
 # run does not spend an image capture re-finding a marker that has not moved.
 DEFAULT_TARGET_CAPTURE = str(Path.home() /
-                             "shared_data/mingi_erasethis/20260826_183252")
+                             "shared_data/mingi_erasethis/20260826_200751")
 LIFT_HEIGHT = 0.10
 
 
@@ -266,6 +266,22 @@ def _fk_wrist(planner, qpos_full) -> np.ndarray:
     T[:3, :3] = R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
     T[:3, 3] = kin.ee_position[0].detach().cpu().numpy()
     return T
+
+
+def _wrist_now(planner, executor, adof: int, hand_qpos) -> np.ndarray:
+    """Current wrist pose IN THE PLANNER'S FRAME.
+
+    Do NOT use ``arm.get_data()["position"] @ _link6_to_wrist`` to build cuRobo
+    targets: measured on this robot, that frame sits 107.2 mm (and 180 deg) away
+    from cuRobo's ee_link, constant in the wrist's own frame. Feeding a target
+    built from it into plan_pose_constrained shifts the goal by that offset's
+    world-z component -- which swings between +4 mm and -62 mm depending on the
+    wrist's orientation, and is why a 3 cm descend came out as 4.6 cm.
+    """
+    q = np.concatenate([
+        np.asarray(executor.arm.get_data()["qpos"][:adof], dtype=np.float32),
+        np.asarray(hand_qpos, dtype=np.float32)])
+    return _fk_wrist(planner, q)
 
 
 def _stop_with_timeout(name: str, fn, timeout: float = 20.0) -> bool:
@@ -562,6 +578,53 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
     timing["place_yaw_feasible"] = feasible
     print(f"    [pre-flight] place yaw = {place_yaw:+.0f}deg "
           f"({len(feasible)}/{len(yaws)} yaws feasible)")
+    # Dry-run the WHOLE motion before touching the robot. planner.plan() only
+    # IK-checks the lift (`Lift IK check`); the trajectory optimiser is what
+    # returns INVALID_START_STATE_WORLD_COLLISION, and finding that out after
+    # the object is already squeezed leaves the arm stuck holding it with no
+    # plan for anywhere to go. Fail here instead, before the grasp.
+    _t = time.time()
+    grasp_end = np.asarray(result.traj[-1], dtype=np.float32)
+    T_wrist_grasp = _fk_wrist(planner, grasp_end)
+    # FK-derived (not result.wrist_se3) so the lift starts exactly where the
+    # planner thinks the executed trajectory ends.
+    T_oiw = np.linalg.inv(T_wrist_grasp) @ T_obj_grasp
+
+    def _full(q_arm):
+        return np.concatenate([np.asarray(q_arm[:adof], dtype=np.float32),
+                               np.asarray(result.grasp_pose, dtype=np.float32)])
+
+    lift_wrist = T_wrist_grasp.copy()
+    lift_wrist[2, 3] += LIFT_HEIGHT
+    lift_traj = planner.plan_pose_constrained(
+        _full(grasp_end), lift_wrist, hold_vec_weight=[1, 1, 1, 1, 1, 0],
+        scene_cfg=scene_cfg, include_obj_obstacle=False)
+    if lift_traj is None:
+        print(f"    [dry-run] LIFT plan failed — refusing to grasp "
+              f"(the arm would end up holding the object with nowhere to go)")
+        chime.error()
+        return _finish({"dir_idx": dir_idx, "success": False,
+                        "reason": "lift_plan_failed", "tabletop": pose_stem,
+                        "scene_info": result.scene_info})
+
+    lift_end = np.asarray(lift_traj[-1], dtype=np.float32)
+    T_wrist_lift = _fk_wrist(planner, lift_end)
+    obj_z_lift = float((T_wrist_lift @ T_oiw)[2, 3])
+    carry_wrist = _place_wrist(T_obj_grasp, T_oiw, target_xyz, place_yaw,
+                               obj_z_lift, float(T_wrist_lift[2, 3]))
+    carry_traj = planner.plan_pose_constrained(
+        _full(lift_end), carry_wrist, hold_vec_weight=[0, 0, 0, 0, 0, 1],
+        scene_cfg=scene_cfg, include_obj_obstacle=False)
+    if carry_traj is None:
+        print(f"    [dry-run] CARRY plan failed — refusing to grasp")
+        chime.error()
+        return _finish({"dir_idx": dir_idx, "success": False,
+                        "reason": "carry_plan_failed", "tabletop": pose_stem,
+                        "scene_info": result.scene_info})
+    timing["m_dryrun_s"] = round(time.time() - _t, 2)
+    print(f"    [dry-run] lift + carry both plan OK "
+          f"({timing['m_dryrun_s']}s)")
+
     np.save(os.path.join(img_dir, "plan_traj.npy"), np.asarray(result.traj))
     np.save(os.path.join(img_dir, "grasp_wrist_se3.npy"), result.wrist_se3)
 
@@ -587,7 +650,8 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
     t0 = time.time()
     try:
         s_hand = executor.execute(result, planner=planner, scene_cfg=scene_cfg,
-                                  lift_height=LIFT_HEIGHT)
+                                  lift_height=LIFT_HEIGHT,
+                                  lift_traj_override=lift_traj)
     except Exception as e:
         print(f"    execute FAILED: {e!r}")
         for fn, nm in ((rcc.stop, "rcc.stop"),
@@ -604,8 +668,8 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
 
     # ── 5. repose over the marker, then place ────────────────────────────────
     print(f"[5/6] Carry to marker (constant height) + drop {np.round(target_xyz, 3)} + place...")
-    T_wrist_now = executor.arm.get_data()["position"] @ executor._link6_to_wrist
-    T_obj_now = T_wrist_now @ T_obj_in_wrist
+    T_wrist_now = _wrist_now(planner, executor, adof, result.grasp_pose)
+    T_obj_now = T_wrist_now @ T_oiw
     # Constant height: the goal wrist z IS the current wrist z, and
     # plan_pose_constrained holds z along the way. Rotation comes off the
     # PERCEPTION-time orientation so lift drift doesn't accumulate.
@@ -622,6 +686,14 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
         scene_cfg=scene_cfg, include_obj_obstacle=False,
     )
     timing["m_carry_plan_s"] = round(time.time() - t0, 2)
+    if traj_repose is None:
+        # The re-plan starts from the arm's ACTUAL config (tracking error), so
+        # it can fail where the dry run succeeded. The dry-run trajectory is
+        # still collision-checked for this scene -- use it rather than dropping
+        # the object where it stands.
+        print(f"    carry re-plan failed — using the dry-run trajectory")
+        traj_repose = carry_traj
+        timing["carry_source"] = "dryrun"
     if traj_repose is not None:
         _t = time.time()
         executor._move_joints(traj_repose[:, :adof],
@@ -634,25 +706,28 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
         print(f"    repose plan FAILED — placing where the object is")
 
     # The object is carried at the lift height and let go ``--drop_h`` below it
-    # -- NOT lowered back onto the table the way run_auto's place does. Both
-    # executors descend ``lift_height`` from where the wrist is (franka needs
-    # use_current_wrist for that; the xarm's place already works off the lift
-    # pose) and stop early on contact.
-    place_kwargs = {"use_current_wrist": True} if args.arm == "franka" else {}
-    z_carry = float((executor.arm.get_data()["position"]
-                     @ executor._link6_to_wrist)[2, 3])
-    # place() derives its descend target from the MEASURED wrist z while the
-    # planner works in cuRobo FK; log both so a z offset is visible instead of
-    # showing up as an unexplained overshoot in place_info["descended"].
+    # -- NOT lowered back onto the table the way run_auto's place does. The
+    # target is built here from cuRobo FK and handed over explicitly;
+    # use_current_wrist would have place() rebuild it from the measured frame,
+    # which is the 107mm-offset one (see _wrist_now).
+    T_place = _wrist_now(planner, executor, adof, result.grasp_pose)
+    z_carry = float(T_place[2, 3])
+    T_place[2, 3] -= args.drop_h
+    place_kwargs = {"grasp_wrist": T_place} if args.arm == "franka" else {}
+    # Record both frames: the gap is the constant 107mm ee_link offset seen
+    # through the current wrist orientation, and place_info["descended"] is
+    # measured in the OTHER frame, so it will not equal --drop_h.
     try:
         _q_now = np.concatenate([
             np.asarray(executor.arm.get_data()["qpos"][:adof], dtype=np.float32),
             np.asarray(s_hand, dtype=np.float32)])
         _z_fk = float(_fk_wrist(planner, _q_now)[2, 3])
-        timing["z_wrist_measured"] = round(z_carry, 4)
+        _z_meas = float((executor.arm.get_data()["position"]
+                         @ executor._link6_to_wrist)[2, 3])
+        timing["z_wrist_measured"] = round(_z_meas, 4)
         timing["z_wrist_fk"] = round(_z_fk, 4)
-        print(f"    wrist z: measured={z_carry:.4f}  curobo_fk={_z_fk:.4f}  "
-              f"delta={_z_fk - z_carry:+.4f}")
+        print(f"    wrist z: measured={_z_meas:.4f}  curobo_fk={_z_fk:.4f}  "
+              f"delta={_z_fk - _z_meas:+.4f}")
     except Exception as _fe:
         print(f"    [fk check] {_fe!r}")
     _t = time.time()
@@ -664,25 +739,19 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
     if args.arm != "franka":
         _safe("release", executor.release, result)
 
-    # place()'s release ramps squeeze -> grasp -> PREGRASP and stops there
-    # (that is the last config the grasp plan guarantees collision-free), so the
-    # fingers are still half-closed around the object. run_auto gets away with
-    # it because reset() opens them along the retract; for this demo the hand
-    # has to leave the object alone BEFORE it lifts off, so open it fully here.
-    if args.arm == "franka":
-        try:
-            executor._ramp_hand(executor._convert(executor._hand_init))
-            executor._last_hand_qpos = executor._hand_init.copy()
-            print(f"    hand opened to init")
-        except Exception as _he:
-            print(f"    [hand open] {_he!r}")
-
-    # Straight back up to the carry height before anything else moves: the hand
-    # is open right next to the object it just put down, so retracting from
-    # here (reset() plans a joint-space path home) would sweep through it.
+    # Straight up and OUT before anything else moves. Retracting from where
+    # place() left the wrist (reset() plans a joint-space path home) sweeps the
+    # hand through the object and the setup around it -- that is what pushed the
+    # rig off the table on the very first trial. Climb --retreat_h from HERE,
+    # and hold the fingers where release left them: opening them at this height
+    # extends them downward and scrapes the table.
     _t = time.time()
-    T_up = (executor.arm.get_data()["position"] @ executor._link6_to_wrist).copy()
-    T_up[2, 3] = z_carry
+    T_up = _wrist_now(planner, executor, adof,
+                      getattr(executor, "_last_hand_qpos", result.pregrasp_pose)).copy()
+    z_up = float(T_up[2, 3]) + args.retreat_h
+    T_up[2, 3] = z_up
+    # Hold the shape place()'s release left the fingers in (PREGRASP) all the
+    # way up -- do NOT open them further next to the object.
     hand_now = np.asarray(getattr(executor, "_last_hand_qpos", result.pregrasp_pose),
                           dtype=np.float32)                       # RADIANS (planner units)
     up_traj = planner.plan_pose_constrained(
@@ -700,7 +769,8 @@ def run_trial(args, *, orch, planner, executor, rcc, sync_generator,
         executor._move_joints(up_traj[:, :adof],
                               np.tile(hand_cmd, (len(up_traj), 1)))
         timing["retreat_up"] = "ok"
-        print(f"    retreat up to carry height ({z_carry:.3f}) OK")
+        print(f"    retreat up {args.retreat_h*100:.0f}cm "
+              f"({T_wrist_now[2, 3]:.3f} -> {z_up:.3f}) OK")
     else:
         timing["retreat_up"] = "plan_failed"
         print(f"    retreat-up plan FAILED — reset() will handle it")
@@ -912,6 +982,9 @@ def main():
                    help="force this world-z yaw for the drop (default: pick "
                         "the IK-feasible yaw closest to as-picked -- the demo "
                         "does not care how the object lands)")
+    p.add_argument("--retreat_h", type=float, default=0.15,
+                   help="how far straight up the wrist climbs after releasing, "
+                        "before the retract home (m)")
     p.add_argument("--drop_h", type=float, default=0.03,
                    help="descend this far below the carry height before "
                         "releasing (m); the object is never lowered back to "
