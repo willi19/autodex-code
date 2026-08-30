@@ -80,6 +80,7 @@ from src.demo.continuous_basket.catalog import (
     parse_catalog,
     read_capture_images,
 )
+from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.policy import (
     LocalRetryPolicy,
     PoseEvidence,
@@ -115,19 +116,6 @@ def _planner_full_qpos(planner: GraspPlanner, executor, fallback_hand: np.ndarra
             f"robot state shape {len(full)} does not match planner ({len(planner._init_state)})"
         )
     return full
-
-
-def _capture_catalog_snapshot(rcc, destination: Path, stream_fps: int) -> None:
-    """Take a short ParaDex image snapshot, then resume the live init stream."""
-    destination.mkdir(parents=True, exist_ok=True)
-    rel = os.path.relpath(destination, Path.home())
-    rcc.stop()
-    rcc.start("image", False, rel)
-    rcc.stop()
-    # The capture sink writes on the remote PCs.  A tiny settle window is
-    # cheaper than making YOLO-E race a partially visible NFS directory.
-    time.sleep(0.35)
-    _rcc_start(rcc, "stream", False, fps=stream_fps)
 
 
 def _object_paths(item: CatalogObject, grasp_version: str) -> tuple[Path, Path]:
@@ -493,7 +481,10 @@ def main() -> None:
                 tracking.stop()
             cycle_t0 = time.perf_counter()
             snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
-            _capture_catalog_snapshot(rcc, snapshot_dir, args.stream_fps)
+            n_images = capture_catalog_snapshot(
+                rcc, snapshot_dir, min_images=args.catalog_min_views,
+            )
+            print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
             images = read_capture_images(snapshot_dir)
             match, alternatives = recognizer.identify(
                 images, catalogue, min_views=args.catalog_min_views,

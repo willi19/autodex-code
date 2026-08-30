@@ -12,6 +12,7 @@ from src.demo.continuous_basket.catalog import (
     parse_catalog,
     rank_catalog_detections,
 )
+from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.policy import (
     LocalRetryPolicy,
     PoseEvidence,
@@ -41,6 +42,29 @@ class CatalogPolicyTest(unittest.TestCase):
         )
         self.assertEqual([m.name for m in ranked], ["banana"])
         self.assertEqual(ranked[0].supporting_views, 2)
+
+    def test_catalog_snapshot_keeps_live_stream_running(self):
+        """Latest ParaDex uses its one-shot sink instead of a session restart."""
+        class SnapshotOnlyRcc:
+            def __init__(self):
+                self.calls = []
+
+            def snapshot(self, rel, count=1):
+                self.calls.append((rel, count))
+                image_dir = (Path.home() / rel / "images").resolve()
+                image_dir.mkdir(parents=True, exist_ok=True)
+                for idx in range(2):
+                    (image_dir / f"camera{idx}.png").touch()
+                return {"capture1": {"status": "ok"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rcc = SnapshotOnlyRcc()
+            count = capture_catalog_snapshot(
+                rcc, Path(tmp) / "snapshot", min_images=2, settle_timeout_s=0.2,
+            )
+        self.assertEqual(count, 2)
+        self.assertEqual(len(rcc.calls), 1)
+        self.assertEqual(rcc.calls[0][1], 1)
 
     def test_retry_removes_failed_candidate_without_reset(self):
         keys = [("table", "0", "0"), ("table", "0", "1"), ("table", "0", "2")]

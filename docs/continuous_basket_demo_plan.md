@@ -25,7 +25,7 @@ script, but it is a poor continuous-demo loop:
 | Human y/n/c label prompt | Breaks the uncut take and makes retry policy manual | Lift and drop are re-observed automatically in robot coordinates. |
 | Candidate failure ends a trial; final retract uses reset/home paths | A miss unnecessarily returns to the initial configuration | Measured current joints become the planner start state; the failed candidate is removed and the next one is planned over the object still on the table. |
 | Fixed table-marker target | Does not express an actual container | Explicit robot-frame basket release reference, approached from above at the lifted height. |
-| A new video sink per trial | Produces cut artifacts, not a single take | Use an external continuous video for the first take. ParaDex snapshots are only internal perception artifacts. |
+| Stop/restart the camera session for every catalogue image | Adds daemon handshakes and can interrupt the live stream | Keep ParaDex acquisition/stream alive; use its one-shot `snapshot` sink only for internal catalogue images, and record the uncut take externally. |
 
 The current distributed notes are the relevant performance baseline:
 
@@ -41,7 +41,7 @@ The current distributed notes are the relevant performance baseline:
 `src/demo/continuous_basket/run_demo.py` now implements this loop:
 
 ```text
-ParaDex snapshot
+ParaDex live snapshot (stream remains armed)
   -> YOLO-E catalogue agreement (>= 2 views)
   -> selected class only: distributed FoundPose constrained to the pick workspace
      (so accumulated basket contents are not treated as the next instance)
