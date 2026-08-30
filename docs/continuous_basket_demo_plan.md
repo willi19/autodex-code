@@ -119,11 +119,17 @@ Before turning on the robot, do all of the following.
 Example command (replace the calibrated basket coordinates):
 
 ```bash
-python src/demo/continuous_basket/run_demo.py \
+/home/robot/anaconda3/envs/planner/bin/python src/demo/continuous_basket/run_demo.py \
   --objects banana=banana wood_organizer='wood organizer' beige_brush='beige brush' \
   --arm franka --hand inspire --grasp-version v8 \
   --basket-center 0.52 -0.23 0.20 --max-successes 12
 ```
+
+The runner finds ParaDex from `AUTODEX_PARADEX_ROOT` when set, otherwise from
+the standard `~/paradex` checkout. The shown planner environment is required
+because it contains cuRobo as well as the vision dependencies. Verify that
+`torch.cuda.is_available()` is true there before starting camera or robot
+processes.
 
 ## Next implementation gates
 

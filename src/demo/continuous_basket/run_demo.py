@@ -32,7 +32,19 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT))
+# The deployment commonly keeps the latest ParaDex checkout beside AutoDex
+# rather than installing it into every specialised CUDA environment. Prefer an
+# explicit task-scoped override, then that standard checkout; leave normal
+# installed-package resolution untouched when neither exists.
+for _paradex_root in (
+    os.environ.get("AUTODEX_PARADEX_ROOT"),
+    str(Path.home() / "paradex"),
+):
+    if _paradex_root and (Path(_paradex_root).expanduser() / "paradex").is_dir():
+        sys.path.insert(0, str(Path(_paradex_root).expanduser()))
+        break
 
 from paradex.calibration.utils import load_c2r, save_current_C2R, save_current_camparam
 from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
