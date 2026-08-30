@@ -48,12 +48,13 @@ ParaDex snapshot
      -> quality selection, no silhouette
   -> select successful pose-compatible grasp + preflight lift/carry
      -> preflight failure: remove that candidate and try the next one in place
+  -> start GoTrack from the initial FoundPose pose (once)
   -> execute lift
-  -> fast pose re-observation
+  -> fresh GoTrack pose
        -> still on table: remove attempted grasp, replan from measured raised pose
        -> lifted: live carry to basket, drop, retreat up
        -> ambiguous: stop raised for a manual safety check
-  -> fast basket re-observation and JSON record
+  -> fresh GoTrack basket pose and JSON record
        -> missed basket but object is back in pick workspace: re-grasp in place
 ```
 
@@ -74,6 +75,12 @@ Three supporting pieces are intentionally independent of hardware:
 silhouette refinement); the new `quality` mode is opt-in and explicitly logs
 `sil_skipped: true`. Existing experiments are therefore unchanged.
 
+The runner defaults to `--verification-mode gotrack`: normal cycles use one
+FoundPose initialization plus low-latency GoTrack poses for lift/drop/retry
+checks. This is the path intended to stay below the 20-second inference
+budget. `--verification-mode foundpose` remains an intentionally slower
+bring-up fallback if the GoTrack daemons are not available.
+
 ## Bring-up checklist
 
 Before turning on the robot, do all of the following.
@@ -81,6 +88,8 @@ Before turning on the robot, do all of the following.
 1. Pick 3–6 objects with `v8` successful grasps for the intended hand and
    create FoundPose assets plus GoTrack anchor banks for every one. The runner
    refuses to start if a mesh or `repre.pth` is absent.
+   Start `gotrack_daemon.py` on every capture PC before the default run; the
+   runner configures it dynamically per selected catalogue object.
 2. Place a shallow basket at a comfortable robot-frame center. Set
    `--basket-center X Y Z` to the release reference above its open interior;
    start conservatively with `--drop-height 0.05` and a clear vertical path.

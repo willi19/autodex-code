@@ -13,6 +13,7 @@ from src.demo.continuous_basket.policy import (
     PoseVerifier,
     Verification,
 )
+from src.demo.continuous_basket.tracking import LiveGoTrackSession
 
 
 class CatalogPolicyTest(unittest.TestCase):
@@ -62,6 +63,20 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertEqual(serial, "early")
         self.assertTrue(np.array_equal(pose, candidates["early"]))
         self.assertEqual(scores, {"late": 0.6, "early": 0.6})
+
+    def test_tracking_payload_keeps_undistorted_calibration(self):
+        session = LiveGoTrackSession(
+            pc_list=["capture1"], capture_ips=["10.0.0.1"],
+            intrinsics={"serial": {
+                "K_undist": np.eye(3), "K_orig": np.eye(3) * 2,
+                "dist_params": np.zeros(5), "width": 640, "height": 480,
+            }},
+            extrinsics={"serial": np.eye(4)}, anchor_root="/tmp/anchors",
+        )
+        intrinsics, extrinsics = session._payload_calibration()
+        self.assertEqual(intrinsics["serial"]["K"], np.eye(3).tolist())
+        self.assertEqual(intrinsics["serial"]["width"], 640)
+        self.assertEqual(extrinsics["serial"], np.eye(4).tolist())
 
 if __name__ == "__main__":
     unittest.main()

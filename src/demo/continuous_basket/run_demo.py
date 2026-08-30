@@ -75,6 +75,7 @@ from src.demo.continuous_basket.policy import (
     PoseVerifier,
     Verification,
 )
+from src.demo.continuous_basket.tracking import LiveGoTrackSession
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
 
@@ -319,6 +320,20 @@ def _write_trial(run_dir: Path, record: dict) -> None:
     (out / "result.json").write_text(json.dumps(_jsonable(record), indent=2))
 
 
+def _pose_in_bounds(pose_world: np.ndarray, c2r: np.ndarray, bounds: np.ndarray) -> bool:
+    lo, hi = np.asarray(bounds, dtype=float).reshape(2, 3)
+    xyz = (np.linalg.inv(c2r) @ np.asarray(pose_world, dtype=float))[:3, 3]
+    return bool(np.all(xyz >= lo) and np.all(xyz <= hi))
+
+
+def _track_timing(sample, *, source: str = "gotrack") -> dict:
+    if sample is None:
+        return {"source": source, "ok": False}
+    return {"source": source, "ok": True, "frame_id": sample.frame_id,
+            "n_inliers": sample.n_inliers,
+            "mean_residual_mm": sample.mean_residual_mm}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--objects", nargs="+", required=True,
@@ -345,6 +360,20 @@ def main() -> None:
     p.add_argument("--catalog-min-score", type=float, default=0.25)
     p.add_argument("--catalog-gpu", type=int, default=0)
     p.add_argument("--init-timeout-s", type=float, default=10.0)
+    p.add_argument("--verification-mode", choices=["gotrack", "foundpose"], default="gotrack",
+                   help="gotrack keeps normal cycles under the 20s inference target; foundpose is a daemon-free fallback")
+    p.add_argument("--tracking-timeout-s", type=float, default=1.5,
+                   help="max wait for a post-action GoTrack pose")
+    p.add_argument("--tracking-warmup-s", type=float, default=3.0,
+                   help="max wait for first GoTrack pose after a FoundPose init")
+    p.add_argument("--tracking-anchor-root", default=str(
+        Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/MV-GoTrack/anchor_banks"),
+                   help="per-object GoTrack .npz anchor-bank directory")
+    p.add_argument("--port-track-obs", type=int, default=1235)
+    p.add_argument("--port-track-prior", type=int, default=1236)
+    p.add_argument("--port-track-cmd", type=int, default=6892)
+    p.add_argument("--track-min-cams", type=int, default=6)
+    p.add_argument("--track-min-inliers", type=int, default=12)
     p.add_argument("--object-switch-settle-s", type=float, default=1.0)
     p.add_argument("--stream-fps", type=int, default=10)
     p.add_argument("--yaw-step", type=int, default=30)
@@ -353,8 +382,9 @@ def main() -> None:
     p.add_argument("--retreat-height", type=float, default=0.15)
     p.add_argument("--exp-name", default="continuous_basket_demo")
     args = p.parse_args()
-    if args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1:
-        p.error("max-successes, max-retries and yaw-step must be positive")
+    if (args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1
+            or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0):
+        p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
     basket_xyz = np.asarray(args.basket_center, dtype=np.float64)
@@ -390,6 +420,7 @@ def main() -> None:
     rcc = remote_camera_controller("continuous_basket_demo", pc_list=args.pc_list,
                                    stall_timeout=15.0)
     orch = InitOrchestrator(pc_list=args.pc_list, capture_ips=pc_ips)
+    tracking = None
     recognizer = None
     executor = None
     successes = 0
@@ -401,6 +432,15 @@ def main() -> None:
         _warn_if_not_streaming(rcc)
         recognizer = CatalogRecognizer(gpu=args.catalog_gpu, conf_threshold=args.catalog_min_score)
         planner = GraspPlanner(hand=_planner_robot(args.arm, args.hand))
+        if args.verification_mode == "gotrack":
+            tracking = LiveGoTrackSession(
+                pc_list=args.pc_list, capture_ips=pc_ips,
+                intrinsics=intrinsics, extrinsics=extrinsics,
+                anchor_root=Path(args.tracking_anchor_root).expanduser(),
+                port_obs=args.port_track_obs, port_prior=args.port_track_prior,
+                port_cmd=args.port_track_cmd, min_cams_per_frame=args.track_min_cams,
+                min_inliers=args.track_min_inliers,
+            )
         if args.arm == "franka":
             from src.execution.franka_executor import FrankaExecutor
             executor = FrankaExecutor(hand_name=args.hand)
@@ -412,6 +452,8 @@ def main() -> None:
         for cycle in range(1, args.max_cycles + 1):
             if successes >= args.max_successes:
                 break
+            if tracking is not None:
+                tracking.stop()
             cycle_t0 = time.perf_counter()
             snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
             _capture_catalog_snapshot(rcc, snapshot_dir, args.stream_fps)
@@ -452,6 +494,22 @@ def main() -> None:
                                         "catalog": [x.__dict__ for x in alternatives]})
                 continue
 
+            if tracking is not None:
+                mesh_path, _assets = _object_paths(item, args.grasp_version)
+                tracking.start(obj_name=item.name, mesh_path=mesh_path,
+                               init_pose_world=pose_world,
+                               settle_s=args.object_switch_settle_s)
+                warm = tracking.wait_for_pose(timeout_s=args.tracking_warmup_s)
+                if warm is None:
+                    err = tracking.worker_error or "no reliable pose from GoTrack daemons"
+                    tracking.stop()
+                    raise RuntimeError(
+                        f"GoTrack warmup failed before robot motion: {err}. "
+                        "Use --verification-mode foundpose only for the slower fallback."
+                    )
+                pose_world = warm.pose_world
+                perception = {**perception, "tracking_warmup": _track_timing(warm)}
+
             attempt = 0
             drop_retries = 0
             retry: Optional[LocalRetryPolicy] = None
@@ -488,15 +546,25 @@ def main() -> None:
                                             "retry": decision.__dict__ if decision else None})
                     if decision is not None and decision.retry:
                         print(f"  {plan_info['reason']}: trying the next grasp in place")
+                        reuse_observation = True
                         continue
                     break
                 # First automatic outcome: re-observe after the physical lift.
+                lift_started = time.time()
                 executor.execute(result, planner=planner, scene_cfg=plan_info["scene_cfg"],
                                  lift_height=args.lift_height,
                                  lift_traj_override=prepared["lift_traj"],
                                  start_from_current=True)
-                lift_pose, lift_timing = _observe_fast(
-                    orch, item, attempt_dir / "lift_check", args, c2r, pick_bounds)
+                if tracking is not None:
+                    lift_sample = tracking.wait_for_pose(
+                        since_wall_time=lift_started, timeout_s=args.tracking_timeout_s)
+                    lift_pose, lift_timing = (
+                        (lift_sample.pose_world, _track_timing(lift_sample))
+                        if lift_sample is not None else (None, _track_timing(None))
+                    )
+                else:
+                    lift_pose, lift_timing = _observe_fast(
+                        orch, item, attempt_dir / "lift_check", args, c2r, pick_bounds)
                 after_lift = PoseEvidence(
                     tuple((np.linalg.inv(c2r) @ lift_pose)[:3, 3]) if lift_pose is not None else None,
                     float(lift_timing.get("best_quality", 0.0)),
@@ -518,6 +586,8 @@ def main() -> None:
                     _write_trial(run_dir, record)
                     if decision.retry:
                         print(f"  grasp miss: retrying on the observed object, without home reset")
+                        pose_world, perception = lift_pose, lift_timing
+                        reuse_observation = True
                         continue
                     if lift_check is Verification.UNCERTAIN:
                         raise RuntimeError(
@@ -548,12 +618,21 @@ def main() -> None:
                 place_kwargs = {"grasp_wrist": place_wrist} if args.arm == "franka" else {}
                 place = executor.place(result, planner=planner, scene_cfg=plan_info["scene_cfg"],
                                        lift_height=args.drop_height, **place_kwargs)
+                released_at = time.time()
                 if args.arm != "franka":
                     executor.release(result)
                 hand_after = np.asarray(getattr(executor, "_last_hand_qpos", result.pregrasp_pose), dtype=np.float32)
                 retreat_ok = _retreat_up(planner, executor, hand_after, plan_info["scene_cfg"], args.retreat_height)
-                dropped_pose, drop_timing = _observe_fast(
-                    orch, item, attempt_dir / "drop_check", args, c2r, basket_bounds)
+                if tracking is not None:
+                    drop_sample = tracking.wait_for_pose(
+                        since_wall_time=released_at, timeout_s=args.tracking_timeout_s)
+                    dropped_pose, drop_timing = (
+                        (drop_sample.pose_world, _track_timing(drop_sample))
+                        if drop_sample is not None else (None, _track_timing(None))
+                    )
+                else:
+                    dropped_pose, drop_timing = _observe_fast(
+                        orch, item, attempt_dir / "drop_check", args, c2r, basket_bounds)
                 drop_evidence = PoseEvidence(
                     tuple((np.linalg.inv(c2r) @ dropped_pose)[:3, 3]) if dropped_pose is not None else None,
                     float(drop_timing.get("best_quality", 0.0)),
@@ -567,8 +646,12 @@ def main() -> None:
                     # A dropped object that missed the basket but remains in
                     # the pick workspace is a normal next pick, not a reason
                     # to reset home or stop the take.
-                    recovery_pose, recovery_timing = _observe_fast(
-                        orch, item, attempt_dir / "drop_recovery", args, c2r, pick_bounds)
+                    if tracking is not None:
+                        if dropped_pose is not None and _pose_in_bounds(dropped_pose, c2r, pick_bounds):
+                            recovery_pose, recovery_timing = dropped_pose, drop_timing
+                    else:
+                        recovery_pose, recovery_timing = _observe_fast(
+                            orch, item, attempt_dir / "drop_recovery", args, c2r, pick_bounds)
                 _write_trial(run_dir, {"cycle": cycle, "attempt": attempt, "object": item.name,
                                         "status": "success" if success else drop_check.value,
                                         "catalog": selected_match.__dict__,
@@ -587,6 +670,8 @@ def main() -> None:
                     continue
                 break
     finally:
+        if tracking is not None:
+            tracking.close()
         if recognizer is not None:
             recognizer.close()
         if executor is not None:

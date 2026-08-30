@@ -54,6 +54,28 @@ def _bytes_to_np(buf: bytes, shape: List[int], dtype: str) -> Optional[np.ndarra
     return arr.reshape(shape) if arr.size else None
 
 
+def _parse_multipart(parts: List[bytes]) -> Tuple[Optional[Any], List[bytes]]:
+    """Decode current ParaDex envelopes with a legacy JSON fallback.
+
+    ``DataPublisher`` migrated from ``[topic, json, *blobs]`` to a msgpack
+    envelope.  The init orchestrator already supports both forms; keeping the
+    tracker JSON-only silently discards every anchor observation on current
+    capture PCs and makes a seemingly healthy GoTrack session time out.
+    """
+    try:
+        from paradex.io.capture_pc.envelope import decode
+        msg = decode(parts)
+        return msg.meta, list(msg.bufs)
+    except Exception:
+        pass
+    if len(parts) < 2:
+        return None, []
+    try:
+        return json.loads(parts[1].decode("utf-8")), list(parts[2:])
+    except Exception:
+        return None, []
+
+
 def _unpack_payload(meta_item: Dict[str, Any], parts: List[bytes]) -> Dict[str, Any]:
     """Reconstruct numpy arrays for one cam from a multipart message."""
     out: Dict[str, Any] = {
@@ -229,15 +251,18 @@ class GoTrackTracker:
                     parts = sock.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
                     continue
-                if len(parts) < 2:
+                meta, bin_parts = _parse_multipart(parts)
+                if meta is None:
                     continue
-                try:
-                    msg = json.loads(parts[1].decode("utf-8"))
-                except Exception:
+                if isinstance(meta, list):
+                    items = meta
+                elif isinstance(meta, dict) and "items" in meta:
+                    items = meta["items"]
+                elif isinstance(meta, dict):
+                    items = [meta]
+                else:
                     continue
-                # Binary parts begin at parts[2:].
-                bin_parts = parts[2:]
-                for item in msg.get("items", []):
+                for item in items:
                     if item.get("type") != "gotrack_obs":
                         continue
                     payload = _unpack_payload(item, bin_parts)
