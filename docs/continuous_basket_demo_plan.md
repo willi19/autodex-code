@@ -20,7 +20,7 @@ script, but it is a poor continuous-demo loop:
 
 | Current behavior | Why it is costly for this demo | Replacement |
 | --- | --- | --- |
-| One hard-coded `--obj` and object-specific FoundPose init | Cannot choose among a fixed set of objects | YOLO-E catalogue scan selects one object before FoundPose is run. |
+| One hard-coded `--obj` and object-specific FoundPose init | Cannot choose among a fixed set of objects | One multi-text YOLO-E catalogue scan selects one object before FoundPose is run. |
 | Per trial SAM3 + FoundPose + cross-view IoU + 100-iteration silhouette refine | The distributed-path notes measure the old full path at about 10 s after FoundPose init; silhouette refine alone is about 4.6 s | `selection_mode=quality` chooses the strongest FoundPose view and performs neither rendered IoU nor silhouette optimization. |
 | Human y/n/c label prompt | Breaks the uncut take and makes retry policy manual | Lift and drop are re-observed automatically in robot coordinates. |
 | Candidate failure ends a trial; final retract uses reset/home paths | A miss unnecessarily returns to the initial configuration | Measured current joints become the planner start state; the failed candidate is removed and the next one is planned over the object still on the table. |
@@ -60,8 +60,9 @@ ParaDex live snapshot (stream remains armed)
 
 Three supporting pieces are intentionally independent of hardware:
 
-- `catalog.py` collects cross-view YOLO-E evidence and prevents a
-  single-camera false detection from selecting a mesh.
+- `catalog.py` evaluates every fixed catalogue prompt in one YOLO-E
+  multi-class image batch, then collects cross-view evidence so a
+  single-camera false detection cannot select a mesh.
 - `policy.py` only retries after positive evidence that the object is still at
   the original table location. It never retries on an ambiguous held-object
   observation.

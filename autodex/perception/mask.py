@@ -9,7 +9,7 @@ Each class loads the model once in __init__ and exposes:
 import gc
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -38,6 +38,39 @@ def _all_masks_from_yoloe(result, h: int, w: int) -> Optional[List]:
         out.append((mask_u8, float(confs[i])))
     out.sort(key=lambda x: x[1], reverse=True)
     return out if out else None
+
+
+def _masks_by_class_from_yoloe(
+    result, h: int, w: int, prompts: Sequence[str],
+) -> Dict[str, Optional[List]]:
+    """Split one multi-text-prompt YOLO-E result by predicted class index.
+
+    Ultralytics keeps masks and boxes aligned by detection index; ``boxes.cls``
+    is the index in the prompt list passed to ``set_classes``.  Retaining that
+    mapping lets a fixed AutoDex catalogue use one GPU inference per camera
+    batch instead of one inference per object prompt.
+    """
+    grouped: Dict[str, List] = {prompt: [] for prompt in prompts}
+    if result.masks is None or not len(result.boxes):
+        return {prompt: None for prompt in prompts}
+    try:
+        confs = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(np.int64)
+    except AttributeError:
+        return {prompt: None for prompt in prompts}
+    n = min(len(confs), len(classes), len(result.masks.data))
+    for i in range(n):
+        class_idx = int(classes[i])
+        if not 0 <= class_idx < len(prompts):
+            continue
+        raw = result.masks.data[i].cpu().numpy()
+        mask = cv2.resize(raw, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask_u8 = (mask > 0.5).astype(np.uint8) * 255
+        grouped[prompts[class_idx]].append((mask_u8, float(confs[i])))
+    return {
+        prompt: sorted(masks, key=lambda x: x[1], reverse=True) or None
+        for prompt, masks in grouped.items()
+    }
 
 
 # Colors for multi-mask debug overlay (BGR)
@@ -157,10 +190,21 @@ class YoloeSegmentor:
         self.conf_thr = conf_thr
         self._current_prompt = None
 
+    def _ensure_prompts(self, prompts: Sequence[str]) -> List[str]:
+        """Set the detector vocabulary once, preserving text-class order."""
+        unique_prompts = list(dict.fromkeys(prompts))
+        if not unique_prompts:
+            raise ValueError("at least one YOLO-E prompt is required")
+        key = tuple(unique_prompts)
+        if key != self._current_prompt:
+            self.model.set_classes(
+                unique_prompts, self.model.get_text_pe(unique_prompts),
+            )
+            self._current_prompt = key
+        return unique_prompts
+
     def _ensure_prompt(self, prompt: str):
-        if prompt != self._current_prompt:
-            self.model.set_classes([prompt], self.model.get_text_pe([prompt]))
-            self._current_prompt = prompt
+        self._ensure_prompts([prompt])
 
     def segment(self, rgb: np.ndarray, prompt: str) -> Optional[np.ndarray]:
         """Single image → uint8 mask (H,W) 0/255, or None."""
@@ -192,6 +236,35 @@ class YoloeSegmentor:
             )
             for i, result in enumerate(results):
                 out[start + i] = _all_masks_from_yoloe(result, h, w)
+        return out
+
+    def segment_catalog_batch(
+        self, rgbs: List[np.ndarray], prompts: Sequence[str], batch_size: int = 64,
+    ) -> Dict[str, List[Optional[List]]]:
+        """Segment a fixed text catalogue in one inference per image batch.
+
+        The returned dict is keyed by prompt and each value has one entry per
+        input image.  Duplicate prompts intentionally share their detections;
+        callers may use different catalogue names with the same detector text.
+        """
+        unique_prompts = self._ensure_prompts(prompts)
+        out: Dict[str, List[Optional[List]]] = {
+            prompt: [None] * len(rgbs) for prompt in unique_prompts
+        }
+        if not rgbs:
+            return out
+        for start in range(0, len(rgbs), batch_size):
+            batch = rgbs[start : start + batch_size]
+            results = self.model.predict(
+                batch, conf=self.conf_thr, verbose=False, device="cuda", retina_masks=True,
+            )
+            for i, result in enumerate(results):
+                if i >= len(batch):
+                    break
+                h, w = batch[i].shape[:2]
+                grouped = _masks_by_class_from_yoloe(result, h, w, unique_prompts)
+                for prompt in unique_prompts:
+                    out[prompt][start + i] = grouped[prompt]
         return out
 
     def segment_video(

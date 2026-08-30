@@ -104,7 +104,12 @@ def read_capture_images(capture_dir: Path, serials: Optional[Iterable[str]] = No
 
 
 class CatalogRecognizer:
-    """One preloaded YOLO-E model used for a complete catalogue scan."""
+    """One preloaded YOLO-E model used for a complete catalogue scan.
+
+    A multi-text vocabulary is installed once per scan, so all known object
+    classes are evaluated in the same per-camera GPU batch rather than one
+    serial model call per class.
+    """
 
     def __init__(self, *, gpu: int = 0, conf_threshold: float = 0.25):
         # Import lazily: pure policy tests and planning-only work must not need
@@ -125,9 +130,12 @@ class CatalogRecognizer:
         if not images:
             return None, []
         ordered_images = [images[s] for s in sorted(images)]
-        raw: Dict[str, Sequence[Optional[Sequence[tuple[np.ndarray, float]]]]] = {}
-        for item in catalogue:
-            raw[item.name] = self._segmentor.segment_batch(ordered_images, item.prompt)
+        by_prompt = self._segmentor.segment_catalog_batch(
+            ordered_images, [item.prompt for item in catalogue],
+        )
+        raw: Dict[str, Sequence[Optional[Sequence[tuple[np.ndarray, float]]]]] = {
+            item.name: by_prompt[item.prompt] for item in catalogue
+        }
         ranked = rank_catalog_detections(raw, catalogue,
                                          min_views=min_views, min_score=min_score)
         return (ranked[0] if ranked else None), ranked

@@ -9,6 +9,7 @@ import numpy as np
 
 from autodex.fast_selection import select_best_pose_by_quality
 from src.demo.continuous_basket.catalog import (
+    CatalogRecognizer,
     parse_catalog,
     rank_catalog_detections,
 )
@@ -28,6 +29,11 @@ try:
 except ModuleNotFoundError:  # lightweight policy env intentionally has no OpenCV
     InitOrchestrator = None
 
+try:
+    from autodex.perception.mask import _masks_by_class_from_yoloe
+except ModuleNotFoundError:  # lightweight policy env intentionally has no OpenCV
+    _masks_by_class_from_yoloe = None
+
 
 class CatalogPolicyTest(unittest.TestCase):
     def test_catalog_requires_multi_view_agreement(self):
@@ -42,6 +48,56 @@ class CatalogPolicyTest(unittest.TestCase):
         )
         self.assertEqual([m.name for m in ranked], ["banana"])
         self.assertEqual(ranked[0].supporting_views, 2)
+
+    def test_catalog_recognizer_uses_one_multi_prompt_inference(self):
+        class FakeSegmentor:
+            def __init__(self):
+                self.calls = []
+
+            def segment_catalog_batch(self, images, prompts):
+                self.calls.append((len(images), tuple(prompts)))
+                mask = np.ones((2, 2), dtype=np.uint8)
+                return {
+                    "banana": [[(mask, 0.7)], [(mask, 0.8)]],
+                    "tooth brush": [None, None],
+                }
+
+        recognizer = object.__new__(CatalogRecognizer)
+        recognizer._segmentor = FakeSegmentor()
+        catalogue = parse_catalog(["banana", "brush=tooth brush"])
+        selected, _ranked = recognizer.identify(
+            {"cam0": np.zeros((2, 2, 3)), "cam1": np.zeros((2, 2, 3))}, catalogue,
+        )
+        self.assertEqual(selected.name, "banana")
+        self.assertEqual(recognizer._segmentor.calls, [(2, ("banana", "tooth brush"))])
+
+    @unittest.skipIf(_masks_by_class_from_yoloe is None,
+                     "OpenCV YOLO-E helper environment unavailable")
+    def test_multiclass_yoloe_result_keeps_prompt_class_mapping(self):
+        class TensorLike:
+            def __init__(self, value):
+                self.value = np.asarray(value)
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self.value
+
+        class FakeBoxes:
+            conf = TensorLike([0.4, 0.9])
+            cls = TensorLike([1, 0])
+
+            def __len__(self):
+                return 2
+
+        class FakeMasks:
+            data = [TensorLike(np.ones((2, 2))), TensorLike(np.ones((2, 2)))]
+
+        result = type("Result", (), {"boxes": FakeBoxes(), "masks": FakeMasks()})()
+        grouped = _masks_by_class_from_yoloe(result, 2, 2, ["banana", "brush"])
+        self.assertEqual([conf for _mask, conf in grouped["banana"]], [0.9])
+        self.assertEqual([conf for _mask, conf in grouped["brush"]], [0.4])
 
     def test_catalog_snapshot_keeps_live_stream_running(self):
         """Latest ParaDex uses its one-shot sink instead of a session restart."""
