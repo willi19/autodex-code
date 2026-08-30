@@ -24,6 +24,26 @@ class RetryDecision:
     reason: str
 
 
+def choose_success_candidates(
+    at_tabletop: Sequence[Tuple[str, str, str]],
+    any_tabletop: Sequence[Tuple[str, str, str]],
+    *,
+    strict_tabletop: bool = False,
+) -> tuple[Tuple[Tuple[str, str, str], ...], str]:
+    """Prefer matched tabletop successes, then object-frame known grasps.
+
+    A grasp candidate is stored in the object frame, so on the bare demo
+    table it can still be safely planned against a newly observed stable pose.
+    This fallback is necessary for the promised varied-pose sequence; an
+    operator can disable it during conservative bring-up.
+    """
+    if at_tabletop:
+        return tuple(at_tabletop), "success_matching_tabletop"
+    if any_tabletop and not strict_tabletop:
+        return tuple(any_tabletop), "success_other_tabletop"
+    return (), "no_successful_candidate"
+
+
 @dataclass
 class LocalRetryPolicy:
     """Retry a different grasp at the observed object pose, never home-reset.

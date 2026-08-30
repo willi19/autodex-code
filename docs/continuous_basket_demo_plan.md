@@ -93,7 +93,7 @@ Before turning on the robot, do all of the following.
    ```bash
    python src/demo/continuous_basket/preflight.py \
      --objects banana wood_organizer='wood organizer' beige_brush='beige brush' \
-     --hand inspire --version v8
+     --hand inspire --arm franka --version v8
    ```
 
    Start `gotrack_daemon.py` on every capture PC before the default run; the
@@ -105,6 +105,10 @@ Before turning on the robot, do all of the following.
    uses this 3D region to disambiguate repeated object classes.
 3. Test each object separately with the new runner using `--max-successes 1`.
    Check its `result.json` pose evidence, lift verification and drop check.
+   The default uses a successful object-frame grasp from another known stable
+   tabletop pose when the exact pose has no record, which enables the
+   varied-initial-pose demonstration. Pass `--strict-tabletop-success` during
+   conservative bring-up to require an exact pose match.
 4. Require multi-camera detector agreement (`--catalog-min-views 2` or more),
    then run 3 continuous successes. Do not use a catalogue item whose detector
    prompt frequently matches the basket or another item.

@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,8 +17,9 @@ from src.demo.continuous_basket.policy import (
     PoseEvidence,
     PoseVerifier,
     Verification,
+    choose_success_candidates,
 )
-from src.demo.continuous_basket.preflight import build_report
+from src.demo.continuous_basket.preflight import build_report, require_ready
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 
 
@@ -68,6 +71,15 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertTrue(np.array_equal(pose, candidates["early"]))
         self.assertEqual(scores, {"late": 0.6, "early": 0.6})
 
+    def test_other_tabletop_success_is_default_varied_pose_fallback(self):
+        other = [("table", "1", "2")]
+        selected, source = choose_success_candidates([], other)
+        self.assertEqual(selected, tuple(other))
+        self.assertEqual(source, "success_other_tabletop")
+        selected, source = choose_success_candidates([], other, strict_tabletop=True)
+        self.assertEqual(selected, ())
+        self.assertEqual(source, "no_successful_candidate")
+
     def test_tracking_payload_keeps_undistorted_calibration(self):
         session = LiveGoTrackSession(
             pc_list=["capture1"], capture_ips=["10.0.0.1"],
@@ -99,11 +111,15 @@ class CatalogPolicyTest(unittest.TestCase):
             grasp = candidates / obj / "table" / "0" / "0"
             grasp.mkdir(parents=True)
             (grasp / "wrist_se3.npy").touch()
-            (grasp / "result.json").write_text(json.dumps({"success": True}))
+            (grasp / "pregrasp_pose.npy").touch()
+            (grasp / "result.json").write_text(
+                json.dumps({"success": True, "arm": "franka"})
+            )
 
             rows = build_report(
                 parse_catalog([obj]), object_root=obj_root, assets_base=assets,
                 candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
+                arm="franka",
             )
             self.assertFalse(rows[0].ready)
             self.assertEqual(rows[0].missing, ["gotrack_anchor_bank"])
@@ -113,9 +129,38 @@ class CatalogPolicyTest(unittest.TestCase):
             rows = build_report(
                 parse_catalog([obj]), object_root=obj_root, assets_base=assets,
                 candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
+                arm="franka",
             )
             self.assertTrue(rows[0].ready)
             self.assertEqual(rows[0].successful_candidate_count, 1)
+            require_ready(rows)
+
+            wrong_arm = build_report(
+                parse_catalog([obj]), object_root=obj_root, assets_base=assets,
+                candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
+                arm="xarm",
+            )
+            self.assertFalse(wrong_arm[0].ready)
+            self.assertEqual(wrong_arm[0].missing, ["successful_grasp"])
+            with self.assertRaisesRegex(RuntimeError, "banana: successful_grasp"):
+                require_ready(wrong_arm)
+
+    def test_preflight_direct_script_invocation_has_repo_import_path(self):
+        """The command documented for operators works without PYTHONPATH."""
+        script = (Path(__file__).resolve().parents[2]
+                  / "src/demo/continuous_basket/preflight.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = subprocess.run(
+                [sys.executable, str(script), "--objects", "missing_object",
+                 "--object-root", str(root / "objects"),
+                 "--assets-base", str(root / "assets"),
+                 "--candidate-root", str(root / "candidates"), "--no-gotrack"],
+                cwd=Path(__file__).resolve().parents[2], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("MISSING: mesh", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

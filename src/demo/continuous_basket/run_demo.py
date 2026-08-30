@@ -50,7 +50,6 @@ from src.demo.banana_test.run_demo import (
     ASSETS_BASE,
     CAM_PARAM_ROOT,
     DEFAULT_PC_LIST,
-    MESH_BASE,
     _clear_camera_errors,
     _ensure_camera_lock,
     _fk_wrist,
@@ -74,7 +73,9 @@ from src.demo.continuous_basket.policy import (
     PoseEvidence,
     PoseVerifier,
     Verification,
+    choose_success_candidates,
 )
+from src.demo.continuous_basket.preflight import build_report, require_ready
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
@@ -195,12 +196,20 @@ def _observe_fast(orch: InitOrchestrator, item: CatalogObject, out_dir: Path,
 
 
 def _candidate_order(item: CatalogObject, hand: str, version: str,
-                     pose_robot: np.ndarray, arm: str) -> tuple[list, Optional[str], dict]:
+                     pose_robot: np.ndarray, arm: str,
+                     strict_tabletop: bool) -> tuple[list, Optional[str], dict]:
     obj_root = get_obj_root(version)
     tabletop = classify_tabletop_pose(pose_robot, item.name, obj_root)
     stem = tabletop["filename"].replace(".npy", "") if tabletop else None
-    at_pose, _any_pose = success_keys_at_pose(item.name, hand, version, stem, arm=arm)
-    return at_pose, stem, tabletop or {}
+    at_pose, any_pose = success_keys_at_pose(item.name, hand, version, stem, arm=arm)
+    candidates, source = choose_success_candidates(
+        at_pose, any_pose, strict_tabletop=strict_tabletop,
+    )
+    info = dict(tabletop or {})
+    info["candidate_source"] = source
+    info["matched_tabletop_successes"] = len(at_pose)
+    info["other_tabletop_successes"] = len(any_pose)
+    return list(candidates), stem, info
 
 
 def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidate_order: Sequence,
@@ -213,7 +222,8 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
     )
     pose_robot = np.linalg.inv(c2r) @ pose_world
     order, tabletop_stem, tabletop = _candidate_order(item, hand, args.grasp_version,
-                                                       pose_robot, args.arm)
+                                                       pose_robot, args.arm,
+                                                       args.strict_tabletop_success)
     # Keep only catalog/pose-compatible successful grasps.  On a retry the
     # policy removes the candidate that just missed, while retaining the same
     # object pose and current arm state.
@@ -341,6 +351,8 @@ def main() -> None:
     p.add_argument("--hand", default="inspire", choices=["allegro", "inspire", "inspire_left"])
     p.add_argument("--arm", default="franka", choices=["xarm", "franka"])
     p.add_argument("--grasp-version", default="v8")
+    p.add_argument("--strict-tabletop-success", action="store_true",
+                   help="disable object-frame fallback to successes recorded at other stable poses")
     p.add_argument("--basket-center", nargs=3, type=float, metavar=("X", "Y", "Z"), required=True,
                    help="robot-frame basket release reference, metres")
     p.add_argument("--pick-workspace", nargs=6, type=float,
@@ -387,6 +399,19 @@ def main() -> None:
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
+    # Do this before opening camera/robot sessions: every catalogue entry must
+    # be demo-ready even when it is selected only after several successes.
+    readiness = build_report(
+        catalogue, object_root=Path(get_obj_root(args.grasp_version)),
+        assets_base=ASSETS_BASE,
+        candidate_root=Path(project_dir) / "candidates" / args.hand / args.grasp_version,
+        anchor_root=Path(args.tracking_anchor_root).expanduser(),
+        require_gotrack=args.verification_mode == "gotrack", arm=args.arm,
+    )
+    try:
+        require_ready(readiness)
+    except RuntimeError as exc:
+        p.error(str(exc))
     basket_xyz = np.asarray(args.basket_center, dtype=np.float64)
     pick_bounds = np.asarray(args.pick_workspace, dtype=np.float64).reshape(2, 3)
     if np.any(pick_bounds[1] <= pick_bounds[0]):
@@ -530,7 +555,8 @@ def main() -> None:
                 before_robot = np.linalg.inv(c2r) @ pose_world
                 if retry is None:
                     order, _stem, _tabletop = _candidate_order(item, args.hand, args.grasp_version,
-                                                                before_robot, args.arm)
+                                                                before_robot, args.arm,
+                                                                args.strict_tabletop_success)
                     retry = LocalRetryPolicy(order, max_attempts=args.max_retries)
                 result, plan_info, prepared = _plan_attempt(
                     planner, executor, item, retry.remaining_candidates(),
