@@ -17,7 +17,7 @@ import mujoco
 from autodex.simulator.hand_object import MjHO
 from autodex.simulator.rot_util import np_get_delta_qpos
 from autodex.utils.conversion import se32cart, cart2se3
-from autodex.utils.path import get_scene_dir
+from autodex.utils.path import get_candidate_path, get_scene_dir
 from autodex.planner.planner import GraspPlanner, _to_curobo_world
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -498,6 +498,8 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (object-level)")
     parser.add_argument("--obj_root_dir", type=str, default=None,
                         help="Override object root dir (default: paradex from autodex.utils.path)")
+    parser.add_argument("--candidate-root", type=str, default=None,
+                        help="Candidate base directory. Defaults to the NAS runtime path for --hand.")
     parser.add_argument("--obj_list_file", type=str, default=None,
                         help="Object list file (default: src/grasp_generation/obj_list.txt)")
     args = parser.parse_args()
@@ -512,7 +514,12 @@ if __name__ == "__main__":
             obj_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
     bodex_root = os.path.join(REPO_ROOT, "bodex_outputs", args.hand, args.version)
-    candidate_root = os.path.join(REPO_ROOT, "candidates", args.hand, args.version)
+    # Candidate results are consumed by the robot runner from the NAS. Keeping
+    # them under the source checkout made a newly generated pool invisible to
+    # preflight and caused an avoidable manual copy step.
+    candidate_base = (os.path.expanduser(args.candidate_root)
+                      if args.candidate_root else get_candidate_path(args.hand))
+    candidate_root = os.path.join(candidate_base, args.version)
 
     print(f"Hand: {args.hand}, Version: {args.version}, Workers: {args.workers}")
 

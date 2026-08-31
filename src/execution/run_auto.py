@@ -367,7 +367,6 @@ def _planner_robot(arm: str, hand: str) -> str:
 
 DEFAULT_PC_LIST = ["capture1", "capture2", "capture3", "capture5", "capture6"]
 ASSETS_BASE = Path.home() / "shared_data/AutoDex/foundpose_assets"
-MESH_BASE = Path.home() / "shared_data/AutoDex/object/paradex"
 CAM_PARAM_ROOT = Path.home() / "shared_data/cam_param"
 
 
@@ -637,17 +636,25 @@ def run_single_trial(
     elif _is_coverage_pool(args.grasp_version):
         _eff_grasp_version = args.grasp_version
         _plan_scene_id = None
-        # Trim to only scenes matching --scene (wall/shelf/box).
-        _plan_scene_type_filter = (args.scene
-                                   if args.scene in ("wall", "shelf", "box")
-                                   else None)
+        # A newly generated tabletop pool has no coverage JSON yet. Select it
+        # directly but keep skip-done and the one-success-per-tabletop safety
+        # policy, so real Franka collection does not repeat a known failure or
+        # overwrite a successful record.
+        _plan_scene_type_filter = args.candidate_scene_type or (
+            args.scene if args.scene in ("wall", "shelf", "box") else None
+        )
         # Trim by tabletop pose: keep only candidates whose scene
         # meta.pose_idx == current tabletop stem.
         _plan_tabletop_stem = pose_stem
         # NO pre-filter (= all tabletop-matching candidates loaded). After
         # IK+collision in planner.plan, sort survivors by coverage count
         # desc via priority_map, then plan_single_js in that order.
-        if args.ignore_coverage:
+        if args.candidate_scene_type is not None:
+            _plan_candidate_order = None
+            _plan_priority_map = None
+            print(f"    [collection] direct candidate scene type="
+                  f"{args.candidate_scene_type}; coverage ordering deferred")
+        elif args.ignore_coverage:
             _plan_candidate_order = None
             _plan_priority_map = None
             print(f"    [coverage] IGNORED (--ignore_coverage) — full pool")
@@ -1675,6 +1682,10 @@ def main():
                         help="Run regardless of scene coverage / past success: "
                              "no coverage filter, no skip_done, no reorient "
                              "suggestion. v7_demo use case.")
+    parser.add_argument("--candidate-scene-type", default=None,
+                        choices=["table", "wall", "shelf", "box"],
+                        help="Use only this candidate scene type while retaining normal skip-done semantics. "
+                             "For new Franka collection use 'table' before coverage is computed.")
 
     # scene-specific args (pass-through to autodex.planner.obstacles.add_obstacles)
     parser.add_argument("--wall_gap", type=float, default=0.04)
@@ -1723,16 +1734,21 @@ def main():
         scene_prefix = f"{scene_prefix}_success_only" if scene_prefix else "success_only"
 
     # Mesh / FoundPose assets sanity check.
-    mesh_path = MESH_BASE / args.obj / "raw_mesh" / f"{args.obj}.obj"
+    # v8 candidates are expressed against object_processing. FoundPose must
+    # initialize against that exact mesh frame; otherwise physical Franka
+    # collection can mark grasps that are offset when the continuous runner
+    # later consumes them.
+    mesh_root = Path(get_obj_root(args.grasp_version))
+    mesh_path = mesh_root / args.obj / "raw_mesh" / f"{args.obj}.obj"
     assets_root = ASSETS_BASE / args.obj
     if not mesh_path.exists():
         sys.exit(f"mesh not found: {mesh_path}")
     if not (assets_root / "object_repre/v1" / args.obj / "1/repre.pth").exists():
         sys.exit(f"repre.pth missing for {args.obj} (expected under {assets_root})")
 
-    # FoundPose estimates the pose of MESH_BASE's mesh; for v8 the planner
-    # places the object_processing mesh. Those roots must agree on geometry or
-    # every grasp is silently offset by their frame difference.
+    # FoundPose and the planner now share the version-resolved mesh. Keep this
+    # check because a caller may still point a non-v8 pool at a mismatched
+    # custom object tree.
     from src.execution.scene_cfg import check_mesh_frame_match
     _frame_ok, _frame_msg = check_mesh_frame_match(
         args.obj, str(mesh_path), get_obj_root(args.grasp_version))

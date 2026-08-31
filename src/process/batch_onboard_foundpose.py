@@ -34,18 +34,18 @@ from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOTRACK_ROOT = REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack"
-MESH_BASE = Path.home() / "shared_data/AutoDex/object/paradex"
+MESH_BASE = Path.home() / "shared_data/object_processing"
 
 
-def _resolve_mesh(obj: str) -> Path:
+def _resolve_mesh(obj: str, mesh_base: Path) -> Path:
     for sub in [
-        MESH_BASE / obj / "raw_mesh" / f"{obj}.obj",
-        MESH_BASE / obj / "processed_data" / "mesh" / "raw.obj",
-        MESH_BASE / obj / "processed_data" / "mesh" / "simplified.obj",
+        mesh_base / obj / "raw_mesh" / f"{obj}.obj",
+        mesh_base / obj / "processed_data" / "mesh" / "raw.obj",
+        mesh_base / obj / "processed_data" / "mesh" / "simplified.obj",
     ]:
         if sub.exists():
             return sub
-    raise FileNotFoundError(f"No mesh for {obj} under {MESH_BASE}")
+    raise FileNotFoundError(f"No mesh for {obj} under {mesh_base}")
 
 
 def _resolve_reference_camera(reference_intrinsics_json: Path) -> str:
@@ -117,6 +117,8 @@ def main():
                         help="One object name per line.")
     parser.add_argument("--output-root", type=str,
                         default=str(REPO_ROOT / "outputs/foundpose_assets"))
+    parser.add_argument("--object-root", type=str, default=str(MESH_BASE),
+                        help="Object tree containing raw_mesh and processed_data (v8 defaults to object_processing).")
     parser.add_argument("--reference-intrinsics-json", type=str, default=None,
                         help="Calibration json (intrinsics) used during onboarding. "
                              "Defaults to the first usable cam_param/intrinsics.json "
@@ -157,6 +159,7 @@ def main():
 
     output_root = Path(args.output_root).resolve()
     log_dir = Path(args.log_dir).resolve()
+    object_root = Path(args.object_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,7 +172,7 @@ def main():
     jobs = []
     for obj in objects:
         try:
-            mesh = _resolve_mesh(obj)
+            mesh = _resolve_mesh(obj, object_root)
         except FileNotFoundError as e:
             print(f"[skip] {obj}: {e}")
             continue
