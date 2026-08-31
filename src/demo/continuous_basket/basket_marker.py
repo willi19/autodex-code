@@ -12,9 +12,9 @@ def release_reference_from_marker(
     """Return the basket release point from a detected standalone marker.
 
     ``marker_offset_m`` is expressed in the detected marker's local frame, not
-    the robot frame.  This lets a marker live on a basket rim or side while the
-    release reference remains at the open interior.  A zero offset means that
-    the marker centre itself is the release reference.
+    the robot frame. Attach the marker horizontally on a rigid basket fixture;
+    its local +z then points upward and the offset can reach the open interior.
+    A zero offset means that the marker centre itself is the release reference.
     """
     center = np.asarray(center_robot, dtype=np.float64).reshape(-1)
     pose = np.asarray(pose_robot, dtype=np.float64)
@@ -27,4 +27,9 @@ def release_reference_from_marker(
         raise ValueError(f"marker offset must have shape (3,), got {offset.shape}")
     if not (np.isfinite(center).all() and np.isfinite(pose).all() and np.isfinite(offset).all()):
         raise ValueError("marker geometry must contain only finite values")
+    # ``locate_marker.marker_frame`` was deliberately defined for a marker on
+    # the table plane. Reject a side-mounted tag instead of silently treating
+    # its ambiguous normal as the basket's vertical release axis.
+    if float(pose[2, 2]) < 0.9:
+        raise ValueError("basket marker must be mounted horizontally (local +z upward)")
     return center + pose[:3, :3] @ offset

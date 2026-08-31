@@ -120,8 +120,8 @@ Before turning on the robot, do all of the following.
 
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
-3. Attach a standalone `6X6_1000` ArUco marker to the basket and pass
-   `--basket-marker-id ID`. The runner triangulates it from a one-shot camera
+3. Attach a standalone `6X6_1000` ArUco marker horizontally to a rigid basket
+   rim fixture and pass `--basket-marker-id ID`. The runner triangulates it from a one-shot camera
    snapshot before it connects to the arm. Set `--basket-marker-offset DX DY DZ`
    in marker coordinates to point from the marker centre to a release point
    above the open interior; start conservatively with `--drop-height 0.05` and
@@ -147,7 +147,7 @@ Example command (replace marker ID/offset with the calibrated basket fixture):
 /home/robot/anaconda3/envs/planner/bin/python src/demo/continuous_basket/run_demo.py \
   --objects banana=banana wood_organizer='wood organizer' beige_brush='beige brush' \
   --arm franka --hand inspire --grasp-version v8 \
-  --basket-marker-id 42 --basket-marker-offset 0 0 0.08 --max-successes 12
+  --basket-marker-id MARKER_ID --basket-marker-offset DX DY DZ --max-successes 12
 ```
 
 The runner finds ParaDex from `AUTODEX_PARADEX_ROOT` when set, otherwise from

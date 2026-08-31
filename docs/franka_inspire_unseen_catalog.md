@@ -110,7 +110,8 @@ Run the audit again after each session. Do not proceed while it reports
 ## 5. Start the continuous take
 
 Keep the GoTrack daemons running on capture1/2/3/5/6 and attach one
-standalone (non-Charuco) `6X6_1000` ArUco marker to the basket. The runner
+standalone (non-Charuco) `6X6_1000` ArUco marker **horizontally** to a rigid
+basket rim fixture. The runner
 triangulates it before it connects to the arm. `--basket-marker-offset` is in
 the marker frame and points from that marker centre to the safe release point
 over the basket interior. First run a one-success check for each class, then
@@ -121,7 +122,7 @@ the uncut sequence:
   src/demo/continuous_basket/run_demo.py \
   --objects apple banana pepsi toothbrush_holder \
   --hand inspire --arm franka --grasp-version v8 \
-  --basket-marker-id 42 --basket-marker-offset 0 0 0.08 \
+  --basket-marker-id MARKER_ID --basket-marker-offset DX DY DZ \
   --max-successes 12 --max-cycles 40
 ```
 

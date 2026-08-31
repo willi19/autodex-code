@@ -156,6 +156,16 @@ class CatalogPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape"):
             release_reference_from_marker(np.zeros(2), np.eye(4), np.zeros(3))
 
+    def test_basket_marker_rejects_side_mounted_tag(self):
+        side_marker = np.eye(4)
+        side_marker[:3, :3] = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ])
+        with self.assertRaisesRegex(ValueError, "horizontally"):
+            release_reference_from_marker(np.zeros(3), side_marker, np.zeros(3))
+
     def test_retry_removes_failed_candidate_without_reset(self):
         keys = [("table", "0", "0"), ("table", "0", "1"), ("table", "0", "2")]
         policy = LocalRetryPolicy(keys, max_attempts=3)
