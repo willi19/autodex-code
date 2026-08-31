@@ -13,12 +13,37 @@ PCS=(capture1 capture2 capture3 capture5 capture6)  # capture4 out
 PY='$HOME/anaconda3/envs/gotrack_cu128/bin/python'
 DAEMON='$HOME/AutoDex/src/execution/daemon/gotrack_daemon.py'
 LOG=/tmp/gotrack_daemon.log
-ROBOT_IP="${ROBOT_IP:-192.168.0.2}"
+# Capture PCs subscribe to the robot-host prior-pose PUB endpoint.  The old
+# fixed default (192.168.0.2) belongs to the previous lab host and leaves the
+# daemons waiting forever when this host has a different camera-LAN address.
+# Let an explicit ROBOT_IP override this discovery for unusual topologies;
+# otherwise use the source address selected by the route to capture1.
+detect_robot_ip() {
+    if [[ -n "${ROBOT_IP:-}" ]]; then
+        printf '%s\n' "$ROBOT_IP"
+        return 0
+    fi
+
+    local capture_ip route_ip
+    capture_ip="$(getent ahostsv4 "${PCS[0]}" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    if [[ -z "$capture_ip" ]]; then
+        echo "[gotrack] cannot resolve ${PCS[0]}; set ROBOT_IP explicitly" >&2
+        return 1
+    fi
+    route_ip="$(ip route get "$capture_ip" 2>/dev/null | awk '{for (i = 1; i <= NF; ++i) if ($i == "src") {print $(i + 1); exit}}')"
+    if [[ -z "$route_ip" ]]; then
+        echo "[gotrack] cannot determine source IP for $capture_ip; set ROBOT_IP explicitly" >&2
+        return 1
+    fi
+    printf '%s\n' "$route_ip"
+}
 
 ACTION="${1:-status}"
 
 case "$ACTION" in
     start)
+        ROBOT_IP="$(detect_robot_ip)"
+        echo "[gotrack] robot prior-pose IP: $ROBOT_IP"
         for pc in "${PCS[@]}"; do
             ssh -o ConnectTimeout=3 "$pc" "pkill -9 -f gotrack_daemon 2>/dev/null || true" &
         done
