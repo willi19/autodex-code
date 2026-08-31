@@ -12,12 +12,13 @@ Example (after pre-onboarding all listed objects):
 
     python src/demo/continuous_basket/run_demo.py \
       --objects banana=banana wood_organizer='wood organizer' \
-      --basket-center 0.52 -0.23 0.20 --max-successes 12
+      --basket-marker-id 42 --max-successes 12
 
-The basket center is a *release reference*: set z high enough that the object
-falls into the basket and keep the basket at the edge of the comfortable work
-space.  Start with an empty basket, a clear approach from above, and an
-external continuous camera for the uncut take.
+The basket release reference is either supplied manually or measured once at
+startup from a standalone ArUco marker.  With a marker, use the local marker
+offset to point from the marker centre to the safe release point over the
+basket's open interior.  Start with an empty basket, a clear approach from
+above, and an external continuous camera for the uncut take.
 """
 from __future__ import annotations
 
@@ -74,6 +75,8 @@ from src.demo.banana_test.run_demo import (
     filter_by_place_reach,
 )
 from src.demo.banana_test.success_grasps import success_keys_at_pose
+from src.demo.banana_test.place_target import locate_marker
+from src.demo.continuous_basket.basket_marker import release_reference_from_marker
 from src.demo.continuous_basket.catalog import (
     CatalogObject,
     CatalogRecognizer,
@@ -344,6 +347,37 @@ def _track_timing(sample, *, source: str = "gotrack") -> dict:
             "mean_residual_mm": sample.mean_residual_mm}
 
 
+def _measure_basket_reference(rcc, args, run_dir: Path, expected_serials: Iterable[str]) -> tuple[np.ndarray, dict]:
+    """Capture and triangulate the standalone basket marker before arm setup."""
+    marker_dir = run_dir / "basket_marker"
+    image_count = capture_catalog_snapshot(
+        rcc, marker_dir, min_images=args.basket_marker_min_views,
+        settle_timeout_s=args.basket_marker_snapshot_timeout_s,
+        expected_serials=expected_serials,
+    )
+    # ``locate_marker`` consumes the per-capture camera/calibration sidecars,
+    # matching the legacy banana place-target path.
+    save_current_C2R(str(marker_dir))
+    save_current_camparam(str(marker_dir))
+    info = locate_marker(
+        str(marker_dir), dict_type=args.basket_marker_dict,
+        marker_id=args.basket_marker_id,
+    )
+    reference = release_reference_from_marker(
+        info["center_robot"], info["pose_robot"], args.basket_marker_offset,
+    )
+    record = {
+        "source": "aruco_marker",
+        "marker": info,
+        "marker_offset_m": np.asarray(args.basket_marker_offset, dtype=float),
+        "release_reference_robot": reference,
+        "snapshot_images": image_count,
+    }
+    print(f"[basket] marker {args.basket_marker_dict} id={info['marker_id']} "
+          f"({info['n_views']} views) release_robot={reference.round(4)}")
+    return reference, record
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--objects", nargs="+", required=True,
@@ -353,8 +387,20 @@ def main() -> None:
     p.add_argument("--grasp-version", default="v8")
     p.add_argument("--strict-tabletop-success", action="store_true",
                    help="disable object-frame fallback to successes recorded at other stable poses")
-    p.add_argument("--basket-center", nargs=3, type=float, metavar=("X", "Y", "Z"), required=True,
-                   help="robot-frame basket release reference, metres")
+    basket_source = p.add_mutually_exclusive_group(required=True)
+    basket_source.add_argument("--basket-center", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                               help="manual robot-frame basket release reference, metres")
+    basket_source.add_argument("--basket-marker-id", type=int, metavar="ID",
+                               help="standalone 6X6_1000 ArUco ID fixed to the basket")
+    p.add_argument("--basket-marker-dict", default="6X6_1000",
+                   help="OpenCV dictionary for --basket-marker-id")
+    p.add_argument("--basket-marker-offset", nargs=3, type=float, default=[0.0, 0.0, 0.0],
+                   metavar=("DX", "DY", "DZ"),
+                   help="marker-local metres from marker centre to release reference")
+    p.add_argument("--basket-marker-min-views", type=int, default=3,
+                   help="minimum NAS-visible marker snapshot views (must be >= 3)")
+    p.add_argument("--basket-marker-snapshot-timeout-s", type=float, default=15.0,
+                   help="marker snapshot maximum wait before any robot connection")
     p.add_argument("--pick-workspace", nargs=6, type=float,
                    default=[0.35, -0.30, 0.00, 0.80, 0.21, 0.45],
                    metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
@@ -405,7 +451,9 @@ def main() -> None:
     if (args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1
             or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0
             or args.init_command_timeout_s <= 0 or args.tracking_command_timeout_s <= 0
-            or args.catalog_snapshot_timeout_s <= 0):
+            or args.catalog_snapshot_timeout_s <= 0
+            or args.basket_marker_snapshot_timeout_s <= 0
+            or args.basket_marker_min_views < 3):
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
@@ -422,26 +470,13 @@ def main() -> None:
         require_ready(readiness)
     except RuntimeError as exc:
         p.error(str(exc))
-    basket_xyz = np.asarray(args.basket_center, dtype=np.float64)
     pick_bounds = np.asarray(args.pick_workspace, dtype=np.float64).reshape(2, 3)
     if np.any(pick_bounds[1] <= pick_bounds[0]):
         p.error("pick-workspace max bounds must exceed min bounds")
-    basket_bounds = np.array([
-        [basket_xyz[0] - args.basket_observe_radius,
-         basket_xyz[1] - args.basket_observe_radius, 0.0],
-        [basket_xyz[0] + args.basket_observe_radius,
-         basket_xyz[1] + args.basket_observe_radius,
-         basket_xyz[2] + args.basket_observe_height],
-    ], dtype=np.float64)
     run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (Path(project_dir) / "experiment" / args.exp_name
                / f"{args.arm}_{args.hand}" / run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "catalog.json").write_text(json.dumps(_jsonable({
-        "objects": [item.__dict__ for item in catalogue], "basket_center": basket_xyz,
-        "pick_workspace": pick_bounds, "basket_observation_workspace": basket_bounds,
-        "policy": "fast_quality_no_silhouette + local_retry_no_home_reset",
-    }), indent=2))
     save_current_C2R(str(run_dir)); save_current_camparam(str(run_dir))
     c2r = load_c2r(str(run_dir))
 
@@ -471,6 +506,27 @@ def main() -> None:
         _ensure_camera_lock(rcc); _clear_camera_errors(rcc)
         _rcc_start(rcc, "stream", False, fps=args.stream_fps)
         _warn_if_not_streaming(rcc)
+        if args.basket_center is not None:
+            basket_xyz = np.asarray(args.basket_center, dtype=np.float64)
+            basket_record = {
+                "source": "manual", "release_reference_robot": basket_xyz,
+            }
+        else:
+            basket_xyz, basket_record = _measure_basket_reference(
+                rcc, args, run_dir, active,
+            )
+        basket_bounds = np.array([
+            [basket_xyz[0] - args.basket_observe_radius,
+             basket_xyz[1] - args.basket_observe_radius, 0.0],
+            [basket_xyz[0] + args.basket_observe_radius,
+             basket_xyz[1] + args.basket_observe_radius,
+             basket_xyz[2] + args.basket_observe_height],
+        ], dtype=np.float64)
+        (run_dir / "catalog.json").write_text(json.dumps(_jsonable({
+            "objects": [item.__dict__ for item in catalogue], "basket": basket_record,
+            "pick_workspace": pick_bounds, "basket_observation_workspace": basket_bounds,
+            "policy": "fast_quality_no_silhouette + local_retry_no_home_reset",
+        }), indent=2))
         recognizer = CatalogRecognizer(gpu=args.catalog_gpu, conf_threshold=args.catalog_min_score)
         planner = GraspPlanner(hand=_planner_robot(args.arm, args.hand))
         if args.verification_mode == "gotrack":

@@ -9,6 +9,7 @@ import numpy as np
 
 from src.demo.continuous_basket.catalog import CatalogObject
 from src.demo.continuous_basket.prepare_franka_catalog import (
+    _demo_command,
     _franka_successful_tabletops,
     processing_readiness,
     table_scene_payload,
@@ -17,6 +18,17 @@ from src.demo.continuous_basket.prepare_franka_catalog import (
 
 
 class FrankaCatalogTest(unittest.TestCase):
+    def test_demo_command_uses_marker_source_when_provided(self):
+        args = type("Args", (), {
+            "planner_python": "python", "version": "v8", "max_successes": 1,
+            "basket_center": None, "basket_marker_id": 42,
+            "basket_marker_dict": "6X6_1000", "basket_marker_offset": [0.0, 0.0, 0.08],
+        })()
+        command = _demo_command([CatalogObject("banana", "banana")], args)
+        self.assertIn("--basket-marker-id", command)
+        self.assertIn("42", command)
+        self.assertNotIn("--basket-center", command)
+
     def _make_object(self, root: Path, name: str) -> None:
         base = root / name
         for relative in (

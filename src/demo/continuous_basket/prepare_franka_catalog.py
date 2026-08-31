@@ -228,13 +228,20 @@ def _collection_commands(items: Iterable[CatalogObject], args) -> list[list[str]
 
 
 def _demo_command(items: Sequence[CatalogObject], args) -> list[str]:
-    basket = list(args.basket_center) if args.basket_center else ["<X>", "<Y>", "<Z>"]
-    return [
+    command = [
         args.planner_python, str(REPO_ROOT / "src/demo/continuous_basket/run_demo.py"),
         "--objects", *[f"{item.name}={item.prompt}" for item in items],
         "--hand", "inspire", "--arm", "franka", "--grasp-version", args.version,
-        "--basket-center", *[str(v) for v in basket], "--max-successes", str(args.max_successes),
+        "--max-successes", str(args.max_successes),
     ]
+    if args.basket_marker_id is not None:
+        return command + [
+            "--basket-marker-id", str(args.basket_marker_id),
+            "--basket-marker-dict", args.basket_marker_dict,
+            "--basket-marker-offset", *[str(v) for v in args.basket_marker_offset],
+        ]
+    basket = list(args.basket_center) if args.basket_center else ["<X>", "<Y>", "<Z>"]
+    return command + ["--basket-center", *[str(v) for v in basket]]
 
 
 def _franka_successful_tabletops(item: CatalogObject, *, candidate_root: Path,
@@ -338,7 +345,14 @@ def main() -> None:
                         help="require this many stable tabletop poses with Franka successes during audit")
     parser.add_argument("--auto-label", action="store_true",
                         help="use Charuco lift verification during physical collection")
-    parser.add_argument("--basket-center", type=float, nargs=3, default=None)
+    basket_source = parser.add_mutually_exclusive_group()
+    basket_source.add_argument("--basket-center", type=float, nargs=3, default=None)
+    basket_source.add_argument("--basket-marker-id", type=int, default=None,
+                               help="standalone ArUco ID fixed to the basket")
+    parser.add_argument("--basket-marker-dict", default="6X6_1000")
+    parser.add_argument("--basket-marker-offset", type=float, nargs=3,
+                        default=[0.0, 0.0, 0.0], metavar=("DX", "DY", "DZ"),
+                        help="marker-local metres from marker centre to release reference")
     parser.add_argument("--max-successes", type=int, default=12)
     parser.add_argument("--session-dir", default=None)
     args = parser.parse_args()
@@ -394,10 +408,10 @@ def main() -> None:
     if args.stage == "demo":
         print("[demo] This command is blocked until all objects pass the Franka preflight and basket coordinates are known.")
         command = _demo_command(items, args)
-        if args.basket_center is None:
-            print("$ " + " ".join(command))
-        else:
+        if args.basket_center is not None or args.basket_marker_id is not None:
             _run(command, execute=args.execute and args.run_robot)
+        else:
+            print("$ " + " ".join(command))
 
     if args.stage == "all":
         print("[next: collection]")

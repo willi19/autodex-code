@@ -15,6 +15,7 @@ from src.demo.continuous_basket.catalog import (
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.camera_smoke import advancing_frame_errors
+from src.demo.continuous_basket.basket_marker import release_reference_from_marker
 from src.demo.continuous_basket.policy import (
     LocalRetryPolicy,
     PoseEvidence,
@@ -138,6 +139,22 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertIn("frame id did not advance", advancing_frame_errors(
             before, after, ["capture1"],
         )[0])
+
+    def test_basket_marker_offset_uses_marker_frame(self):
+        marker_pose = np.eye(4)
+        marker_pose[:3, :3] = np.array([
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        release = release_reference_from_marker(
+            np.array([0.5, -0.2, 0.1]), marker_pose, np.array([0.1, 0.0, 0.05]),
+        )
+        np.testing.assert_allclose(release, [0.5, -0.1, 0.15])
+
+    def test_basket_marker_rejects_bad_geometry(self):
+        with self.assertRaisesRegex(ValueError, "shape"):
+            release_reference_from_marker(np.zeros(2), np.eye(4), np.zeros(3))
 
     def test_retry_removes_failed_candidate_without_reset(self):
         keys = [("table", "0", "0"), ("table", "0", "1"), ("table", "0", "2")]
