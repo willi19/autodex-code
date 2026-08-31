@@ -24,8 +24,15 @@ detect_robot_ip() {
         return 0
     fi
 
-    local capture_ip route_ip
-    capture_ip="$(getent ahostsv4 "${PCS[0]}" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    local capture_target capture_ip route_ip
+    # capture1 is commonly an SSH-config alias, not a DNS hostname.  Resolve
+    # its HostName through the same SSH configuration used below before asking
+    # the routing table for the camera-LAN source address.
+    capture_target="$(ssh -G "${PCS[0]}" 2>/dev/null | awk '$1 == "hostname" {print $2; exit}')"
+    capture_ip="$(getent ahostsv4 "${capture_target:-${PCS[0]}}" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    if [[ -z "$capture_ip" && "$capture_target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        capture_ip="$capture_target"
+    fi
     if [[ -z "$capture_ip" ]]; then
         echo "[gotrack] cannot resolve ${PCS[0]}; set ROBOT_IP explicitly" >&2
         return 1
