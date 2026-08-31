@@ -459,7 +459,7 @@ def main() -> None:
     p.add_argument("--object-switch-settle-s", type=float, default=1.0)
     p.add_argument("--stream-fps", type=int, default=10)
     p.add_argument("--video-fps", type=int, default=30,
-                   help="synchronised FPS for the single uncut capture-PC recording")
+                   help="FPS for the single uncut capture-PC recording (synchronised when trigger is present)")
     p.add_argument("--no-video", action="store_true",
                    help="disable the default whole-run camera and robot-state recording")
     p.add_argument("--run-id", default=None,
@@ -560,28 +560,45 @@ def main() -> None:
         else:
             # Keep both sinks active for the *entire* run: all FoundPose and
             # GoTrack stages keep their live SHM stream while the capture PCs
-            # append one synchronized AVI take, including human re-placement.
+            # append one AVI take, including human re-placement. Hardware
+            # synchronization is preferable but must not make the demo
+            # unusable on the FR3 host when its USB trigger is disconnected.
             from paradex.io.camera_system.signal_generator import UTGE900
             from paradex.io.camera_system.timestamp_monitor import TimestampMonitor
 
-            sync_generator = UTGE900(**network_info["signal_generator"]["param"])
-            timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
+            sync_mode = False
+            try:
+                sync_generator = UTGE900(**network_info["signal_generator"]["param"])
+                timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
+                sync_mode = True
+            except Exception as exc:
+                # The normal FR3 workstation currently has no /dev/usbtmc0.
+                # Capture PCs can still record one uncut free-running take;
+                # record the downgrade instead of failing before any motion.
+                sync_generator = None
+                timestamp_monitor = None
+                recording_manifest["sync_mode"] = "unsynchronized_fallback"
+                recording_manifest["sync_fallback_reason"] = repr(exc)
+                print(f"[video] sync trigger unavailable ({exc!r}); "
+                      "recording an uncut unsynchronised take")
             raw_dir.mkdir(parents=True, exist_ok=True)
             print(f"[video] uncut capture start @ {args.video_fps} FPS -> {capture_video_rel}")
-            _rcc_start(rcc, "full", True, capture_video_rel, fps=args.video_fps)
+            _rcc_start(rcc, "full", sync_mode, capture_video_rel, fps=args.video_fps)
             camera_recording = True
             recording_manifest["camera_started_at"] = dt.datetime.now().isoformat(timespec="seconds")
-            recording_manifest["timestamps_started"] = _safe_timestamp_start(
-                timestamp_monitor, str(raw_dir / "timestamps")
-            )
-            try:
-                sync_generator.start(fps=args.video_fps)
-            except Exception as exc:
-                raise RuntimeError(
-                    "continuous video requires the camera sync generator; "
-                    f"it failed to start: {exc!r}"
-                ) from exc
-            recording_manifest["sync_generator_started"] = True
+            if sync_mode:
+                recording_manifest["sync_mode"] = "hardware"
+                recording_manifest["timestamps_started"] = _safe_timestamp_start(
+                    timestamp_monitor, str(raw_dir / "timestamps")
+                )
+                try:
+                    sync_generator.start(fps=args.video_fps)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "continuous video sync generator was constructed but failed to start: "
+                        f"{exc!r}"
+                    ) from exc
+                recording_manifest["sync_generator_started"] = True
             _write_recording_manifest(run_dir, recording_manifest)
         _warn_if_not_streaming(rcc)
         if args.basket_center is not None:
