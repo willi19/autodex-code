@@ -120,6 +120,19 @@ Before turning on the robot, do all of the following.
 
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
+   Before a first robot motion, verify the distributed tracker with a saved
+   FoundPose pose. This sends commands only to the capture PCs; it does not
+   construct or move a robot executor:
+
+   ```bash
+   python src/demo/continuous_basket/gotrack_smoke.py \
+     --object banana \
+     --init-pose /home/robot/shared_data/AutoDex/experiment/continuous_basket_demo/franka_inspire/<run-id>/init/001_catalog_banana/pose_world.npy \
+     --warmup-s 15
+   ```
+
+   Require `GOTRACK_SMOKE_OK`; a process count or a successful `init` command
+   alone is not evidence that anchor observations reach the robot host.
    The robot-host `planner` environment also needs `ultralytics==8.4.15` and
    the local `autodex/perception/thirdparty/weights/yoloe-26x-seg.pt`
    checkpoint. These are checked before camera or arm connection; do not rely

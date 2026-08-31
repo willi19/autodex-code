@@ -630,10 +630,13 @@ def main() -> None:
                 warm = tracking.wait_for_pose(timeout_s=args.tracking_warmup_s)
                 if warm is None:
                     err = tracking.worker_error or "no reliable pose from GoTrack daemons"
+                    diagnostics = tracking.diagnostics()
                     tracking.stop()
                     raise RuntimeError(
-                        f"GoTrack warmup failed before robot motion: {err}. "
-                        "Use --verification-mode foundpose only for the slower fallback."
+                        f"GoTrack warmup failed before grasp motion: {err}. "
+                        f"diagnostics={json.dumps(_jsonable(diagnostics), sort_keys=True)}. "
+                        "Run gotrack_smoke.py to diagnose without moving the arm; "
+                        "use --verification-mode foundpose only for the slower fallback."
                     )
                 pose_world = warm.pose_world
                 perception = {**perception, "tracking_warmup": _track_timing(warm)}

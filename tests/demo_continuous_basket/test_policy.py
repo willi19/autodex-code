@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -54,6 +55,22 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertEqual(match.supporting_views, 0)
         with self.assertRaises(ValueError):
             single_object_match(parse_catalog(["banana", "apple"]))
+
+    def test_gotrack_diagnostics_exposes_tracker_status(self):
+        session = LiveGoTrackSession(
+            pc_list=[], capture_ips=[], intrinsics={}, extrinsics={},
+            anchor_root=Path("/tmp/anchors"),
+        )
+        session.obj_name = "banana"
+        session._worker_error = "no observations"
+        session._tracker = type("Tracker", (), {
+            "_status_lock": threading.Lock(),
+            "status": {"counts": {"received": 0}, "per_pc_last_frame": {}},
+        })()
+        diag = session.diagnostics()
+        self.assertEqual(diag["object"], "banana")
+        self.assertEqual(diag["worker_error"], "no observations")
+        self.assertEqual(diag["tracker_status"]["counts"]["received"], 0)
 
     def test_catalog_requires_multi_view_agreement(self):
         catalogue = parse_catalog(["banana", "brush=tooth brush"])

@@ -8,6 +8,7 @@ changing GoTrack's existing daemon protocol.
 """
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from dataclasses import dataclass
@@ -184,6 +185,30 @@ class LiveGoTrackSession:
     @property
     def worker_error(self) -> Optional[str]:
         return self._worker_error
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Return a race-safe live-status snapshot for a failed warm-up.
+
+        A control ``init``/``start`` reply only proves that a capture daemon
+        received the command; it does *not* prove that its model loaded, that
+        it received the prior pose, or that observations arrived on the robot
+        host.  Preserve the tracker's counters and per-PC frame receipts before
+        shutdown so a bring-up failure is actionable without moving the arm.
+        """
+        out: Dict[str, Any] = {
+            "object": self.obj_name,
+            "worker_error": self._worker_error,
+            "has_tracker": self._tracker is not None,
+        }
+        if self._tracker is None:
+            return out
+        lock = getattr(self._tracker, "_status_lock", None)
+        if lock is None:
+            out["tracker_status"] = "unavailable"
+            return out
+        with lock:
+            out["tracker_status"] = copy.deepcopy(self._tracker.status)
+        return out
 
     def stop(self) -> None:
         """Stop local consumption and leave capture daemons ready for reuse."""
