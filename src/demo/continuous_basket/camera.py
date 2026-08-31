@@ -14,6 +14,7 @@ def capture_catalog_snapshot(
     min_images: int,
     settle_timeout_s: float = 15.0,
     expected_serials: Optional[Iterable[str]] = None,
+    require_decodable: bool = False,
 ) -> int:
     """Request a one-shot snapshot without stopping the live capture stream.
 
@@ -31,6 +32,9 @@ def capture_catalog_snapshot(
     This avoids an NFS negative-directory cache: otherwise a client that polls
     a not-yet-created ``images`` directory can keep seeing zero files after
     the capture PCs have written them.  Only non-empty files count as ready.
+    ``require_decodable`` additionally waits until PNG writers have closed
+    their files.  This is necessary before ArUco/FoundPose reads them: a
+    non-zero NFS file can still be a partial PNG for a short interval.
     """
     if min_images < 1:
         raise ValueError("min_images must be >= 1")
@@ -63,9 +67,26 @@ def capture_catalog_snapshot(
         if failed:
             raise RuntimeError(f"ParaDex snapshot rejected: {failed}")
 
+    def _is_decodable(path: Path) -> bool:
+        if not require_decodable:
+            return True
+        try:
+            # Pillow's load reads the image data (not just the header), so it
+            # rejects a capture-PC PNG that is still being written.  Keep this
+            # lazy to retain the lightweight camera-smoke dependency surface.
+            from PIL import Image
+            with Image.open(path) as image:
+                image.load()
+            return True
+        except (OSError, ValueError):
+            return False
+
     def ready_count() -> int:
         candidates = expected_paths if expected_paths is not None else image_dir.glob("*.png")
-        return sum(1 for path in candidates if path.is_file() and path.stat().st_size > 0)
+        return sum(
+            1 for path in candidates
+            if path.is_file() and path.stat().st_size > 0 and _is_decodable(path)
+        )
 
     deadline = time.monotonic() + float(settle_timeout_s)
     while time.monotonic() < deadline:

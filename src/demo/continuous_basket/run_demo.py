@@ -359,7 +359,7 @@ def _measure_basket_reference(rcc, args, run_dir: Path, expected_serials: Iterab
     image_count = capture_catalog_snapshot(
         rcc, marker_dir, min_images=args.basket_marker_min_views,
         settle_timeout_s=args.basket_marker_snapshot_timeout_s,
-        expected_serials=expected_serials,
+        expected_serials=expected_serials, require_decodable=True,
     )
     # ``locate_marker`` consumes the per-capture camera/calibration sidecars,
     # matching the legacy banana place-target path.
@@ -582,7 +582,7 @@ def main() -> None:
                 n_images = capture_catalog_snapshot(
                     rcc, snapshot_dir, min_images=args.catalog_min_views,
                     settle_timeout_s=args.catalog_snapshot_timeout_s,
-                    expected_serials=active,
+                    expected_serials=active, require_decodable=True,
                 )
                 print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
                 images = read_capture_images(snapshot_dir)
