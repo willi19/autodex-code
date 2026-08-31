@@ -30,6 +30,7 @@ from src.demo.continuous_basket.policy import (
     choose_success_candidates,
 )
 from src.demo.continuous_basket.preflight import build_report, require_ready
+from src.demo.continuous_basket.recording import resolve_signal_generator_params
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 
 try:
@@ -173,6 +174,23 @@ class CatalogPolicyTest(unittest.TestCase):
         self.assertIn("frame id did not advance", advancing_frame_errors(
             before, after, ["capture1"],
         )[0])
+
+    def test_recording_uses_only_unambiguous_discovered_usbtmc_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            devices = Path(tmp)
+            (devices / "usbtmc5").touch()
+            params, note = resolve_signal_generator_params(
+                {"addr": "/dev/usbtmc0"}, device_root=devices,
+            )
+            self.assertEqual(params["addr"], str(devices / "usbtmc5"))
+            self.assertIn("usbtmc5", note)
+
+            (devices / "usbtmc6").touch()
+            params, note = resolve_signal_generator_params(
+                {"addr": "/dev/usbtmc0"}, device_root=devices,
+            )
+            self.assertEqual(params["addr"], "/dev/usbtmc0")
+            self.assertIsNone(note)
 
     def test_basket_marker_offset_uses_marker_frame(self):
         marker_pose = np.eye(4)

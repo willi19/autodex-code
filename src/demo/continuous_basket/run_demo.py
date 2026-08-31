@@ -103,6 +103,7 @@ from src.demo.continuous_basket.policy import (
     choose_success_candidates,
 )
 from src.demo.continuous_basket.preflight import build_report, require_ready
+from src.demo.continuous_basket.recording import resolve_signal_generator_params
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
@@ -568,13 +569,19 @@ def main() -> None:
 
             sync_mode = False
             try:
-                sync_generator = UTGE900(**network_info["signal_generator"]["param"])
+                trigger_params, trigger_note = resolve_signal_generator_params(
+                    network_info["signal_generator"]["param"]
+                )
+                if trigger_note is not None:
+                    print(f"[video] {trigger_note}")
+                sync_generator = UTGE900(**trigger_params)
                 timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
                 sync_mode = True
+                recording_manifest["sync_trigger_device"] = trigger_params["addr"]
             except Exception as exc:
-                # The normal FR3 workstation currently has no /dev/usbtmc0.
-                # Capture PCs can still record one uncut free-running take;
-                # record the downgrade instead of failing before any motion.
+                # If no usable/unique trigger is available, capture PCs can
+                # still record one uncut free-running take. Record the
+                # downgrade instead of failing before any motion.
                 sync_generator = None
                 timestamp_monitor = None
                 recording_manifest["sync_mode"] = "unsynchronized_fallback"
