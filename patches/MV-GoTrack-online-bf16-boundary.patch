@@ -1,0 +1,22 @@
+diff --git a/archive/run_custom_video_gotrack.py b/archive/run_custom_video_gotrack.py
+index 365b17a..338f1b9 100644
+--- a/archive/run_custom_video_gotrack.py
++++ b/archive/run_custom_video_gotrack.py
+@@ -1022,7 +1022,16 @@ def run_refinement_batch(
+ 
+     with torch.no_grad():
+         for iter_idx in range(num_iters):
+-            forward_outputs = model.compute_flow(forward_inputs)
++            # Blackwell xFormers requires FP16/BF16 Q/K/V, but renderer,
++            # PnP, and diagnostics below require FP32/NumPy-compatible data.
++            # Restrict autocast to the neural forward and immediately promote
++            # the two tensors that cross that boundary.
++            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++                forward_outputs = model.compute_flow(forward_inputs)
++            for key in ("flows", "confidences"):
++                value = forward_outputs.get(key)
++                if isinstance(value, torch.Tensor) and value.is_floating_point():
++                    forward_outputs[key] = value.float()
+             total_forward_time += float(forward_outputs["run_time"])
+             total_forward_feature_time += float(forward_outputs.get("feature_time", 0.0))
+             total_forward_decoder_time += float(forward_outputs.get("decoder_time", 0.0))

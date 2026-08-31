@@ -91,7 +91,16 @@ index d1187d2..d212142 100644
          if obj_id in self._mesh_cache:
              return
  
-@@ -483,9 +446,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+@@ -356,3 +319,8 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
++    # GoTrack's neural forward runs under BF16 autocast on Blackwell GPUs.
++    # nvdiffrast's raster/interpolate kernels, however, require float32
++    # attributes and raster buffers.  Keep this geometry-only boundary FP32;
++    # the learned model remains BF16 outside this method.
++    @torch.autocast(device_type="cuda", enabled=False)
+     def _render_mesh_batch(
+         self,
+         mesh_buffers: Dict[str, torch.Tensor],
+@@ -483,9 +451,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
          return_tensors: bool = False,
          background: Optional[structs.Color] = None,
      ) -> structs.Collection:

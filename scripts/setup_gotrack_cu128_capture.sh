@@ -66,13 +66,18 @@ $PIP install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
 # 8. FoundationPose extras + einops
 $PIP install psutil pandas open3d transformations ruamel.yaml einops
 
-# 9. Renderer patch (idempotent — skip if already applied)
-PATCH="$REPO_ROOT/patches/MV-GoTrack-renderer-fix.patch"
-if git apply --reverse --check "$PATCH" 2>/dev/null; then
-    echo "[gotrack-setup] renderer patch already applied"
-else
-    git apply "$PATCH"
-fi
+# 9. GoTrack compatibility patches (idempotent — skip if already applied).
+# The first keeps nvdiffrast FP32; the second restricts BF16 to the neural
+# forward so Blackwell xFormers works without leaking BF16 into NumPy/PnP.
+for PATCH in \
+    "$REPO_ROOT/patches/MV-GoTrack-renderer-fix.patch" \
+    "$REPO_ROOT/patches/MV-GoTrack-online-bf16-boundary.patch"; do
+    if git apply --reverse --check "$PATCH" 2>/dev/null; then
+        echo "[gotrack-setup] already applied: $(basename "$PATCH")"
+    else
+        git apply "$PATCH"
+    fi
+done
 
 # 10. Sanity check
 $PY -c "

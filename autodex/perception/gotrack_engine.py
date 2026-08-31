@@ -370,11 +370,12 @@ class GoTrackEngine:
         )
 
         t0 = _time.perf_counter()
-        # Wrap in bf16 autocast so DINOv2 attention layers receive bf16 q/k/v
-        # → xformers' memory-efficient attention picks up the bf16 kernel on
-        # Blackwell (cap 12.0). Without autocast, fp32 inputs force the slow
-        # native path (xformers' Blackwell-supporting kernels only do fp16/bf16).
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        # Keep the end-to-end online update in FP32.  GoTrack passes renderer
+        # outputs and confidence maps through nvdiffrast and NumPy in this
+        # call chain; BF16 autocast leaks into both boundaries and fails on
+        # current capture-PC builds.  The demo's correctness takes priority
+        # over the optional xFormers BF16 speed path.
+        with torch.autocast(device_type="cuda", enabled=False):
             per_camera_records = _process_group_for_timestep_anchor(
                 device_state=device_state,
                 frame_batch=frame_batch,

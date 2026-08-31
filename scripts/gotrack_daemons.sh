@@ -56,8 +56,8 @@ case "$ACTION" in
         done
         wait
         sleep 2
-        # xformers Blackwell kernels need fp16/bf16 input. gotrack_engine wraps
-        # the forward in torch.autocast(bf16) so xformers is active again.
+        # The current online GoTrack path is explicitly FP32: its renderer and
+        # NumPy confidence summaries do not accept BF16 tensors end-to-end.
         for pc in "${PCS[@]}"; do
             ssh -o ConnectTimeout=3 "$pc" "bash -c 'nohup $PY $DAEMON --robot-ip $ROBOT_IP > $LOG 2>&1 &'"
         done

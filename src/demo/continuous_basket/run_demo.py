@@ -434,7 +434,7 @@ def main() -> None:
                    help="gotrack keeps normal cycles under the 20s inference target; foundpose is a daemon-free fallback")
     p.add_argument("--tracking-timeout-s", type=float, default=1.5,
                    help="max wait for a post-action GoTrack pose")
-    p.add_argument("--tracking-warmup-s", type=float, default=3.0,
+    p.add_argument("--tracking-warmup-s", type=float, default=8.0,
                    help="max wait for first GoTrack pose after a FoundPose init")
     p.add_argument("--tracking-command-timeout-s", type=float, default=3.0,
                    help="per-capture-PC GoTrack daemon command deadline")
