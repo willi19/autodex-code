@@ -14,6 +14,7 @@ from src.demo.continuous_basket.catalog import (
     rank_catalog_detections,
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
+from src.demo.continuous_basket.camera_smoke import advancing_frame_errors
 from src.demo.continuous_basket.policy import (
     LocalRetryPolicy,
     PoseEvidence,
@@ -110,17 +111,33 @@ class CatalogPolicyTest(unittest.TestCase):
                 image_dir = (Path.home() / rel / "images").resolve()
                 image_dir.mkdir(parents=True, exist_ok=True)
                 for idx in range(2):
-                    (image_dir / f"camera{idx}.png").touch()
+                    (image_dir / f"camera{idx}.png").write_bytes(b"not-a-real-png")
                 return {"capture1": {"status": "ok"}}
 
         with tempfile.TemporaryDirectory() as tmp:
             rcc = SnapshotOnlyRcc()
             count = capture_catalog_snapshot(
                 rcc, Path(tmp) / "snapshot", min_images=2, settle_timeout_s=0.2,
+                expected_serials=["camera0", "camera1"],
             )
         self.assertEqual(count, 2)
         self.assertEqual(len(rcc.calls), 1)
         self.assertEqual(rcc.calls[0][1], 1)
+
+    def test_camera_smoke_requires_each_stream_to_advance(self):
+        before = {"error": False, "pc": {
+            "capture1": {"status": "ok", "states": {"cam": "CAPTURING"},
+                         "frame_ids": {"cam": 10}},
+        }}
+        after = {"error": False, "pc": {
+            "capture1": {"status": "ok", "states": {"cam": "CAPTURING"},
+                         "frame_ids": {"cam": 11}},
+        }}
+        self.assertEqual(advancing_frame_errors(before, after, ["capture1"]), [])
+        after["pc"]["capture1"]["frame_ids"]["cam"] = 10
+        self.assertIn("frame id did not advance", advancing_frame_errors(
+            before, after, ["capture1"],
+        )[0])
 
     def test_retry_removes_failed_candidate_without_reset(self):
         keys = [("table", "0", "0"), ("table", "0", "1"), ("table", "0", "2")]

@@ -91,7 +91,23 @@ minutes in a transport retry loop; both thresholds remain CLI-configurable.
 
 Before turning on the robot, do all of the following.
 
-1. Pick 3–6 objects with `v8` successful grasps for the intended hand and
+1. Verify every configured camera without moving the robot. This arms a brief
+   stream, confirms frame IDs advance, writes one snapshot, then releases the
+   camera controller:
+
+   ```bash
+   /home/robot/anaconda3/envs/planner/bin/python \
+     src/demo/continuous_basket/camera_smoke.py --min-snapshot-images 20
+   ```
+
+   The lab NAS has been measured to expose a full 20-camera snapshot over
+   about ten seconds. The smoke check and runner therefore use a 15-second
+   *maximum* wait, while proceeding immediately once their requested minimum
+   number of views is visible; do not lower it to the former 2–5 second value.
+   The runner pre-creates the known serial filenames so NFS cannot cache the
+   missing `images/` directory while capture PCs write the snapshot.
+
+2. Pick 3–6 objects with `v8` successful grasps for the intended hand and
    create FoundPose assets plus GoTrack anchor banks for every one. Run the
    offline readiness check first; it fails before robot motion when an asset,
    successful grasp record, or anchor is absent:
@@ -104,21 +120,21 @@ Before turning on the robot, do all of the following.
 
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
-2. Place a shallow basket at a comfortable robot-frame center. Set
+3. Place a shallow basket at a comfortable robot-frame center. Set
    `--basket-center X Y Z` to the release reference above its open interior;
    start conservatively with `--drop-height 0.05` and a clear vertical path.
    Confirm `--pick-workspace` excludes the basket and its contents; the runner
    uses this 3D region to disambiguate repeated object classes.
-3. Test each object separately with the new runner using `--max-successes 1`.
+4. Test each object separately with the new runner using `--max-successes 1`.
    Check its `result.json` pose evidence, lift verification and drop check.
    The default uses a successful object-frame grasp from another known stable
    tabletop pose when the exact pose has no record, which enables the
    varied-initial-pose demonstration. Pass `--strict-tabletop-success` during
    conservative bring-up to require an exact pose match.
-4. Require multi-camera detector agreement (`--catalog-min-views 2` or more),
+5. Require multi-camera detector agreement (`--catalog-min-views 2` or more),
    then run 3 continuous successes. Do not use a catalogue item whose detector
    prompt frequently matches the basket or another item.
-5. Record the actual demo with one external camera. Keep the ParaDex
+6. Record the actual demo with one external camera. Keep the ParaDex
    controller alive throughout; it is never intentionally reset between
    successful cycles or verified empty-grasp retries.
 

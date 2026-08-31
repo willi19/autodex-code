@@ -371,6 +371,8 @@ def main() -> None:
     p.add_argument("--catalog-min-views", type=int, default=2)
     p.add_argument("--catalog-min-score", type=float, default=0.25)
     p.add_argument("--catalog-gpu", type=int, default=0)
+    p.add_argument("--catalog-snapshot-timeout-s", type=float, default=15.0,
+                   help="maximum wait for the requested NAS-visible snapshot views; returns early when ready")
     p.add_argument("--init-timeout-s", type=float, default=10.0)
     p.add_argument("--init-command-timeout-s", type=float, default=5.0,
                    help="per-capture-PC init-daemon command deadline; fail before robot motion")
@@ -392,6 +394,8 @@ def main() -> None:
     p.add_argument("--track-min-inliers", type=int, default=12)
     p.add_argument("--object-switch-settle-s", type=float, default=1.0)
     p.add_argument("--stream-fps", type=int, default=10)
+    p.add_argument("--run-id", default=None,
+                   help="unique result session name (default: current timestamp; prevents stale snapshots)")
     p.add_argument("--yaw-step", type=int, default=30)
     p.add_argument("--lift-height", type=float, default=0.10)
     p.add_argument("--drop-height", type=float, default=0.05)
@@ -400,7 +404,8 @@ def main() -> None:
     args = p.parse_args()
     if (args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1
             or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0
-            or args.init_command_timeout_s <= 0 or args.tracking_command_timeout_s <= 0):
+            or args.init_command_timeout_s <= 0 or args.tracking_command_timeout_s <= 0
+            or args.catalog_snapshot_timeout_s <= 0):
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
@@ -428,7 +433,9 @@ def main() -> None:
          basket_xyz[1] + args.basket_observe_radius,
          basket_xyz[2] + args.basket_observe_height],
     ], dtype=np.float64)
-    run_dir = Path(project_dir) / "experiment" / args.exp_name / f"{args.arm}_{args.hand}"
+    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = (Path(project_dir) / "experiment" / args.exp_name
+               / f"{args.arm}_{args.hand}" / run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "catalog.json").write_text(json.dumps(_jsonable({
         "objects": [item.__dict__ for item in catalogue], "basket_center": basket_xyz,
@@ -494,6 +501,8 @@ def main() -> None:
             snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
             n_images = capture_catalog_snapshot(
                 rcc, snapshot_dir, min_images=args.catalog_min_views,
+                settle_timeout_s=args.catalog_snapshot_timeout_s,
+                expected_serials=active,
             )
             print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
             images = read_capture_images(snapshot_dir)
