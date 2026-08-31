@@ -121,8 +121,8 @@ Before turning on the robot, do all of the following.
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
    Before a first robot motion, verify the distributed tracker with a saved
-   FoundPose pose. This sends commands only to the capture PCs; it does not
-   construct or move a robot executor:
+   FoundPose pose. This briefly arms the camera stream and sends commands only
+   to capture PCs; it does not construct or move a robot executor:
 
    ```bash
    python src/demo/continuous_basket/gotrack_smoke.py \

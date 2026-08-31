@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Exercise distributed GoTrack without creating any robot motion.
 
-Use a FoundPose world pose captured by a failed/previous demo run.  The script
-sends only GoTrack ``init`` / ``start`` / ``stop`` commands to capture PCs,
-publishes the initial prior pose, and waits for a fused observation.  It never
-constructs a Franka or Inspire executor and never contacts the FCI daemon.
+Use a FoundPose world pose captured by a failed/previous demo run. The script
+arms the capture stream, sends GoTrack ``init`` / ``start`` / ``stop`` commands
+to capture PCs, publishes the initial prior pose, and waits for a fused
+observation. It never constructs a Franka or Inspire executor and never
+contacts the FCI daemon.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ for _paradex_root in (os.environ.get("AUTODEX_PARADEX_ROOT"),
         sys.path.insert(0, str(Path(_paradex_root).expanduser()))
         break
 
+from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
 from paradex.utils.system import get_camera_list, get_pc_ip
 
 from autodex.utils.path import get_obj_root
@@ -78,12 +80,15 @@ def main() -> None:
     parser.add_argument("--anchor-root", default=str(
         REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack/anchor_banks"))
     parser.add_argument("--warmup-s", type=float, default=15.0)
+    parser.add_argument("--stream-fps", type=int, default=10)
+    parser.add_argument("--stream-warmup-s", type=float, default=3.0)
     parser.add_argument("--object-switch-settle-s", type=float, default=2.0)
     parser.add_argument("--command-timeout-s", type=float, default=3.0)
     parser.add_argument("--min-cams", type=int, default=6)
     parser.add_argument("--min-inliers", type=int, default=12)
     args = parser.parse_args()
-    if min(args.warmup_s, args.object_switch_settle_s, args.command_timeout_s) <= 0:
+    if min(args.warmup_s, args.stream_warmup_s, args.object_switch_settle_s,
+           args.command_timeout_s) <= 0 or args.stream_fps < 1:
         parser.error("timing arguments must be positive")
 
     initial = np.asarray(np.load(Path(args.init_pose).expanduser()), dtype=np.float64)
@@ -111,7 +116,23 @@ def main() -> None:
         min_inliers=args.min_inliers,
         command_timeout_ms=round(args.command_timeout_s * 1000), command_retries=1,
     )
+    rcc = remote_camera_controller("continuous_basket_gotrack_smoke", pc_list=args.pc_list,
+                                   stall_timeout=max(15.0, args.warmup_s + 3.0))
     try:
+        # GoTrack reads live SHM rings, rather than images saved by the earlier
+        # FoundPose run. A connected reader reporting frame_id=0 has no data.
+        rcc.arm(syncMode=False, fps=args.stream_fps)
+        rcc.set_stream(True)
+        import time
+        time.sleep(args.stream_warmup_s)
+        status = rcc.get_status()
+        stalled = [pc for pc, info in (status.get("pc") or {}).items()
+                   if not info.get("running")]
+        if stalled:
+            print("GOTRACK_SMOKE_FAILED " + json.dumps({
+                "reason": "camera_stream_not_running", "stalled_pcs": stalled,
+            }, sort_keys=True))
+            raise SystemExit(2)
         session.start(obj_name=args.obj_name, mesh_path=mesh, init_pose_world=initial,
                       settle_s=args.object_switch_settle_s)
         sample = session.wait_for_pose(timeout_s=args.warmup_s)
@@ -128,6 +149,10 @@ def main() -> None:
         }), sort_keys=True))
     finally:
         session.stop()
+        try:
+            rcc.stop()
+        finally:
+            rcc.end()
 
 
 if __name__ == "__main__":
