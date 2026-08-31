@@ -111,7 +111,10 @@ Run the audit again after each session. Do not proceed while it reports
 
 Keep the GoTrack daemons running on capture1/2/3/5/6 and attach one
 standalone (non-Charuco) `6X6_1000` ArUco marker **horizontally** to a rigid
-basket rim fixture. The runner
+basket rim fixture. The runner defaults to the legacy banana marker ID `660`;
+pass `--basket-marker-id ID` only when the basket uses another tag. The marker
+must actually move with the basket: ID `660` on the old cutting-board target
+is not a basket reference. The runner
 triangulates it before it connects to the arm. `--basket-marker-offset` is in
 the marker frame and points from that marker centre to the safe release point
 over the basket interior. First run a one-success check for each class, then
@@ -122,7 +125,7 @@ the uncut sequence:
   src/demo/continuous_basket/run_demo.py \
   --objects apple banana pepsi toothbrush_holder \
   --hand inspire --arm franka --grasp-version v8 \
-  --basket-marker-id MARKER_ID --basket-marker-offset DX DY DZ \
+  --basket-marker-offset DX DY DZ \
   --max-successes 12 --max-cycles 40
 ```
 

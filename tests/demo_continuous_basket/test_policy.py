@@ -15,7 +15,10 @@ from src.demo.continuous_basket.catalog import (
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.camera_smoke import advancing_frame_errors
-from src.demo.continuous_basket.basket_marker import release_reference_from_marker
+from src.demo.continuous_basket.basket_marker import (
+    DEFAULT_BASKET_MARKER_ID,
+    release_reference_from_marker,
+)
 from src.demo.continuous_basket.policy import (
     LocalRetryPolicy,
     PoseEvidence,
@@ -151,6 +154,9 @@ class CatalogPolicyTest(unittest.TestCase):
             np.array([0.5, -0.2, 0.1]), marker_pose, np.array([0.1, 0.0, 0.05]),
         )
         np.testing.assert_allclose(release, [0.5, -0.1, 0.15])
+
+    def test_basket_marker_keeps_legacy_banana_marker_as_default(self):
+        self.assertEqual(DEFAULT_BASKET_MARKER_ID, 660)
 
     def test_basket_marker_rejects_bad_geometry(self):
         with self.assertRaisesRegex(ValueError, "shape"):

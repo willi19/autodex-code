@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import numpy as np
 
+# The standalone 6X6_1000 marker used by the legacy banana place-target demo.
+# It must be attached to the basket fixture for it to serve as a basket marker.
+DEFAULT_BASKET_MARKER_ID = 660
+
 
 def release_reference_from_marker(
     center_robot: np.ndarray,

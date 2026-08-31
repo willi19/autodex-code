@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.demo.continuous_basket.catalog import CatalogObject, parse_catalog
+from src.demo.continuous_basket.basket_marker import DEFAULT_BASKET_MARKER_ID
 from src.demo.continuous_basket.preflight import (
     DEFAULT_ANCHOR_ROOT,
     DEFAULT_ASSETS_BASE,
@@ -347,8 +348,8 @@ def main() -> None:
                         help="use Charuco lift verification during physical collection")
     basket_source = parser.add_mutually_exclusive_group()
     basket_source.add_argument("--basket-center", type=float, nargs=3, default=None)
-    basket_source.add_argument("--basket-marker-id", type=int, default=None,
-                               help="standalone ArUco ID fixed to the basket")
+    basket_source.add_argument("--basket-marker-id", type=int, default=DEFAULT_BASKET_MARKER_ID,
+                               help=f"standalone ArUco ID fixed to the basket (default: {DEFAULT_BASKET_MARKER_ID})")
     parser.add_argument("--basket-marker-dict", default="6X6_1000")
     parser.add_argument("--basket-marker-offset", type=float, nargs=3,
                         default=[0.0, 0.0, 0.0], metavar=("DX", "DY", "DZ"),

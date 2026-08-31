@@ -12,7 +12,7 @@ Example (after pre-onboarding all listed objects):
 
     python src/demo/continuous_basket/run_demo.py \
       --objects banana=banana wood_organizer='wood organizer' \
-      --basket-marker-id 42 --max-successes 12
+      --max-successes 12
 
 The basket release reference is either supplied manually or measured once at
 startup from a standalone ArUco marker.  With a marker, use the local marker
@@ -76,7 +76,10 @@ from src.demo.banana_test.run_demo import (
 )
 from src.demo.banana_test.success_grasps import success_keys_at_pose
 from src.demo.banana_test.place_target import locate_marker
-from src.demo.continuous_basket.basket_marker import release_reference_from_marker
+from src.demo.continuous_basket.basket_marker import (
+    DEFAULT_BASKET_MARKER_ID,
+    release_reference_from_marker,
+)
 from src.demo.continuous_basket.catalog import (
     CatalogObject,
     CatalogRecognizer,
@@ -387,11 +390,13 @@ def main() -> None:
     p.add_argument("--grasp-version", default="v8")
     p.add_argument("--strict-tabletop-success", action="store_true",
                    help="disable object-frame fallback to successes recorded at other stable poses")
-    basket_source = p.add_mutually_exclusive_group(required=True)
+    basket_source = p.add_mutually_exclusive_group()
     basket_source.add_argument("--basket-center", nargs=3, type=float, metavar=("X", "Y", "Z"),
                                help="manual robot-frame basket release reference, metres")
     basket_source.add_argument("--basket-marker-id", type=int, metavar="ID",
-                               help="standalone 6X6_1000 ArUco ID fixed to the basket")
+                               default=DEFAULT_BASKET_MARKER_ID,
+                               help="standalone 6X6_1000 ArUco ID fixed to the basket "
+                                    f"(default: legacy marker {DEFAULT_BASKET_MARKER_ID})")
     p.add_argument("--basket-marker-dict", default="6X6_1000",
                    help="OpenCV dictionary for --basket-marker-id")
     p.add_argument("--basket-marker-offset", nargs=3, type=float, default=[0.0, 0.0, 0.0],
