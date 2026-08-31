@@ -83,9 +83,11 @@ from src.demo.continuous_basket.basket_marker import (
 from src.demo.continuous_basket.catalog import (
     CatalogObject,
     CatalogRecognizer,
+    CatalogMatch,
     parse_catalog,
     read_capture_images,
     require_catalog_runtime,
+    single_object_match,
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.policy import (
@@ -463,13 +465,15 @@ def main() -> None:
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
-    # Do not open a camera session or connect to the arm before the fixed
-    # catalogue detector is available locally. YOLO-E must not attempt an
-    # unpredictable internet download during a live take.
-    try:
-        require_catalog_runtime()
-    except RuntimeError as exc:
-        p.error(str(exc))
+    single_object_mode = len(catalogue) == 1
+    # A YOLO-E class scan only has value when there are two or more known
+    # classes to distinguish. The single-object banana bring-up goes straight
+    # to FoundPose and therefore needs neither ultralytics nor its checkpoint.
+    if not single_object_mode:
+        try:
+            require_catalog_runtime()
+        except RuntimeError as exc:
+            p.error(str(exc))
     # Do this before opening camera/robot sessions: every catalogue entry must
     # be demo-ready even when it is selected only after several successes.
     readiness = build_report(
@@ -540,7 +544,10 @@ def main() -> None:
             "pick_workspace": pick_bounds, "basket_observation_workspace": basket_bounds,
             "policy": "fast_quality_no_silhouette + local_retry_no_home_reset",
         }), indent=2))
-        recognizer = CatalogRecognizer(gpu=args.catalog_gpu, conf_threshold=args.catalog_min_score)
+        if not single_object_mode:
+            recognizer = CatalogRecognizer(gpu=args.catalog_gpu, conf_threshold=args.catalog_min_score)
+        else:
+            print(f"[catalog] one-object fast path: {catalogue[0].name}; YOLO-E skipped")
         planner = GraspPlanner(hand=_planner_robot(args.arm, args.hand))
         if args.verification_mode == "gotrack":
             tracking = LiveGoTrackSession(
@@ -567,22 +574,26 @@ def main() -> None:
             if tracking is not None:
                 tracking.stop()
             cycle_t0 = time.perf_counter()
-            snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
-            n_images = capture_catalog_snapshot(
-                rcc, snapshot_dir, min_images=args.catalog_min_views,
-                settle_timeout_s=args.catalog_snapshot_timeout_s,
-                expected_serials=active,
-            )
-            print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
-            images = read_capture_images(snapshot_dir)
-            match, alternatives = recognizer.identify(
-                images, catalogue, min_views=args.catalog_min_views,
-                min_score=args.catalog_min_score,
-            )
-            if match is None:
-                print(f"[cycle {cycle}] no known object; keep stream alive and try again")
-                _write_trial(run_dir, {"cycle": cycle, "status": "no_catalog_match"})
-                continue
+            if single_object_mode:
+                alternatives: list[CatalogMatch] = [single_object_match(catalogue)]
+                print(f"[cycle {cycle}] one-object FoundPose check: {catalogue[0].name}")
+            else:
+                snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
+                n_images = capture_catalog_snapshot(
+                    rcc, snapshot_dir, min_images=args.catalog_min_views,
+                    settle_timeout_s=args.catalog_snapshot_timeout_s,
+                    expected_serials=active,
+                )
+                print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
+                images = read_capture_images(snapshot_dir)
+                match, alternatives = recognizer.identify(
+                    images, catalogue, min_views=args.catalog_min_views,
+                    min_score=args.catalog_min_score,
+                )
+                if match is None:
+                    print(f"[cycle {cycle}] no known object; keep stream alive and try again")
+                    _write_trial(run_dir, {"cycle": cycle, "status": "no_catalog_match"})
+                    continue
 
             # A basket can contain objects from the same known catalogue.  The
             # detector names classes, not instances, so try its ranked classes

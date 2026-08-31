@@ -13,6 +13,7 @@ from src.demo.continuous_basket.catalog import (
     parse_catalog,
     rank_catalog_detections,
     require_catalog_runtime,
+    single_object_match,
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.camera_smoke import advancing_frame_errors
@@ -46,6 +47,13 @@ class CatalogPolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "checkpoint is missing"):
                 require_catalog_runtime(weights_path=Path(tmp) / "yoloe-26x-seg.pt")
+
+    def test_single_catalogue_bypasses_detector_selection(self):
+        match = single_object_match(parse_catalog(["banana"]))
+        self.assertEqual(match.name, "banana")
+        self.assertEqual(match.supporting_views, 0)
+        with self.assertRaises(ValueError):
+            single_object_match(parse_catalog(["banana", "apple"]))
 
     def test_catalog_requires_multi_view_agreement(self):
         catalogue = parse_catalog(["banana", "brush=tooth brush"])

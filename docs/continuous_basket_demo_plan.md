@@ -123,7 +123,9 @@ Before turning on the robot, do all of the following.
    The robot-host `planner` environment also needs `ultralytics==8.4.15` and
    the local `autodex/perception/thirdparty/weights/yoloe-26x-seg.pt`
    checkpoint. These are checked before camera or arm connection; do not rely
-   on an internet download during a live take.
+   on an internet download during a live take. A `--objects banana` singleton
+   smoke test bypasses YOLO-E completely and goes directly to FoundPose; the
+   package and checkpoint are required only for a two-or-more-object catalogue.
 3. Attach the legacy standalone `6X6_1000` ArUco marker ID `660` horizontally
    to a rigid basket rim fixture. The runner triangulates it from a one-shot camera
    snapshot before it connects to the arm. Set `--basket-marker-offset DX DY DZ`

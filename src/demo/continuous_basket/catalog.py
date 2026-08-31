@@ -85,6 +85,21 @@ def parse_catalog(values: Sequence[str]) -> List[CatalogObject]:
     return out
 
 
+def single_object_match(catalogue: Sequence[CatalogObject]) -> CatalogMatch:
+    """Return the deterministic class selection for a one-object test.
+
+    With a singleton catalogue, a YOLO-E class scan cannot add information:
+    FoundPose still establishes whether that object is actually in the pick
+    workspace.  Skipping the detector makes a banana hardware smoke test
+    independent of the 164 MB YOLO-E checkpoint and removes its inference.
+    """
+    if len(catalogue) != 1:
+        raise ValueError("single-object fast path requires exactly one catalogue item")
+    item = catalogue[0]
+    return CatalogMatch(item.name, item.prompt, score=1.0,
+                        supporting_views=0, best_view_score=1.0)
+
+
 def rank_catalog_detections(
     detections: Mapping[str, Sequence[Optional[Sequence[tuple[np.ndarray, float]]]]],
     catalogue: Sequence[CatalogObject],
