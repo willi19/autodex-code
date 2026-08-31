@@ -120,6 +120,10 @@ Before turning on the robot, do all of the following.
 
    Start `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
+   The robot-host `planner` environment also needs `ultralytics==8.4.15` and
+   the local `autodex/perception/thirdparty/weights/yoloe-26x-seg.pt`
+   checkpoint. These are checked before camera or arm connection; do not rely
+   on an internet download during a live take.
 3. Attach the legacy standalone `6X6_1000` ArUco marker ID `660` horizontally
    to a rigid basket rim fixture. The runner triangulates it from a one-shot camera
    snapshot before it connects to the arm. Set `--basket-marker-offset DX DY DZ`

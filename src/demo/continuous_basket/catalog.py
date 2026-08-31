@@ -14,6 +14,33 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 
 
+def require_catalog_runtime(*, weights_path: Optional[Path] = None) -> None:
+    """Fail before camera/robot setup when the fixed-catalog detector is absent.
+
+    A live take must never rely on an opportunistic model download: it is slow,
+    depends on lab DNS/internet, and hides a missing asset as a generic
+    perception failure.
+    """
+    try:
+        import ultralytics  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "YOLO-E runtime is missing: install the repository-pinned package with "
+            "`/home/robot/anaconda3/envs/planner/bin/pip install "
+            "ultralytics==8.4.15 --no-deps`."
+        ) from exc
+    if weights_path is None:
+        from autodex.perception.mask import YOLOE_WEIGHTS
+        weights_path = Path(YOLOE_WEIGHTS)
+    weights_path = Path(weights_path)
+    if not weights_path.is_file() or weights_path.stat().st_size < 100_000:
+        raise RuntimeError(
+            f"YOLO-E checkpoint is missing: {weights_path}. Download "
+            "yoloe-26x-seg.pt on a networked machine and copy it to that exact path "
+            "before running the continuous demo; do not rely on a runtime download."
+        )
+
+
 @dataclass(frozen=True)
 class CatalogObject:
     """A demo-supported object and its open-vocabulary detector prompt."""
@@ -114,6 +141,7 @@ class CatalogRecognizer:
     def __init__(self, *, gpu: int = 0, conf_threshold: float = 0.25):
         # Import lazily: pure policy tests and planning-only work must not need
         # ultralytics, CUDA, or the YOLO-E weights.
+        require_catalog_runtime()
         from autodex.perception.mask import YoloeSegmentor
 
         self._segmentor = YoloeSegmentor(gpu=gpu, conf_thr=conf_threshold)

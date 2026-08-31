@@ -12,6 +12,7 @@ from src.demo.continuous_basket.catalog import (
     CatalogRecognizer,
     parse_catalog,
     rank_catalog_detections,
+    require_catalog_runtime,
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.camera_smoke import advancing_frame_errors
@@ -41,6 +42,11 @@ except ModuleNotFoundError:  # lightweight policy env intentionally has no OpenC
 
 
 class CatalogPolicyTest(unittest.TestCase):
+    def test_catalog_runtime_rejects_missing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "checkpoint is missing"):
+                require_catalog_runtime(weights_path=Path(tmp) / "yoloe-26x-seg.pt")
+
     def test_catalog_requires_multi_view_agreement(self):
         catalogue = parse_catalog(["banana", "brush=tooth brush"])
         mask = np.ones((2, 2), dtype=np.uint8)

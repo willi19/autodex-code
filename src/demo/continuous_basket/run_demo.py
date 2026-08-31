@@ -85,6 +85,7 @@ from src.demo.continuous_basket.catalog import (
     CatalogRecognizer,
     parse_catalog,
     read_capture_images,
+    require_catalog_runtime,
 )
 from src.demo.continuous_basket.camera import capture_catalog_snapshot
 from src.demo.continuous_basket.policy import (
@@ -462,6 +463,13 @@ def main() -> None:
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
+    # Do not open a camera session or connect to the arm before the fixed
+    # catalogue detector is available locally. YOLO-E must not attempt an
+    # unpredictable internet download during a live take.
+    try:
+        require_catalog_runtime()
+    except RuntimeError as exc:
+        p.error(str(exc))
     # Do this before opening camera/robot sessions: every catalogue entry must
     # be demo-ready even when it is selected only after several successes.
     readiness = build_report(
