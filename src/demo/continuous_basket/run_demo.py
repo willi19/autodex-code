@@ -18,7 +18,9 @@ The basket release reference is either supplied manually or measured once at
 startup from a standalone ArUco marker.  With a marker, use the local marker
 offset to point from the marker centre to the safe release point over the
 basket's open interior.  Start with an empty basket, a clear approach from
-above, and an external continuous camera for the uncut take.
+above.  By default, all capture PCs record one synchronized, uncut take from
+startup through the final human re-placement; use ``--no-video`` only for
+perception or planning bring-up.
 """
 from __future__ import annotations
 
@@ -49,7 +51,7 @@ for _paradex_root in (
 
 from paradex.calibration.utils import load_c2r, save_current_C2R, save_current_camparam
 from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
-from paradex.utils.system import get_camera_list, get_pc_ip
+from paradex.utils.system import get_camera_list, get_pc_ip, network_info
 
 from autodex.perception.init_orchestrator import InitOrchestrator
 from autodex.planner import GraspPlanner
@@ -70,6 +72,9 @@ from src.demo.banana_test.run_demo import (
     _planner_robot,
     _rcc_start,
     _safe,
+    _safe_timestamp_start,
+    _safe_timestamp_stop,
+    _stop_with_timeout,
     _warn_if_not_streaming,
     _wrist_now,
     filter_by_place_reach,
@@ -339,6 +344,11 @@ def _write_trial(run_dir: Path, record: dict) -> None:
     (out / "result.json").write_text(json.dumps(_jsonable(record), indent=2))
 
 
+def _write_recording_manifest(run_dir: Path, record: dict) -> None:
+    """Persist recording paths/state independently from per-attempt results."""
+    (run_dir / "recording.json").write_text(json.dumps(_jsonable(record), indent=2))
+
+
 def _pose_in_bounds(pose_world: np.ndarray, c2r: np.ndarray, bounds: np.ndarray) -> bool:
     lo, hi = np.asarray(bounds, dtype=float).reshape(2, 3)
     xyz = (np.linalg.inv(c2r) @ np.asarray(pose_world, dtype=float))[:3, 3]
@@ -448,6 +458,10 @@ def main() -> None:
     p.add_argument("--track-min-inliers", type=int, default=12)
     p.add_argument("--object-switch-settle-s", type=float, default=1.0)
     p.add_argument("--stream-fps", type=int, default=10)
+    p.add_argument("--video-fps", type=int, default=30,
+                   help="synchronised FPS for the single uncut capture-PC recording")
+    p.add_argument("--no-video", action="store_true",
+                   help="disable the default whole-run camera and robot-state recording")
     p.add_argument("--run-id", default=None,
                    help="unique result session name (default: current timestamp; prevents stale snapshots)")
     p.add_argument("--yaw-step", type=int, default=30)
@@ -461,7 +475,8 @@ def main() -> None:
             or args.init_command_timeout_s <= 0 or args.tracking_command_timeout_s <= 0
             or args.catalog_snapshot_timeout_s <= 0
             or args.basket_marker_snapshot_timeout_s <= 0
-            or args.basket_marker_min_views < 3):
+            or args.basket_marker_min_views < 3 or args.stream_fps < 1
+            or args.video_fps < 1):
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
@@ -516,12 +531,58 @@ def main() -> None:
     tracking = None
     recognizer = None
     executor = None
+    sync_generator = None
+    timestamp_monitor = None
+    camera_recording = False
+    robot_recording = False
+    raw_dir = run_dir / "raw"
+    # Capture PCs resolve paths beneath their shared-data mount. Keep this
+    # relative form aligned with the existing banana demo's video layout.
+    capture_video_rel = str(
+        Path("AutoDex") / "experiment" / args.exp_name / f"{args.arm}_{args.hand}"
+        / run_id / "raw" / "capture"
+    )
+    recording_manifest = {
+        "enabled": not args.no_video,
+        "mode": "single_uncut_take" if not args.no_video else "disabled",
+        "camera_capture_relative": capture_video_rel,
+        "robot_state_directory": str(raw_dir / "robot"),
+        "video_fps": args.video_fps,
+        "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
     successes = 0
     current_item: Optional[CatalogObject] = None
     verifier = PoseVerifier()
     try:
         _ensure_camera_lock(rcc); _clear_camera_errors(rcc)
-        _rcc_start(rcc, "stream", False, fps=args.stream_fps)
+        if args.no_video:
+            _rcc_start(rcc, "stream", False, fps=args.stream_fps)
+        else:
+            # Keep both sinks active for the *entire* run: all FoundPose and
+            # GoTrack stages keep their live SHM stream while the capture PCs
+            # append one synchronized AVI take, including human re-placement.
+            from paradex.io.camera_system.signal_generator import UTGE900
+            from paradex.io.camera_system.timestamp_monitor import TimestampMonitor
+
+            sync_generator = UTGE900(**network_info["signal_generator"]["param"])
+            timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[video] uncut capture start @ {args.video_fps} FPS -> {capture_video_rel}")
+            _rcc_start(rcc, "full", True, capture_video_rel, fps=args.video_fps)
+            camera_recording = True
+            recording_manifest["camera_started_at"] = dt.datetime.now().isoformat(timespec="seconds")
+            recording_manifest["timestamps_started"] = _safe_timestamp_start(
+                timestamp_monitor, str(raw_dir / "timestamps")
+            )
+            try:
+                sync_generator.start(fps=args.video_fps)
+            except Exception as exc:
+                raise RuntimeError(
+                    "continuous video requires the camera sync generator; "
+                    f"it failed to start: {exc!r}"
+                ) from exc
+            recording_manifest["sync_generator_started"] = True
+            _write_recording_manifest(run_dir, recording_manifest)
         _warn_if_not_streaming(rcc)
         if args.basket_center is not None:
             basket_xyz = np.asarray(args.basket_center, dtype=np.float64)
@@ -563,10 +624,20 @@ def main() -> None:
         if args.arm == "franka":
             from src.execution.franka_executor import FrankaExecutor
             executor = FrankaExecutor(hand_name=args.hand)
-            executor.home(clear_view=True)  # one startup home only
         else:
             from autodex.executor.real import RealExecutor
             executor = RealExecutor(hand_name=args.hand)
+        if camera_recording:
+            # State recording starts before clear-view so the robot log covers
+            # every autonomous motion in the same uncut take as the cameras.
+            executor.start_recording(str(raw_dir / "robot"))
+            robot_recording = True
+            recording_manifest["robot_state_started_at"] = dt.datetime.now().isoformat(
+                timespec="seconds"
+            )
+            _write_recording_manifest(run_dir, recording_manifest)
+        if args.arm == "franka":
+            executor.home(clear_view=True)  # one startup home only
 
         for cycle in range(1, args.max_cycles + 1):
             if successes >= args.max_successes:
@@ -806,10 +877,34 @@ def main() -> None:
             tracking.close()
         if recognizer is not None:
             recognizer.close()
+        # Cameras must stop while the trigger is still pulsing; otherwise a
+        # capture PC can block flushing its final frames. This is deliberately
+        # only here, never between pick cycles, to preserve the uncut take.
+        if camera_recording:
+            _stop_with_timeout("rcc.continuous_recording", rcc.stop)
+            recording_manifest["camera_stopped_at"] = dt.datetime.now().isoformat(
+                timespec="seconds"
+            )
+        else:
+            _safe("rcc.stop", rcc.stop)
+        if timestamp_monitor is not None:
+            _safe_timestamp_stop(timestamp_monitor)
+        if sync_generator is not None:
+            _stop_with_timeout("sync_generator", sync_generator.stop)
+        if executor is not None and robot_recording:
+            _stop_with_timeout("executor.continuous_recording", executor.stop_recording)
+            recording_manifest["robot_state_stopped_at"] = dt.datetime.now().isoformat(
+                timespec="seconds"
+            )
+        recording_manifest["ended_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        _write_recording_manifest(run_dir, recording_manifest)
         if executor is not None:
             _safe("executor.shutdown", executor.shutdown)
         _safe("orch.close", orch.close)
-        _safe("rcc.stop", rcc.stop)
+        if timestamp_monitor is not None:
+            _safe("timestamp_monitor.end", timestamp_monitor.end)
+        if sync_generator is not None:
+            _safe("sync_generator.end", sync_generator.end)
         _safe("rcc.end", rcc.end)
 
 
