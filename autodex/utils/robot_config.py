@@ -40,6 +40,15 @@ INSPIRE_LEFT_LINK6_TO_WRIST = np.array([
     [ 0, 0, 0, 1]
 ])
 
+# ── Floor Charuco board ─────────────────────────────────────────────────────
+# Board 11 centre in the robot-base frame, measured on 2026-09-06 from a
+# single 20-camera capture.  All 54 internal corners were triangulated with
+# cam_param/20260821_210132 and mapped with
+# inv(handeye_calibration/20260821_215517/0/C2R.npy), matching
+# pose_world_to_scene_cfg().  This is the board's maximum-clearance point;
+# remeasure after moving the board or recalibrating the camera/robot system.
+CHARUCO_BOARD_11_CENTER_XY = np.array([0.608, 0.153], dtype=np.float64)
+
 # ── FR3 (Franka) ─────────────────────────────────────────────────────────────
 # 7-DOF init = the franka HOME pose saved by paradex hand-eye calibration
 # (system/current/hecalib/franka/home_qpos.npy). Executor homes here and the

@@ -33,10 +33,10 @@ if [ -d "$NAS_WEIGHTS/da3" ]; then
 fi
 
 # YOLOE
-if [ -d "$NAS_WEIGHTS/yoloe" ]; then
+if [ -f "$NAS_WEIGHTS/yoloe/yoloe-26x-seg.pt" ]; then
     echo "  YOLOE..."
-    mkdir -p "$LOCAL_WEIGHTS/yoloe"
-    cp -r "$NAS_WEIGHTS/yoloe/"* "$LOCAL_WEIGHTS/yoloe/"
+    # YoloeSegmentor resolves this exact flat path via YOLOE_WEIGHTS.
+    cp "$NAS_WEIGHTS/yoloe/yoloe-26x-seg.pt" "$LOCAL_WEIGHTS/yoloe-26x-seg.pt"
 fi
 
 echo "Done. Weights at: $LOCAL_WEIGHTS"

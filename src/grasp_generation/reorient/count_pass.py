@@ -10,7 +10,8 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hand", default="inspire_left")
-    parser.add_argument("--version", default="reset_0")
+    parser.add_argument("--version", default="reset_0",
+                        help="BODex reset experiment; suffix is release height in cm")
     parser.add_argument("--bodex_root", default=str(Path.home() / "AutoDex" / "bodex_outputs"))
     parser.add_argument("--per_scene", action="store_true",
                         help="show per-(obj, scene_id) breakdown")
@@ -19,6 +20,8 @@ def main():
     parser.add_argument("--failed_pairs", action="store_true",
                         help="print only 'obj i j' lines for scenes with 0 passes (for next stage)")
     args = parser.parse_args()
+    if not args.version.startswith("reset_"):
+        parser.error("--version must be a reset_<height_mm> experiment")
 
     root = Path(args.bodex_root) / args.hand / args.version
     if not root.is_dir():

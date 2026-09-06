@@ -14,7 +14,7 @@ import trimesh
 import viser
 from scipy.spatial.transform import Rotation as R
 
-from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH
+from autodex.utils.path import get_obj_root
 
 
 SAMPLE_SPHERE_MARGIN = 0.0  # matches BODex after types.py:266 patched to 0
@@ -232,13 +232,19 @@ class SceneBrowser:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--obj_root", type=Path, default=Path(DEFAULT_OBJ_PATH))
+    parser.add_argument("--version", default="v8",
+                        help="v8 tabletop asset contract (only supported value)")
+    parser.add_argument("--obj_root", type=Path, default=None,
+                        help="optional v8 object-root override")
     parser.add_argument("--scene_type", default="reorient_*",
                         help="glob pattern for scene_type dirs (default reorient_*)")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--scene", type=Path, default=None,
                         help="single scene file (legacy mode)")
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("viz_scene supports only --version v8; legacy assets are not used")
+    args.obj_root = args.obj_root or Path(get_obj_root(args.version))
 
     if args.scene:
         # legacy single-scene mode (no browser)

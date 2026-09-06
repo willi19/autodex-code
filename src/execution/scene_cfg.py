@@ -16,8 +16,11 @@ from autodex.utils.conversion import se32cart
 from autodex.utils.path import obj_path
 
 
-# Object bottom must stay >= this z (robot frame) when snapping to table.
-TABLE_SURFACE_Z = -0.1 + 0.039 + 0.1  # 0.039
+# Physical tabletop top in the robot frame.  Keep the object snap and the
+# collision cuboid on exactly the same surface; a lower cuboid lets fingers
+# plan through the real table during the demo.
+TABLE_SURFACE_Z = 0.040
+TABLE_THICKNESS_Z = 0.2
 
 # Objects with y-axis cylindrical symmetry — snap to nearest tabletop pose.
 CYLINDER_OBJECTS = [
@@ -190,8 +193,10 @@ def pose_world_to_scene_cfg(pose_world: np.ndarray, c2r: np.ndarray, obj_name: s
         },
         "cuboid": {
             "table": {
-                "dims": [2, 3, 0.2],
-                "pose": [1.1, 0, -0.1 + 0.037, 1, 0, 0, 0],
+                "dims": [2, 3, TABLE_THICKNESS_Z],
+                # Cuboid pose is its centre, so its upper face is 0.040 m.
+                "pose": [1.1, 0, TABLE_SURFACE_Z - TABLE_THICKNESS_Z / 2,
+                         1, 0, 0, 0],
             }
         },
     }

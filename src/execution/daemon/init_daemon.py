@@ -14,6 +14,7 @@ Channels:
     REQ/REP control:    CommandReceiver  port 6893  (init/run/exit)
     PUB masks:          DataPublisher    port 5006  ("init_mask")
     PUB poses:          DataPublisher    port 5007  ("init_pose")
+    PUB P2 crops:       DataPublisher    optional port 5010 ("p2_semantic")
 
 Init payload (sent once when robot PC selects an object):
     {
@@ -79,13 +80,21 @@ class InitDaemon:
     Pipeline per camera: SHM read → undistort → SAM3 mask (PUB) → FPose (PUB).
     """
 
-    def __init__(self, port_mask: int, port_pose: int, port_cmd: int):
+    def __init__(self, port_mask: int, port_pose: int, port_cmd: int,
+                 port_semantic: int = 0):
         self.port_mask = port_mask
         self.port_pose = port_pose
         self.port_cmd = port_cmd
+        self.port_semantic = int(port_semantic)
 
         self.pub_mask = DataPublisher(port=port_mask, name="init_mask")
         self.pub_pose = DataPublisher(port=port_pose, name="init_pose")
+        # P2 is opt-in.  Standard AutoDex daemons keep their original two PUB
+        # sockets and do not allocate, encode, or transmit semantic images.
+        self.pub_semantic = (
+            DataPublisher(port=self.port_semantic, name="p2_semantic")
+            if self.port_semantic > 0 else None
+        )
 
         # Preload SAM3 now (object-agnostic, slow ~5-30s first time). FoundPose
         # is object-specific so it loads on /init per-object.
@@ -198,6 +207,46 @@ class InitDaemon:
                 logger.warning(f"[mask_pub] {serial}: {exc}")
         threading.Thread(target=_work, daemon=True).start()
 
+    def _publish_p2_semantic_async(self, req_id: int, serial: str,
+                                   image_rgb: np.ndarray,
+                                   mask_bool: np.ndarray) -> bool:
+        """Publish one P2 crop, returning false when this view is edge-clipped.
+
+        This is called only for ``p2_semantic_enabled`` requests and uses its
+        own PUB channel.  The existing SAM3-mask and FoundPose pose payloads
+        keep their original byte format and timing.
+        """
+        if self.pub_semantic is None:
+            return False
+        try:
+            from src.demo.p2.semantic_crops import make_semantic_crop
+
+            crop_rgb, crop_info = make_semantic_crop(image_rgb, mask_bool) or (None, None)
+            if crop_rgb is None:
+                return False
+            crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+            metadata = crop_info.jsonable()
+        except Exception as exc:
+            logger.warning(f"[p2_semantic] {serial}: crop preparation failed: {exc}")
+            return False
+
+        def _work():
+            try:
+                ok, buf = cv2.imencode(".jpg", crop_bgr,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    return
+                meta = [{
+                    "req_id": int(req_id), "serial": serial,
+                    "encoding": "jpeg", "ts": time.time(),
+                    **metadata,
+                }]
+                self.pub_semantic.send_data(meta, [buf.tobytes()])
+            except Exception as exc:
+                logger.warning(f"[p2_semantic] {serial}: publish failed: {exc}")
+        threading.Thread(target=_work, daemon=True).start()
+        return True
+
     def _publish_pose(self, req_id: int, serial: str,
                       result: Optional[Dict[str, Any]],
                       t_fp: float) -> None:
@@ -232,6 +281,10 @@ class InitDaemon:
         info = self.cmd_receiver.event_info.get("run", {}) or {}
         prompt = info.get("prompt", "object")
         req_id = int(info.get("request_id", 0))
+        p2_semantic_enabled = bool(info.get("p2_semantic_enabled", False))
+        if p2_semantic_enabled and self.pub_semantic is None:
+            logger.warning(f"[run {req_id}] P2 semantic requested but daemon has no "
+                           "--port-semantic; normal FoundPose continues")
         capture_dir = info.get("capture_dir")  # disk mode only
         save_capture_dir = info.get("save_capture_dir")  # optional: save live undistorted frames
         if capture_dir:
@@ -263,7 +316,12 @@ class InitDaemon:
                     f"({len(frames)} frames)")
 
         # 2. per-cam pipeline
-        for s in self.my_serials:
+        p2_crop_sent = False
+        # P2's single-PC camera rule is a fixed ascending serial order.  Keep
+        # standard AutoDex's original reader order exactly when P2 is absent.
+        serials_to_process = (sorted(self.my_serials) if p2_semantic_enabled
+                              else self.my_serials)
+        for s in serials_to_process:
             if s not in self.K_undist:
                 continue
             f = frames.get(s)
@@ -301,6 +359,13 @@ class InitDaemon:
 
             # publish mask in background, run FoundPose in parallel
             self._publish_mask_async(req_id, s, mask.astype(bool), t_sam3)
+            # One crop per capture PC, from the first serial whose foreground
+            # bbox is not cut by an image edge.  No mask-ranking or pose check
+            # is added here; P2's robot-side router starts as soon as three PCs
+            # publish one such crop.
+            if p2_semantic_enabled and not p2_crop_sent:
+                p2_crop_sent = self._publish_p2_semantic_async(
+                    req_id, s, rgb, mask.astype(bool))
 
             # FoundPose Stage B
             t2 = time.perf_counter()
@@ -321,7 +386,8 @@ class InitDaemon:
 
     def loop(self) -> None:
         logger.info(f"[daemon] cmd port {self.port_cmd}, mask port {self.port_mask}, "
-                    f"pose port {self.port_pose}")
+                    f"pose port {self.port_pose}, semantic port "
+                    f"{self.port_semantic if self.pub_semantic else 'disabled'}")
         while not self.exit_event.is_set():
             if self.init_event.is_set():
                 try:
@@ -344,6 +410,8 @@ class InitDaemon:
         self.exit_event.set()
         self.pub_mask.close()
         self.pub_pose.close()
+        if self.pub_semantic is not None:
+            self.pub_semantic.close()
 
 
 def main():
@@ -351,8 +419,11 @@ def main():
     parser.add_argument("--port-mask", type=int, default=5006)
     parser.add_argument("--port-pose", type=int, default=5007)
     parser.add_argument("--port-cmd", type=int, default=6893)
+    parser.add_argument("--port-semantic", type=int, default=0,
+                        help="P2 masked-crop PUB port; 0 disables the optional channel")
     args = parser.parse_args()
-    d = InitDaemon(args.port_mask, args.port_pose, args.port_cmd)
+    d = InitDaemon(args.port_mask, args.port_pose, args.port_cmd,
+                   args.port_semantic)
     try:
         d.loop()
     except KeyboardInterrupt:

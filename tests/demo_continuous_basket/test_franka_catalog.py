@@ -10,7 +10,7 @@ import numpy as np
 from src.demo.continuous_basket.catalog import CatalogObject
 from src.demo.continuous_basket.prepare_franka_catalog import (
     _demo_command,
-    _franka_successful_tabletops,
+    _successful_tabletops,
     processing_readiness,
     table_scene_payload,
     write_table_scenes,
@@ -79,7 +79,7 @@ class FrankaCatalogTest(unittest.TestCase):
                 write_table_scenes([item], object_root=root, scene_root=scene_root,
                                    overwrite=False)
 
-    def test_table_scene_metadata_reports_franka_success_pose(self):
+    def test_table_scene_metadata_reports_any_arm_success_pose(self):
         item = CatalogObject("new_object", "new object")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "objects"
@@ -91,8 +91,10 @@ class FrankaCatalogTest(unittest.TestCase):
             grasp = candidate_root / item.name / "table/0/candidate0"
             grasp.mkdir(parents=True)
             (grasp / "wrist_se3.npy").write_bytes(b"pose")
-            (grasp / "result.json").write_text(json.dumps({"success": True, "arm": "franka"}))
-            self.assertEqual(_franka_successful_tabletops(
+            # Collection arm is provenance only; either arm's success makes
+            # this object pose useful to the continuous catalogue.
+            (grasp / "result.json").write_text(json.dumps({"success": True, "arm": "xarm"}))
+            self.assertEqual(_successful_tabletops(
                 item, candidate_root=candidate_root, scene_root=scene_root,
             ), {"000"})
 

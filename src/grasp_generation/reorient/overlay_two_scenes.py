@@ -11,7 +11,7 @@ import trimesh
 import viser
 from scipy.spatial.transform import Rotation as R
 
-from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH
+from autodex.utils.path import get_obj_root
 
 
 def _pos(p): return np.array(p[:3], dtype=np.float64)
@@ -44,8 +44,14 @@ def main():
     parser.add_argument("--scene_a", required=True, help="e.g., 1_2")
     parser.add_argument("--scene_b", required=True, help="e.g., 2_1")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--obj_root", type=Path, default=Path(DEFAULT_OBJ_PATH))
+    parser.add_argument("--version", default="v8",
+                        help="v8 tabletop asset contract (only supported value)")
+    parser.add_argument("--obj_root", type=Path, default=None,
+                        help="optional v8 object-root override")
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("overlay_two_scenes supports only --version v8; legacy assets are not used")
+    args.obj_root = args.obj_root or Path(get_obj_root(args.version))
 
     base = args.obj_root / args.obj / "scene" / args.scene_type
     server = viser.ViserServer(port=args.port)

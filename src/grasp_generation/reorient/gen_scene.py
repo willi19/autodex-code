@@ -7,22 +7,21 @@ import trimesh
 from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 
-from autodex.utils.path import obj_path as _OBJ_PATH
-
-OBJ_ROOT = Path(_OBJ_PATH)
+from autodex.utils.path import get_obj_root
 
 
-def _obj_dir(obj_name: str) -> Path:
-    return OBJ_ROOT / obj_name
+def _obj_dir(obj_name: str, obj_root: str) -> Path:
+    return Path(obj_root) / obj_name
 
 
-def _load_tabletop_pose(obj_name: str, pose_idx: int) -> np.ndarray:
-    p = _obj_dir(obj_name) / "processed_data" / "info" / "tabletop" / f"{pose_idx:03d}.npy"
+def _load_tabletop_pose(obj_name: str, pose_idx: int, obj_root: str) -> np.ndarray:
+    p = (_obj_dir(obj_name, obj_root) / "processed_data" / "info" /
+         "tabletop" / f"{pose_idx:03d}.npy")
     return np.load(p)
 
 
-def _mesh_target_entry(obj_name: str, pose_xyzquat) -> dict:
-    od = _obj_dir(obj_name)
+def _mesh_target_entry(obj_name: str, pose_xyzquat, obj_root: str) -> dict:
+    od = _obj_dir(obj_name, obj_root)
     return {
         "scale": [1.0, 1.0, 1.0],
         "pose": list(map(float, pose_xyzquat)),
@@ -82,6 +81,7 @@ def gen_reorient_scene(
     pose_i_idx: int,
     pose_j_idx: int,
     h: float,
+    obj_root: str,
     thickness: float = 0.01,
     table_size: float = 2.0,
     table_thickness: float = 0.2,
@@ -101,14 +101,14 @@ def gen_reorient_scene(
       - "table_j": pose j's table plane: cuboid perpendicular to d_j, located
                    at distance h beyond the lower extreme along d_j.
     """
-    od = _obj_dir(obj_name)
+    od = _obj_dir(obj_name, obj_root)
     mesh_file = od / ("raw_mesh" if raw_mesh else "processed_data/mesh") / (
         f"{obj_name}.obj" if raw_mesh else "simplified.obj"
     )
     mesh = trimesh.load(mesh_file, process=False, force="mesh")
 
-    Ti = _load_tabletop_pose(obj_name, pose_i_idx)
-    Tj = _load_tabletop_pose(obj_name, pose_j_idx)
+    Ti = _load_tabletop_pose(obj_name, pose_i_idx, obj_root)
+    Tj = _load_tabletop_pose(obj_name, pose_j_idx, obj_root)
     Ri, ti = Ti[:3, :3], Ti[:3, 3]
     Rj = Tj[:3, :3]
 
@@ -202,7 +202,7 @@ def gen_reorient_scene(
 
     return {
         "scene": {
-            "mesh": {"target": _mesh_target_entry(obj_name, _se3_to_xyzquat(Ti))},
+            "mesh": {"target": _mesh_target_entry(obj_name, _se3_to_xyzquat(Ti), obj_root)},
             "cuboid": cuboids,
         },
         "meta": {
@@ -211,6 +211,7 @@ def gen_reorient_scene(
             "pose_j": f"{pose_j_idx:03d}",
             "h": h,
             "thickness": thickness,
+            "version": "v8",
         },
     }
 
@@ -222,17 +223,23 @@ def main():
     parser.add_argument("--j", type=int, required=True, help="pose j (target after reorient)")
     parser.add_argument("--h", type=float, required=True,
                         help="distance from lower extreme to pose j table along d_j (meters)")
+    parser.add_argument("--version", default="v8",
+                        help="v8 tabletop asset contract (only supported value)")
     parser.add_argument("--thickness", type=float, default=0.01)
     parser.add_argument("--out", type=str, default=None,
                         help="output json; default outputs/reorient_scenes/{obj}/{i}_{j}_h{h}.json")
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("gen_scene supports only --version v8; legacy assets are not used")
+    obj_root = get_obj_root(args.version)
 
     scene = gen_reorient_scene(
-        args.obj, args.i, args.j, args.h, thickness=args.thickness
+        args.obj, args.i, args.j, args.h, thickness=args.thickness,
+        obj_root=obj_root,
     )
     default_name = f"{args.i:03d}_{args.j:03d}_h{int(round(args.h * 1000))}.json"
     out_path = Path(args.out) if args.out else (
-        Path(__file__).resolve().parents[3] / "outputs" / "reorient_scenes"
+        Path(__file__).resolve().parents[3] / "outputs" / "reorient_scenes" / args.version
         / args.obj / default_name
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

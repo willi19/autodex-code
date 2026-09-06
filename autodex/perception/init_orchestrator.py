@@ -342,6 +342,7 @@ class InitOrchestrator:
         timeout_s: float = 15.0,
         capture_dir: Optional[str] = None,
         save_capture_dir: Optional[str] = None,
+        run_info_extra: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """Trigger one capture across all capture PCs and return raw payloads.
 
@@ -357,6 +358,13 @@ class InitOrchestrator:
 
         t_dispatch = time.perf_counter()
         run_info = {"request_id": int(request_id), "prompt": prompt}
+        if run_info_extra:
+            protected = {"request_id", "prompt", "capture_dir", "save_capture_dir"}
+            overlap = protected & set(run_info_extra)
+            if overlap:
+                raise ValueError("run_info_extra may not override "
+                                 + ", ".join(sorted(overlap)))
+            run_info.update(run_info_extra)
         if capture_dir is not None:
             run_info["capture_dir"] = _to_home_relative(capture_dir)
         if save_capture_dir is not None:

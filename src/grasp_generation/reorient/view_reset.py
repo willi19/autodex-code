@@ -11,7 +11,7 @@ Object pose during lift/rotate/place is interpolated between phase keyframes
 
 Usage:
     python src/grasp_generation/reorient/view_reset.py \
-        --plan_dir outputs/reset_plans/inspire_left/attached_container/reorient_0/0_16/r0.30_t090/605 \
+        --plan_dir outputs/reset_plans/v8/inspire_left/attached_container/reorient_0/0_16/r0.30_t090/605 \
         --port 8080
 """
 
@@ -29,7 +29,7 @@ from scipy.spatial.transform import Rotation as Rot
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "paradex"))
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from autodex.utils.path import obj_path, project_dir, repo_dir
+from autodex.utils.path import get_obj_root, project_dir, repo_dir
 
 
 URDF_BY_HAND = {
@@ -156,9 +156,9 @@ def preload_sweep_cells(sweep_dir: Path):
     return xs, tzs, cells, summary
 
 
-def discover_pair_dirs(obj: str, h_cm: int, hand: str) -> list:
+def discover_pair_dirs(obj: str, h_cm: int, hand: str, version: str = "v8") -> list:
     """List all pair subdirs containing sweep_summary.json."""
-    obj_root = (Path(repo_dir) / "outputs" / "reset_cache" / hand / obj
+    obj_root = (Path(repo_dir) / "outputs" / "reset_cache" / version / hand / obj
                 / f"reorient_{h_cm}")
     if not obj_root.exists():
         return []
@@ -291,10 +291,14 @@ def main():
     parser.add_argument("--obj", default=None, help="Object name (multi-pair explorer)")
     parser.add_argument("--h_cm", type=int, default=None, help="lift height (multi-pair)")
     parser.add_argument("--hand", default="inspire_left")
+    parser.add_argument("--version", default="v8",
+                        help="v8 reset/tabletop asset contract (only supported value)")
     parser.add_argument("--x", type=float, default=None, help="pickup x (single-cell lookup)")
     parser.add_argument("--tz", type=float, default=None, help="pickup theta_z deg")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("view_reset supports only --version v8; legacy assets are not used")
 
     # Mode selection:
     #   --plan_dir            : single trajectory replay
@@ -320,10 +324,10 @@ def main():
         parser.error("specify one of: --plan_dir | --sweep_dir | (--obj + --h_cm)")
 
     if multi_pair:
-        pair_dirs = discover_pair_dirs(args.obj, args.h_cm, args.hand)
+        pair_dirs = discover_pair_dirs(args.obj, args.h_cm, args.hand, args.version)
         if not pair_dirs:
             raise RuntimeError(
-                f"No sweep results under outputs/reset_cache/{args.hand}/{args.obj}"
+                f"No sweep results under outputs/reset_cache/{args.version}/{args.hand}/{args.obj}"
                 f"/reorient_{args.h_cm}. Run sweep_reset.py first."
             )
         # Use a successful cell for sample metadata if any exists; otherwise
@@ -355,10 +359,9 @@ def main():
         else:
             # No successful cell anywhere — still open the viewer to inspect
             # the fail patterns. Default object at canonical Ti from first pair.
-            from autodex.utils.path import obj_path as _obj_path
             first_summary = json.load(open(pair_dirs[0] / "sweep_summary.json"))
             i0 = first_summary["i"]
-            Ti = np.load(Path(_obj_path) / args.obj / "processed_data"
+            Ti = np.load(Path(get_obj_root(args.version)) / args.obj / "processed_data"
                          / "info" / "tabletop" / f"{i0:03d}.npy")
             meta = {
                 "hand": args.hand, "obj_name": args.obj,
@@ -421,8 +424,9 @@ def main():
     ee_link = EE_LINK_BY_HAND[hand]
 
     # Object mesh (use raw_mesh with texture if available)
-    raw = Path(obj_path) / obj_name / "raw_mesh" / f"{obj_name}.obj"
-    simp = Path(obj_path) / obj_name / "processed_data" / "mesh" / "simplified.obj"
+    asset_root = Path(get_obj_root(args.version))
+    raw = asset_root / obj_name / "raw_mesh" / f"{obj_name}.obj"
+    simp = asset_root / obj_name / "processed_data" / "mesh" / "simplified.obj"
     mesh_path = raw if raw.exists() else simp
     obj_mesh = trimesh.load(mesh_path, force="mesh", process=False)
     try:

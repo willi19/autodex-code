@@ -78,7 +78,7 @@ def main() -> None:
         parser.error("fps/count/time arguments must be positive")
 
     output = (Path(args.snapshot_dir).expanduser() if args.snapshot_dir else
-              Path.home() / "shared_data/AutoDex/experiment/continuous_basket_demo/camera_smoke"
+              Path.home() / "shared_data/AutoDex/experiment/continuous_basket/camera_smoke"
               / dt.datetime.now().strftime("%Y%m%d_%H%M%S"))
     from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
 

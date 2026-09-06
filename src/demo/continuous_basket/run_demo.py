@@ -28,6 +28,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -103,7 +104,16 @@ from src.demo.continuous_basket.policy import (
     choose_success_candidates,
 )
 from src.demo.continuous_basket.preflight import build_report, require_ready
-from src.demo.continuous_basket.recording import resolve_signal_generator_params
+from src.demo.continuous_basket.recording import (
+    autodex_session_relative,
+    create_session_dir,
+    resolve_signal_generator_params,
+    should_auto_upload,
+)
+from src.demo.continuous_basket.tabletop import (
+    load_mesh_vertices,
+    snap_pose_world_to_table,
+)
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
 from src.execution.scene_cfg import pose_world_to_scene_cfg
 from src.experiment.reset.tabletop_pose import classify_tabletop_pose
@@ -147,6 +157,39 @@ def _object_paths(item: CatalogObject, grasp_version: str) -> tuple[Path, Path]:
             f"FoundPose assets missing for {item.name}: {repre}; onboard before the demo"
         )
     return mesh, assets
+
+
+def _planning_pose_on_table(
+    pose_world: np.ndarray,
+    item: CatalogObject,
+    grasp_version: str,
+    c2r: np.ndarray,
+    *,
+    enabled: bool,
+    max_raise_m: float,
+    mesh_vertices: dict[str, np.ndarray],
+) -> tuple[np.ndarray, dict]:
+    """Keep the observed pose intact while correcting only the planner input."""
+    if not enabled:
+        return pose_world, {"enabled": False, "applied": False}
+    vertices = mesh_vertices.get(item.name)
+    if vertices is None:
+        mesh_path, _assets = _object_paths(item, grasp_version)
+        vertices = load_mesh_vertices(mesh_path)
+        mesh_vertices[item.name] = vertices
+    planning_pose, info = snap_pose_world_to_table(
+        pose_world, c2r, vertices, max_raise_m=max_raise_m
+    )
+    info["enabled"] = True
+    if info["applied"]:
+        print("[table] raised planning pose by "
+              f"{info['raise_m'] * 1000:.1f} mm "
+              f"(mesh bottom {info['mesh_bottom_z_robot']:.4f} m)")
+    elif info["mesh_bottom_z_robot"] < info["surface_z_robot"]:
+        print("[table] pose is below the virtual table by "
+              f"{(info['surface_z_robot'] - info['mesh_bottom_z_robot']) * 1000:.1f} mm; "
+              "correction exceeds --table-snap-max-m and was refused")
+    return planning_pose, info
 
 
 def _setup_object(
@@ -211,17 +254,21 @@ def _observe_fast(orch: InitOrchestrator, item: CatalogObject, out_dir: Path,
 
 
 def _candidate_order(item: CatalogObject, hand: str, version: str,
-                     pose_robot: np.ndarray, arm: str,
+                     pose_robot: np.ndarray,
                      strict_tabletop: bool) -> tuple[list, Optional[str], dict]:
     obj_root = get_obj_root(version)
     tabletop = classify_tabletop_pose(pose_robot, item.name, obj_root)
     stem = tabletop["filename"].replace(".npy", "") if tabletop else None
-    at_pose, any_pose = success_keys_at_pose(item.name, hand, version, stem, arm=arm)
+    # Historical success belongs to the object+hand candidate, not to the arm
+    # that will execute this take.  The selected arm is still checked below by
+    # IK, collision, lift/carry planning, and the execution preflight.
+    at_pose, any_pose = success_keys_at_pose(item.name, hand, version, stem)
     candidates, source = choose_success_candidates(
         at_pose, any_pose, strict_tabletop=strict_tabletop,
     )
     info = dict(tabletop or {})
     info["candidate_source"] = source
+    info["candidate_provenance"] = "any_arm"
     info["matched_tabletop_successes"] = len(at_pose)
     info["other_tabletop_successes"] = len(any_pose)
     return list(candidates), stem, info
@@ -237,7 +284,7 @@ def _plan_attempt(planner: GraspPlanner, executor, item: CatalogObject, candidat
     )
     pose_robot = np.linalg.inv(c2r) @ pose_world
     order, tabletop_stem, tabletop = _candidate_order(item, hand, args.grasp_version,
-                                                       pose_robot, args.arm,
+                                                       pose_robot,
                                                        args.strict_tabletop_success)
     # Keep only catalog/pose-compatible successful grasps.  On a retry the
     # policy removes the candidate that just missed, while retaining the same
@@ -430,7 +477,8 @@ def main() -> None:
                    help="z extent above --basket-center for post-drop verification (m)")
     p.add_argument("--max-successes", type=int, default=12)
     p.add_argument("--max-cycles", type=int, default=40,
-                   help="safety cap including failed/retried objects")
+                   help="safety cap on selected grasp trials; idle camera scans while waiting "
+                        "for a person to place an object do not consume it")
     p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--pc-list", nargs="+", default=DEFAULT_PC_LIST)
     p.add_argument("--catalog-min-views", type=int, default=2)
@@ -463,13 +511,23 @@ def main() -> None:
                    help="FPS for the single uncut capture-PC recording (synchronised when trigger is present)")
     p.add_argument("--no-video", action="store_true",
                    help="disable the default whole-run camera and robot-state recording")
-    p.add_argument("--run-id", default=None,
-                   help="unique result session name (default: current timestamp; prevents stale snapshots)")
+    p.add_argument("--plan-only", action="store_true",
+                   help="stop after FoundPose/GoTrack and a full collision/lift/carry plan; do not execute a pick")
+    p.add_argument(
+        "--no-upload-video", action="store_true",
+        help="leave the completed raw AVI on capture PCs instead of automatically "
+             "uploading and verifying this timestamped session on NAS",
+    )
+    p.add_argument("--table-snap", action=argparse.BooleanOptionalAction, default=True,
+                   help="raise only the planner pose when its mesh is slightly below the table")
+    p.add_argument("--table-snap-max-m", type=float, default=0.015,
+                   help="maximum safe vertical FoundPose correction (default: 0.015 m)")
     p.add_argument("--yaw-step", type=int, default=30)
     p.add_argument("--lift-height", type=float, default=0.10)
     p.add_argument("--drop-height", type=float, default=0.05)
     p.add_argument("--retreat-height", type=float, default=0.15)
-    p.add_argument("--exp-name", default="continuous_basket_demo")
+    p.add_argument("--exp-name", default="continuous_basket",
+                   help="experiment family below AutoDex/experiment")
     args = p.parse_args()
     if (args.max_successes < 1 or args.max_retries < 1 or args.yaw_step < 1
             or args.tracking_timeout_s <= 0 or args.tracking_warmup_s <= 0
@@ -477,7 +535,7 @@ def main() -> None:
             or args.catalog_snapshot_timeout_s <= 0
             or args.basket_marker_snapshot_timeout_s <= 0
             or args.basket_marker_min_views < 3 or args.stream_fps < 1
-            or args.video_fps < 1):
+            or args.video_fps < 1 or args.table_snap_max_m < 0):
         p.error("retry/count/timing arguments must be positive")
 
     catalogue = parse_catalog(args.objects)
@@ -497,7 +555,7 @@ def main() -> None:
         assets_base=ASSETS_BASE,
         candidate_root=Path(project_dir) / "candidates" / args.hand / args.grasp_version,
         anchor_root=Path(args.tracking_anchor_root).expanduser(),
-        require_gotrack=args.verification_mode == "gotrack", arm=args.arm,
+        require_gotrack=args.verification_mode == "gotrack",
     )
     try:
         require_ready(readiness)
@@ -506,10 +564,13 @@ def main() -> None:
     pick_bounds = np.asarray(args.pick_workspace, dtype=np.float64).reshape(2, 3)
     if np.any(pick_bounds[1] <= pick_bounds[0]):
         p.error("pick-workspace max bounds must exceed min bounds")
-    run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = (Path(project_dir) / "experiment" / args.exp_name
-               / f"{args.arm}_{args.hand}" / run_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir, session_id = create_session_dir(
+        Path(project_dir), experiment_name=args.exp_name,
+        arm=args.arm, hand=args.hand,
+        object_names=[item.name for item in catalogue],
+    )
+    session_rel = autodex_session_relative(Path(project_dir), run_dir)
+    print(f"[session] {run_dir}")
     save_current_C2R(str(run_dir)); save_current_camparam(str(run_dir))
     c2r = load_c2r(str(run_dir))
 
@@ -522,7 +583,7 @@ def main() -> None:
     extrinsics = {s: value for s, value in extrinsics.items() if s in active}
     pc_ips = [get_pc_ip(pc) for pc in args.pc_list]
 
-    rcc = remote_camera_controller("continuous_basket_demo", pc_list=args.pc_list,
+    rcc = remote_camera_controller("continuous_basket", pc_list=args.pc_list,
                                    stall_timeout=15.0)
     orch = InitOrchestrator(
         pc_list=args.pc_list, capture_ips=pc_ips,
@@ -536,23 +597,38 @@ def main() -> None:
     timestamp_monitor = None
     camera_recording = False
     robot_recording = False
+    # ``clear_view`` is deliberately excluded: only a planned pick lift means
+    # this take contains usable demonstration motion and should auto-upload.
+    robot_motion_started = False
     raw_dir = run_dir / "raw"
-    # Capture PCs resolve paths beneath their shared-data mount. Keep this
-    # relative form aligned with the existing banana demo's video layout.
-    capture_video_rel = str(
-        Path("AutoDex") / "experiment" / args.exp_name / f"{args.arm}_{args.hand}"
-        / run_id / "raw" / "capture"
-    )
+    # Capture PCs resolve paths beneath their *local* capture roots.  The
+    # same canonical session relative path is used for the NAS result root,
+    # so upload never needs to reconstruct paths from an ad-hoc run name.
+    capture_video_path = session_rel / "raw" / "capture"
+    capture_video_rel = capture_video_path.as_posix()
+    nas_video_path = session_rel / "videos" / "capture"
     recording_manifest = {
+        "schema_version": 2,
+        "session_id": session_id,
+        "session_relative": session_rel.as_posix(),
         "enabled": not args.no_video,
         "mode": "single_uncut_take" if not args.no_video else "disabled",
         "camera_capture_relative": capture_video_rel,
-        "robot_state_directory": str(raw_dir / "robot"),
+        "nas_video_relative": nas_video_path.as_posix(),
+        "robot_state_relative": (session_rel / "raw" / "robot").as_posix(),
+        "capture_pc_list": list(args.pc_list),
+        "camera_serials": sorted(active),
+        "upload_command": (
+            "python src/demo/continuous_basket/upload_recording.py --session "
+            f"{session_rel.as_posix()}"
+        ),
+        "upload_state": "pending" if not args.no_video else "disabled",
         "video_fps": args.video_fps,
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
     successes = 0
     current_item: Optional[CatalogObject] = None
+    mesh_vertices: dict[str, np.ndarray] = {}
     verifier = PoseVerifier()
     try:
         _ensure_camera_lock(rcc); _clear_camera_errors(rcc)
@@ -663,31 +739,40 @@ def main() -> None:
         if args.arm == "franka":
             executor.home(clear_view=True)  # one startup home only
 
-        for cycle in range(1, args.max_cycles + 1):
+        # A camera scan is not a trial.  In particular, after a successful
+        # drop the same known object remains visible in the basket, while a
+        # person may take an arbitrary amount of time to put the next object
+        # into the pick area.  Do not burn the safety cap during that idle
+        # period: ``max_cycles`` counts only selections that reached grasp
+        # planning, and Ctrl-C remains the deliberate way to end an idle take.
+        cycle = 0
+        scan = 0
+        while cycle < args.max_cycles:
             if successes >= args.max_successes:
                 break
+            scan += 1
             if tracking is not None:
                 tracking.stop()
             cycle_t0 = time.perf_counter()
             if single_object_mode:
                 alternatives: list[CatalogMatch] = [single_object_match(catalogue)]
-                print(f"[cycle {cycle}] one-object FoundPose check: {catalogue[0].name}")
+                print(f"[scan {scan}] one-object FoundPose check: {catalogue[0].name}")
             else:
-                snapshot_dir = run_dir / "catalog_snapshots" / f"{cycle:03d}"
+                snapshot_dir = run_dir / "catalog_snapshots" / f"{scan:03d}"
                 n_images = capture_catalog_snapshot(
                     rcc, snapshot_dir, min_images=args.catalog_min_views,
                     settle_timeout_s=args.catalog_snapshot_timeout_s,
                     expected_serials=active, require_decodable=True,
                 )
-                print(f"[cycle {cycle}] live snapshot: {n_images} camera images")
+                print(f"[scan {scan}] live snapshot: {n_images} camera images")
                 images = read_capture_images(snapshot_dir)
                 match, alternatives = recognizer.identify(
                     images, catalogue, min_views=args.catalog_min_views,
                     min_score=args.catalog_min_score,
                 )
                 if match is None:
-                    print(f"[cycle {cycle}] no known object; keep stream alive and try again")
-                    _write_trial(run_dir, {"cycle": cycle, "status": "no_catalog_match"})
+                    print(f"[scan {scan}] no known catalogue object; waiting for placement")
+                    _write_trial(run_dir, {"scan": scan, "status": "no_catalog_match"})
                     continue
 
             # A basket can contain objects from the same known catalogue.  The
@@ -697,25 +782,43 @@ def main() -> None:
             pose_world = None
             perception = {}
             selected_match = None
+            scan_observations = []
             for candidate_match in alternatives:
                 candidate_item = next(x for x in catalogue if x.name == candidate_match.name)
                 if current_item != candidate_item:
                     _setup_object(orch, candidate_item, args, intrinsics, extrinsics,
                                   (h, w), pc_serials)
                     current_item = candidate_item
-                candidate_dir = run_dir / "init" / f"{cycle:03d}_catalog_{candidate_item.name}"
+                candidate_dir = run_dir / "init" / f"{scan:03d}_catalog_{candidate_item.name}"
                 candidate_pose, candidate_timing = _observe_fast(
                     orch, candidate_item, candidate_dir, args, c2r, pick_bounds)
+                scan_observations.append({
+                    "object": candidate_item.name,
+                    "catalog_score": candidate_match.score,
+                    "supporting_views": candidate_match.supporting_views,
+                    "pose_in_pick_workspace": candidate_pose is not None,
+                    "perception": candidate_timing,
+                })
                 if candidate_pose is not None:
                     item, pose_world, perception = candidate_item, candidate_pose, candidate_timing
                     selected_match = candidate_match
-                    print(f"[cycle {cycle}] selected {item.name} score={candidate_match.score:.2f} "
-                          f"views={candidate_match.supporting_views}")
                     break
             if item is None:
-                _write_trial(run_dir, {"cycle": cycle, "status": "no_pose_in_pick_workspace",
-                                        "catalog": [x.__dict__ for x in alternatives]})
+                rejected = sum(len(obs["perception"].get("outside_workspace", []))
+                               for obs in scan_observations)
+                print(f"[scan {scan}] FoundPose has no pose in pick workspace "
+                      f"({rejected} outside pose(s)); waiting for placement")
+                _write_trial(run_dir, {
+                    "scan": scan,
+                    "status": "no_pose_in_pick_workspace",
+                    "catalog": [x.__dict__ for x in alternatives],
+                    "observations": scan_observations,
+                })
                 continue
+
+            cycle += 1
+            print(f"[scan {scan} trial {cycle}] selected {item.name} "
+                  f"score={selected_match.score:.2f} views={selected_match.supporting_views}")
 
             if tracking is not None:
                 mesh_path, _assets = _object_paths(item, args.grasp_version)
@@ -753,15 +856,21 @@ def main() -> None:
                                             "object": item.name, "status": "perception_failed",
                                             "perception": perception})
                     break
-                before_robot = np.linalg.inv(c2r) @ pose_world
+                planning_pose_world, table_snap = _planning_pose_on_table(
+                    pose_world, item, args.grasp_version, c2r,
+                    enabled=args.table_snap, max_raise_m=args.table_snap_max_m,
+                    mesh_vertices=mesh_vertices,
+                )
+                perception = {**perception, "table_snap": table_snap}
+                before_robot = np.linalg.inv(c2r) @ planning_pose_world
                 if retry is None:
                     order, _stem, _tabletop = _candidate_order(item, args.hand, args.grasp_version,
-                                                                before_robot, args.arm,
+                                                                before_robot,
                                                                 args.strict_tabletop_success)
                     retry = LocalRetryPolicy(order, max_attempts=args.max_retries)
                 result, plan_info, prepared = _plan_attempt(
                     planner, executor, item, retry.remaining_candidates(),
-                    pose_world, c2r, basket_xyz, args,
+                    planning_pose_world, c2r, basket_xyz, args,
                 )
                 if result is None:
                     failed_key = tuple(plan_info["candidate"]) if plan_info.get("candidate") else None
@@ -776,8 +885,18 @@ def main() -> None:
                         reuse_observation = True
                         continue
                     break
+                if args.plan_only:
+                    _write_trial(run_dir, {
+                        "cycle": cycle, "attempt": attempt, "object": item.name,
+                        "status": "plan_ready_no_motion", "perception": perception,
+                        "plan": plan_info,
+                    })
+                    print("[plan-only] grasp, lift, and basket-carry plan are ready; "
+                          "no pick command was sent")
+                    return
                 # First automatic outcome: re-observe after the physical lift.
                 lift_started = time.time()
+                robot_motion_started = True
                 executor.execute(result, planner=planner, scene_cfg=plan_info["scene_cfg"],
                                  lift_height=args.lift_height,
                                  lift_traj_override=prepared["lift_traj"],
@@ -922,6 +1041,10 @@ def main() -> None:
             )
         recording_manifest["ended_at"] = dt.datetime.now().isoformat(timespec="seconds")
         _write_recording_manifest(run_dir, recording_manifest)
+        if camera_recording:
+            print("[video] NAS upload command:")
+            print("  python src/demo/continuous_basket/upload_recording.py \\")
+            print(f"    --session {session_rel.as_posix()}")
         if executor is not None:
             _safe("executor.shutdown", executor.shutdown)
         _safe("orch.close", orch.close)
@@ -930,6 +1053,46 @@ def main() -> None:
         if sync_generator is not None:
             _safe("sync_generator.end", sync_generator.end)
         _safe("rcc.end", rcc.end)
+        # A normal take is not complete until the uncut camera AVI files are
+        # present on NAS. Run the narrowly scoped uploader only after every
+        # robot/camera resource is closed. On Ctrl-C keep raw files intact so
+        # the operator can explicitly decide whether to upload the partial take.
+        normal_exit = sys.exc_info()[0] is None
+        if should_auto_upload(
+            camera_recording=camera_recording,
+            uploads_deferred=args.no_upload_video,
+            normal_exit=normal_exit,
+            robot_motion_started=robot_motion_started,
+        ):
+            if normal_exit:
+                upload_command = [
+                    sys.executable,
+                    str(REPO_ROOT / "src/demo/continuous_basket/upload_recording.py"),
+                    "--session", session_rel.as_posix(),
+                ]
+                print("[video] uploading this completed take to NAS...")
+                result = subprocess.run(upload_command, check=False)
+                recording_manifest["upload_state"] = (
+                    "verified" if result.returncode == 0 else "failed"
+                )
+                recording_manifest["upload_returncode"] = result.returncode
+                _write_recording_manifest(run_dir, recording_manifest)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "continuous take camera upload failed; raw AVI files were retained on "
+                        "capture PCs for a retry with the printed upload command"
+                    )
+        elif camera_recording and not args.no_upload_video:
+            recording_manifest["upload_state"] = (
+                "skipped_interrupted" if not normal_exit else "deferred_no_robot_motion"
+            )
+            _write_recording_manifest(run_dir, recording_manifest)
+            if normal_exit:
+                print("[video] no planned pick motion occurred; raw AVI files were kept on "
+                      "capture PCs and automatic NAS upload was skipped")
+        elif camera_recording:
+            recording_manifest["upload_state"] = "deferred"
+            _write_recording_manifest(run_dir, recording_manifest)
 
 
 if __name__ == "__main__":

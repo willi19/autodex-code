@@ -1,5 +1,5 @@
-"""Quick diagnostic: take existing inspire_left/v3 grasps and check how many
-clear BOTH table_i and table_j of each reorient_0 scene.
+"""Quick diagnostic: take existing v8 grasps and check how many clear BOTH
+table_i and table_j of each v8 reorient scene.
 
 Wrist_se3 is object-frame in BODex output, so it transfers cleanly across
 scenes that have the same object — just plug into the new scene's object pose.
@@ -12,7 +12,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from autodex.planner.planner import GraspPlanner
-from autodex.utils.path import obj_path as OBJ_PATH
+from autodex.utils.path import get_candidate_path, get_obj_root
 
 
 def _xyzquat_to_T(p):
@@ -22,8 +22,8 @@ def _xyzquat_to_T(p):
     return T
 
 
-def gather_v3(hand, obj, max_g):
-    root = Path.home() / "AutoDex" / "bodex_outputs" / hand / "v3" / obj
+def gather_v8(hand, obj, max_g):
+    root = Path(get_candidate_path(hand)) / "v8" / obj
     if not root.is_dir():
         return None, None
     wrists, gposes = [], []
@@ -51,18 +51,22 @@ def main():
     parser.add_argument("--hand", default="inspire_left")
     parser.add_argument("--obj", required=True)
     parser.add_argument("--scene_type", default="reorient_0")
+    parser.add_argument("--version", default="v8",
+                        help="v8 candidate/tabletop asset contract")
     parser.add_argument("--max", type=int, default=500)
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("this diagnostic supports only --version v8")
 
-    wrists_obj, gposes = gather_v3(args.hand, args.obj, args.max)
+    wrists_obj, gposes = gather_v8(args.hand, args.obj, args.max)
     if wrists_obj is None:
-        print(f"no v3 grasps for {args.hand}/{args.obj}")
+        print(f"no v8 grasps for {args.hand}/{args.obj}")
         return
-    print(f"collected {len(wrists_obj)} v3 grasps")
+    print(f"collected {len(wrists_obj)} v8 grasps")
 
     planner = GraspPlanner(hand=args.hand)
 
-    scene_dir = Path(OBJ_PATH) / args.obj / "scene" / args.scene_type
+    scene_dir = Path(get_obj_root(args.version)) / args.obj / "scene" / args.scene_type
     for sjson in sorted(scene_dir.glob("*.json")):
         scene = json.load(open(sjson))
         obj_T_world = _xyzquat_to_T(scene["scene"]["mesh"]["target"]["pose"])

@@ -2,7 +2,7 @@
 
 Mirrors `adaptive_orchestrator.py` (box/shelf/wall), but escalates over a
 different axis: instead of growing a `gap`, it walks a *config schedule* of
-(h_cm, yml_variant, seed_num) — varying lift height and contact / inflation
+(h_cm, yml_variant, seed_num) — varying release height and contact / inflation
 strategy until at least SUCCESS_THRESHOLD sim-filter-passing grasps exist for
 each (i, j) tabletop-pose pair.
 
@@ -31,11 +31,11 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src", "grasp_generation", "reorient"
 
 from gen_scene import gen_reorient_scene  # noqa: E402
 
-from autodex.utils.path import obj_path as default_obj_path  # noqa: E402
+from autodex.utils.path import get_obj_root  # noqa: E402
 
 
 # --- Schedules ---
-H_SWEEP_CM = [0, 4]
+H_SWEEP_CM = [0, 4, 8, 12]
 N_SWEEP = [1000, 5000]
 SUCCESS_THRESHOLD = 5
 DEFAULT_SEEDS = [123, 456]  # one per N step; advances per-round to avoid duplicate sampling
@@ -76,7 +76,7 @@ def ensure_scenes(obj_name: str, h_cm: int, obj_root: str, pairs):
         if p.exists():
             written.append(f"{i}_{j}")
             continue
-        scene = gen_reorient_scene(obj_name, i, j, h_m)
+        scene = gen_reorient_scene(obj_name, i, j, h_m, obj_root=obj_root)
         scene["meta"]["scene_type"] = f"reorient_{h_cm}"
         with open(p, "w") as f:
             json.dump(scene, f, indent=2)
@@ -275,7 +275,8 @@ def process_obj(obj_name, hand, obj_root, obj_list_file,
         scene_type = f"reorient_{h_cm}"
 
         for variant_tag, yml_relpath in variants:
-            exp_name = f"reset_{h_cm}" if variant_tag == "base" else f"reset_{h_cm}_{variant_tag}"
+            exp_name = (f"reset_{h_cm}" if variant_tag == "base"
+                        else f"reset_{h_cm}_{variant_tag}")
             for n_idx, N in enumerate(n_sweep):
                 active_ids = [sid for sid, s in state.items() if not s["done"]]
                 if not active_ids:
@@ -286,9 +287,9 @@ def process_obj(obj_name, hand, obj_root, obj_list_file,
                 try:
                     run_bodex(yml_relpath, exp_name, obj_list_file, scene_type,
                               active_ids, N, seed,
-                              obj_root_dir=obj_root if obj_root != default_obj_path else None)
+                              obj_root_dir=obj_root)
                     run_sim_filter(hand, exp_name, obj_name,
-                                   obj_root_dir=obj_root if obj_root != default_obj_path else None)
+                                   obj_root_dir=obj_root)
                 except RuntimeError as e:
                     print(f"    [FAIL] {e} — skipping this round, continuing schedule",
                           flush=True)
@@ -343,9 +344,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hand", required=True, choices=list(HAND_BODEX_CFG_PREFIX))
     parser.add_argument("--obj", required=True)
-    parser.add_argument("--obj_root", default=default_obj_path)
+    parser.add_argument("--version", default="v8",
+                        help="v8 tabletop/reset asset contract (only supported value)")
+    parser.add_argument("--obj_root", default=None,
+                        help="optional v8 object-root override; default is object_processing")
     parser.add_argument("--h_sweep", type=int, nargs="+", default=H_SWEEP_CM,
-                        help="Lift heights in cm to try, in order (default: 0 4)")
+                        help="Release heights in cm to try, in order (default: 0 4 8 12)")
     parser.add_argument("--n_sweep", type=int, nargs="+", default=N_SWEEP)
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS,
                         help="One seed per N-step (cycled). Different seeds across N rounds "
@@ -354,6 +358,9 @@ def main():
     parser.add_argument("--output_dir", default=None,
                         help="Where to write reorient_summary.json (default: REPO/logging/reorient/)")
     args = parser.parse_args()
+    if args.version != "v8":
+        parser.error("reorient_orchestrator supports only --version v8; legacy assets are not used")
+    obj_root = args.obj_root or get_obj_root(args.version)
 
     obj_list_file = os.path.join("/tmp", f"reorient_obj_list_{os.getpid()}.txt")
     with open(obj_list_file, "w") as f:
@@ -363,7 +370,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"\n=== {args.obj} ({args.hand}) ===")
-    summary = process_obj(args.obj, args.hand, args.obj_root, obj_list_file,
+    summary = process_obj(args.obj, args.hand, obj_root, obj_list_file,
                           h_sweep=args.h_sweep, n_sweep=args.n_sweep,
                           threshold=args.threshold, seeds=args.seeds)
 

@@ -25,7 +25,7 @@ CLI (single cell):
         --obj attached_container --i 0 --j 16 --h_cm 0 \
         --pickup_x 0.40 --pickup_tz 0 --hand inspire_left
 
-Output: outputs/reset_plans/{hand}/{obj}/reorient_{h_cm}/{i}_{j}/
+Output: outputs/reset_plans/v8/{hand}/{obj}/reorient_{h_cm}/{i}_{j}/
         x{pickup_x:.2f}_tz{pickup_tz:03d}/{seed}/
   trajectory.npz  — phase-named joint trajectories
   meta.json       — config + T_obj keyframes
@@ -43,7 +43,7 @@ from scipy.spatial.transform import Rotation as Rot
 from curobo.types.robot import JointState
 
 from autodex.planner.planner import GraspPlanner, _to_curobo_pose
-from autodex.utils.path import obj_path, repo_dir
+from autodex.utils.path import get_obj_root, get_reset_candidate_root, repo_dir
 from autodex.utils.robot_config import INSPIRE_INIT
 
 
@@ -74,25 +74,32 @@ def phase_names_for(h_cm: int):
 PHASE_NAMES = PHASE_NAMES_FULL
 
 
-def _reset_candidate_path(hand: str) -> Path:
-    return Path(repo_dir) / "candidates" / hand
+def _reset_candidate_path(hand: str, h_cm: int, version: str = "v8") -> Path:
+    """Runtime reset-candidate root for one data contract.
+
+    Reorientation is intentionally v8-only: both cell names and tabletop
+    poses use the object_processing stems, so there is no legacy index bridge.
+    """
+    return Path(get_reset_candidate_root(hand, h_cm, version=version))
 
 
 # ── data loading ─────────────────────────────────────────────────────────────
 
-def load_tabletop_pose(obj_name: str, pose_idx: int) -> np.ndarray:
-    p = Path(obj_path) / obj_name / "processed_data" / "info" / "tabletop" / f"{pose_idx:03d}.npy"
+def load_tabletop_pose(obj_name: str, pose_idx: int, obj_root: str) -> np.ndarray:
+    p = Path(obj_root) / obj_name / "processed_data" / "info" / "tabletop" / f"{pose_idx:03d}.npy"
     return np.load(p)
 
 
-def load_candidates_object_frame(obj_name: str, hand: str, h_cm: int, i: int, j: int):
+def load_candidates_object_frame(obj_name: str, hand: str, h_cm: int, i: int, j: int,
+                                 *, version: str = "v8"):
     """Returns (wrist_se3_obj, pregrasp, grasp, seed_ids, places). All in
     object frame. `places[k]` is the precomputed T_obj_end (4x4) for that seed
     if `place.npy` exists in the seed directory, else None.
 
-    Path layout: candidates/{hand}/reset/{obj}/reorient_{h_cm}/{i}_{j}/{seed}/
+    Path layout: candidates/{hand}/reset_{h_cm}/{obj}/reorient_{h_cm}/{i}_{j}/{seed}/
     """
-    base = _reset_candidate_path(hand) / "reset" / obj_name / f"reorient_{h_cm}" / f"{i}_{j}"
+    base = (_reset_candidate_path(hand, h_cm, version) / obj_name /
+            f"reorient_{h_cm}" / f"{i}_{j}")
     if not base.exists():
         raise FileNotFoundError(f"No candidates at {base}")
     wrist_o, preg, grasp_f, seeds, places = [], [], [], [], []
@@ -153,9 +160,10 @@ def _se3_to_cart7(T: np.ndarray):
             float(q[3]), float(q[0]), float(q[1]), float(q[2])]
 
 
-def world_with_object(base_world: dict, obj_name: str, T_obj_world: np.ndarray) -> dict:
+def world_with_object(base_world: dict, obj_name: str, T_obj_world: np.ndarray,
+                      obj_root: str) -> dict:
     out = {"cuboid": dict(base_world["cuboid"]), "mesh": dict(base_world.get("mesh", {}))}
-    mesh_path = Path(obj_path) / obj_name / "processed_data" / "mesh" / "simplified.obj"
+    mesh_path = Path(obj_root) / obj_name / "processed_data" / "mesh" / "simplified.obj"
     out["mesh"]["placed_object"] = {
         "pose": _se3_to_cart7(T_obj_world),
         "file_path": str(mesh_path),
@@ -200,10 +208,10 @@ def load_fk_urdf(hand: str):
     return yourdfpy.URDF.load(path, build_scene_graph=True), EE_LINK_BY_HAND[hand]
 
 
-def load_object_vertices(obj_name: str) -> np.ndarray:
+def load_object_vertices(obj_name: str, obj_root: str) -> np.ndarray:
     """Object mesh vertices (V,3) — simplified for fast post-hoc checks."""
     import trimesh
-    mesh_path = Path(obj_path) / obj_name / "processed_data" / "mesh" / "simplified.obj"
+    mesh_path = Path(obj_root) / obj_name / "processed_data" / "mesh" / "simplified.obj"
     mesh = trimesh.load(mesh_path, force="mesh", process=False)
     return np.asarray(mesh.vertices, dtype=np.float32)
 
@@ -307,6 +315,7 @@ def _carry_object_hits_base(ee_traj: np.ndarray, wrist_se3_obj: np.ndarray,
 
 def plan_one_seed(planner: GraspPlanner, *,
                   obj_name: str, base_world: dict, h_cm: int = 0,
+                  obj_root: str,
                   T_obj_start, T_obj_apex_i, T_obj_apex_j, T_obj_end,
                   wrist_se3_obj, pregrasp_q, grasp_q,
                   urdf_fk=None, ee_link: str = "base_link",
@@ -347,8 +356,8 @@ def plan_one_seed(planner: GraspPlanner, *,
         q_depart = _ik_solve(planner, T_wrist_depart, open_q, retract_q=q_released)
         if q_depart is None: return None, "ik_depart"
 
-    world_start = world_with_object(base_world, obj_name, T_obj_start)
-    world_end   = world_with_object(base_world, obj_name, T_obj_end)
+    world_start = world_with_object(base_world, obj_name, T_obj_start, obj_root)
+    world_end   = world_with_object(base_world, obj_name, T_obj_end, obj_root)
 
     trajs = {}
     # Phase-by-phase with world swaps as needed. Sequence:
@@ -410,6 +419,7 @@ def plan_one_seed(planner: GraspPlanner, *,
 
 def plan_one_cell(planner: GraspPlanner, *,
                   obj_name: str, hand: str, h_cm: int, i: int, j: int,
+                  obj_root: str, version: str = "v8",
                   T_obj_start: np.ndarray,
                   T_obj_end: np.ndarray = None,
                   # If place_search_tzs is given, T_obj_end is computed per seed
@@ -430,7 +440,7 @@ def plan_one_cell(planner: GraspPlanner, *,
           q_placed. T_obj_end for that seed is computed from Tj, place_xy, place_tz.
     """
     wrist_o_all, preg_all, grasp_all, seeds, places_all = load_candidates_object_frame(
-        obj_name, hand, h_cm, i, j,
+        obj_name, hand, h_cm, i, j, version=version,
     )
     n_try = min(max_seeds, len(seeds))
     if verbose:
@@ -440,7 +450,7 @@ def plan_one_cell(planner: GraspPlanner, *,
     if search_mode:
         if place_xy is None:
             raise ValueError("place_xy required for place search mode")
-        Tj_can = load_tabletop_pose(obj_name, j)
+        Tj_can = load_tabletop_pose(obj_name, j, obj_root)
         h_m = h_cm / 100.0
         init_state = planner._init_state.copy()
 
@@ -482,6 +492,7 @@ def plan_one_cell(planner: GraspPlanner, *,
         t0 = time.time()
         result, status = plan_one_seed(
             planner, obj_name=obj_name, base_world=base_world, h_cm=h_cm,
+            obj_root=obj_root,
             T_obj_start=T_obj_start, T_obj_apex_i=T_ai,
             T_obj_apex_j=T_aj, T_obj_end=T_end_k,
             wrist_se3_obj=wso, pregrasp_q=preg_all[k], grasp_q=grasp_all[k],
@@ -558,9 +569,14 @@ def main():
     p.add_argument("--place_tz", type=float, default=None,
                     help="if omitted, search per-seed across 0..330° in 30° steps")
     p.add_argument("--hand", default="inspire_left", choices=["inspire_left", "inspire", "allegro"])
+    p.add_argument("--version", default="v8",
+                   help="v8 reset/tabletop asset contract (only supported value)")
     p.add_argument("--max_seeds", type=int, default=30)
     p.add_argument("--out", default=None)
     args = p.parse_args()
+    if args.version != "v8":
+        p.error("plan_reset supports only --version v8; legacy reset assets are not used")
+    obj_root = get_obj_root(args.version)
 
     h_m = args.h_cm / 100.0
     ptz_desc = f"{args.place_tz:.0f}°" if args.place_tz is not None else "search"
@@ -569,8 +585,8 @@ def main():
           f"place=({args.place_x:.2f}, {args.place_y:.2f}, tz={ptz_desc}) "
           f"hand={args.hand}")
 
-    Ti = load_tabletop_pose(args.obj, args.i)
-    Tj = load_tabletop_pose(args.obj, args.j)
+    Ti = load_tabletop_pose(args.obj, args.i, obj_root)
+    Tj = load_tabletop_pose(args.obj, args.j, obj_root)
     T_obj_start = make_obj_pose(Ti, np.array([args.pickup_x, 0.0, Ti[2, 3]]),
                                 args.pickup_tz)
     if args.place_tz is None:
@@ -585,12 +601,13 @@ def main():
     t0 = time.time()
     planner, base_world = init_planner(args.hand)
     urdf_fk, ee_link = load_fk_urdf(args.hand)
-    obj_verts = load_object_vertices(args.obj)
+    obj_verts = load_object_vertices(args.obj, obj_root)
     print(f"[reset] planner warmup: {time.time() - t0:.1f}s ({len(obj_verts)} mesh verts)")
 
     result = plan_one_cell(
         planner, obj_name=args.obj, hand=args.hand,
         h_cm=args.h_cm, i=args.i, j=args.j,
+        obj_root=obj_root, version=args.version,
         T_obj_start=T_obj_start, T_obj_end=T_obj_end,
         place_xy=(args.place_x, args.place_y), place_search_tzs=place_search_tzs,
         base_world=base_world, max_seeds=args.max_seeds,
@@ -609,14 +626,15 @@ def main():
 
     out_dir = Path(args.out) if args.out else (
         Path(__file__).resolve().parents[3]
-        / "outputs" / "reset_plans" / args.hand / args.obj
+        / "outputs" / "reset_plans" / args.version / args.hand / args.obj
         / f"reorient_{args.h_cm}" / f"{args.i}_{args.j}"
         / f"x{args.pickup_x:.2f}_tz{int(round(args.pickup_tz)):03d}"
         / result["seed_id"]
     )
     ptz_used = result.get("place_tz_used")
     meta = {
-        "obj_name": args.obj, "hand": args.hand,
+        "obj_name": args.obj, "hand": args.hand, "version": args.version,
+        "obj_root": obj_root,
         "i": args.i, "j": args.j, "h_cm": args.h_cm,
         "pickup_x": args.pickup_x, "pickup_tz": args.pickup_tz,
         "place_x": args.place_x, "place_y": args.place_y,

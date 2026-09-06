@@ -4,15 +4,17 @@ The two asset trees enumerate the same physical resting poses in a DIFFERENT
 order, and different parts of the pipeline are numbered against different trees:
 
 * scene JSONs (``meta.pose_idx``) and v8 candidate ``pose_idx`` — object_processing
-* reset/reorient cell dirs ``candidates/{hand}/reset/{obj}/reorient_{h}/{i}_{j}/``
+* reset/reorient cell dirs
+  ``candidates/{hand}/reset_{h}/{obj}/reorient_{h}/{i}_{j}/``
   and their ``openpose_{i:03d}.npy`` files — paradex, because the generator
   (``src/grasp_generation/reorient/plan_reset.py:load_tabletop_pose``) reads
   ``{obj_path}/.../tabletop/{idx:03d}.npy`` with ``obj_path`` = paradex
 
-So a v8 reorient target named by an object_processing stem cannot index a reset
-cell directly. For attached_container ``op 000 ≡ paradex 001`` and vice versa —
-using the raw int silently looks up the REVERSED transition, and op 002/007/010
-find no cell at all and drop out of the target list without an error.
+So a v8 reorient target named by an object_processing stem cannot index an
+existing reset cell directly. For attached_container ``op 000 ≡ paradex 001``
+and vice versa — using the raw int silently looks up the reversed transition,
+and op 002/007/010 find no cell at all and drop out of the target list without
+an error.
 
 This maps between them by matching tabletop ROTATIONS (the poses are identical
 geometry, only renumbered), so nothing has to be regenerated. The grasp payloads
@@ -116,18 +118,23 @@ def reset_index_map(
     legacy_root: Optional[str] = None,
     tol_deg: float = TOL_DEG,
     margin_deg: float = MARGIN_DEG,
+    strict: bool = True,
 ) -> Dict[str, int]:
     """``{obj_root stem -> paradex int}`` for reset/reorient cell lookups.
 
     Identity (``{stem: int(stem)}``) when ``obj_root`` already IS the legacy
     tree, so callers can apply this unconditionally.
 
-    Raises ``ValueError`` if any stem has no confident match — better a loud
-    failure than reorienting to the wrong face.
+    With ``strict=True`` (the default), raises ``ValueError`` if *any* v8
+    stem has no confident match.  With ``strict=False``, returns every
+    individually verified pair and omits only unmatched/ambiguous stems.  The
+    latter is safe for reset lookup because a transition is usable only when
+    both its current and target stems are present in the returned mapping.
     """
     root = obj_root or obj_path
     legacy = legacy_root or obj_path
-    key = (obj_name, os.path.realpath(root), os.path.realpath(legacy))
+    key = (obj_name, os.path.realpath(root), os.path.realpath(legacy),
+           float(tol_deg), float(margin_deg), bool(strict))
     if key in _CACHE:
         return _CACHE[key]
 
@@ -157,15 +164,19 @@ def reset_index_map(
         best_err, best_k = errs[0]
         runner_up = errs[1][0] if len(errs) > 1 else float("inf")
         if best_err > tol_deg:
-            raise ValueError(
-                f"{obj_name}: tabletop stem {stem} has no legacy match "
-                f"(best {best_k} @ {best_err:.2f}deg > {tol_deg}deg tolerance)")
+            if strict:
+                raise ValueError(
+                    f"{obj_name}: tabletop stem {stem} has no legacy match "
+                    f"(best {best_k} @ {best_err:.2f}deg > {tol_deg}deg tolerance)")
+            continue
         if (runner_up - best_err) < margin_deg and runner_up > tol_deg:
             # Ambiguous: the runner-up is close behind but OUT of tolerance, so
             # the two are not interchangeable and we cannot tell which is meant.
-            raise ValueError(
-                f"{obj_name}: tabletop stem {stem} is ambiguous "
-                f"(best {best_k} @ {best_err:.2f}deg, runner-up @ {runner_up:.2f}deg)")
+            if strict:
+                raise ValueError(
+                    f"{obj_name}: tabletop stem {stem} is ambiguous "
+                    f"(best {best_k} @ {best_err:.2f}deg, runner-up @ {runner_up:.2f}deg)")
+            continue
         # runner_up also within tolerance => the legacy tree lists two poses
         # that are the same class (french_mustard has a pair 0.7deg apart).
         # Either maps correctly, so take the closer one instead of failing.
@@ -174,13 +185,14 @@ def reset_index_map(
     return out
 
 
-def to_reset_index(obj_name: str, stem, obj_root: Optional[str] = None) -> int:
+def to_reset_index(obj_name: str, stem, obj_root: Optional[str] = None,
+                   *, allow_partial: bool = False) -> int:
     """Reset-cell (paradex) index for a tabletop ``stem`` in ``obj_root``.
 
     ``stem`` may be a stem string (``'007'``) or the int the caller already
     derived from one (``7``) — both resolve to the same entry.
     """
-    m = reset_index_map(obj_name, obj_root)
+    m = reset_index_map(obj_name, obj_root, strict=not allow_partial)
     s = str(stem)
     if s in m:
         return m[s]
@@ -195,8 +207,13 @@ def describe_map(obj_name: str, version: str = "v8") -> str:
     """Human-readable ``op stem -> paradex cell index`` table, for logs."""
     root = get_obj_root(version)
     try:
-        m = reset_index_map(obj_name, root)
+        m = reset_index_map(obj_name, root, strict=False)
     except ValueError as e:
         return f"{obj_name}: MAPPING FAILED — {e}"
-    return f"{obj_name} ({version}): " + ", ".join(
-        f"{s}->{i}" for s, i in sorted(m.items()))
+    source_stems = sorted(_load_rots(root, obj_name))
+    if not m:
+        return f"{obj_name}: MAPPING FAILED — no individually verified stems"
+    mapped = ", ".join(f"{s}->{i}" for s, i in sorted(m.items()))
+    unmapped = [s for s in source_stems if s not in m]
+    suffix = f"; unmapped: {', '.join(unmapped)}" if unmapped else ""
+    return f"{obj_name} ({version}): {mapped}{suffix}"

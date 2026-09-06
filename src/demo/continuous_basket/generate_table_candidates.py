@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate NAS-visible Inspire tabletop candidates for Franka collection.
 
-The candidates model the Inspire hand only; every candidate still goes through
-the real FR3 planner and must earn an ``arm=franka`` success record during the
-collection stage.  This command has no robot or camera dependency.
+The candidates model the Inspire hand only.  A physical success from either
+robot arm makes a candidate eligible for the continuous catalogue; the live
+planner always rechecks it for the arm executing the take.  This command has
+no robot or camera dependency.
 """
 from __future__ import annotations
 

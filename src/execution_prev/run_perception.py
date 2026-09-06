@@ -26,15 +26,19 @@ logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 
 MESH_ROOT = Path.home() / "shared_data/object_6d/data/mesh"
 
+# Daemons are NAS-path workers, not per-camera services: any host can process
+# any serial, so this list is a compute budget rather than a camera mapping.
 SAM3_HOSTS = [
-    ("192.168.0.101", 5001),
-    ("192.168.0.102", 5001),
-    ("192.168.0.103", 5001),
+    ("192.168.0.101", 5001),   # capture1
+    ("192.168.0.102", 5001),   # capture2
+    ("192.168.0.103", 5001),   # capture3
 ]
+# capture4 (192.168.0.104) is gone: it answers no ssh and paradex's system
+# config raises KeyError('capture4'). Leaving it here costs a 30 s ZMQ timeout
+# on every chunk that lands on it.
 FPOSE_HOSTS = [
-    ("192.168.0.104", 5003),
-    ("192.168.0.105", 5003),
-    ("192.168.0.106", 5003),
+    ("192.168.0.105", 5003),   # capture5
+    ("192.168.0.106", 5003),   # capture6
 ]
 
 

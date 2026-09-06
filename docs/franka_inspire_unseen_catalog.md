@@ -3,20 +3,23 @@
 The continuous demo can select an object that is *unseen in prior real Franka
 trials*, but it is not mesh-free open-set grasping. Before a new object may
 move the FR3, it must have a scan mesh, 6D pose assets, simulated candidates,
-and at least one physical FR3+Inspire success record. This is intentional:
+and at least one physical Inspire success record. Candidate provenance is
+arm-agnostic: a success collected with either arm is eligible, but the live
+planner always validates IK, collision, lift, and carry for the arm actually
+executing the take. This is intentional:
 the demo's runtime is fast because it does not generate grasps, silhouette
 match, or explore the object during the uncut take.
 
-The first practical catalogue is:
+The preferred first 3-object catalogue is:
 
 ```text
-apple  banana  pepsi  toothbrush_holder
+banana  toothbrush_holder  pepsi
 ```
 
-On 2026-08-31, all four have object-processing, FoundPose, GoTrack, and v8
-candidate assets. `banana` has seven Franka+Inspire successes; the other three
-need real-robot collection. This gives a small 4-class first demo without
-waiting for arbitrary-object scanning.
+Use `preflight.py` as the source of truth rather than this static shortlist.
+It is arm-agnostic for grasp provenance and rejects assets that cannot be read
+from the robot host. An object with just one historical success is useful for
+a one-success smoke test, but should not be part of a multi-retry uncut take.
 
 ## 1. Audit before any robot connection
 
@@ -26,7 +29,7 @@ waiting for arbitrary-object scanning.
   --objects apple banana pepsi toothbrush_holder --stage audit
 ```
 
-`FR3 ok` must be nonzero for every object before the continuous runner is
+`phys ok` must be nonzero for every object before the continuous runner is
 allowed to move. The audit also checks new-object scan products:
 
 - `raw_mesh/{object}.obj` — FoundPose mesh;
@@ -71,7 +74,7 @@ copy from the source checkout. Existing scene files are never replaced unless
 `--overwrite-scenes` is explicitly supplied.
 
 The simulation models the Inspire hand, so it only supplies safe starting
-candidates. FR3 reachability and real success are established next.
+candidates. Execution-arm reachability and real success are established next.
 
 ## 4. Collect Franka successes, one object at a time
 
@@ -135,4 +138,37 @@ measured manual reference. The runner uses multi-prompt YOLO-E only to choose am
 classes; it then runs FoundPose once for that selected class, skips silhouette
 matching, tracks with GoTrack, replans retries from the current raised state,
 and records automatic lift/drop verification. It does not home-reset during a
-normal retry.
+normal retry. After a drop it keeps scanning while a person re-places the next
+object. A scan that finds only the object in the basket (or a pose outside
+`--pick-workspace`) is logged as an idle scan and does **not** consume
+`--max-cycles`; that limit counts only selected grasp trials.
+
+Every take now creates its own non-overwriting timestamped NAS session; do not
+pass a hand-written run ID. Its layout follows the existing banana-demo
+convention, with the fixed catalogue between the robot and timestamp:
+
+```text
+~/shared_data/AutoDex/experiment/continuous_basket/
+  franka_inspire/apple__banana__pepsi__toothbrush_holder/
+    20260831_173000_123456/
+      cam_param/  basket_marker/  init/  trials/  raw/robot/
+      videos/capture/                 # populated after upload
+      recording.json
+```
+
+At the end of a normal take the runner automatically invokes the timestamped
+uploader. It selects only that recording, serializes GPU undistortion on each
+capture PC, verifies all calibrated camera videos on NAS, and restarts the
+temporary paused Init/GoTrack daemons automatically. It also prints the exact
+recovery command for a deferred or interrupted upload:
+
+```bash
+python src/demo/continuous_basket/upload_recording.py \
+  --session AutoDex/experiment/continuous_basket/franka_inspire/apple__banana__pepsi__toothbrush_holder/20260831_173000_123456
+```
+
+The final AVI files are under the session's `videos/capture/` directory. Do
+not use ParaDex's generic all-raw-video uploader for a continuous take: it can
+pick up unrelated historical raw files on the capture PCs. Pass
+`--no-upload-video` only when intentionally deferring the automatic post-take
+upload.

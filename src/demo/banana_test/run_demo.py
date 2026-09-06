@@ -1082,6 +1082,7 @@ def main():
     if args.arm == "franka":
         from src.execution.franka_executor import FrankaExecutor
         executor = FrankaExecutor(hand_name=args.hand)
+        executor.set_speed_profile_planner(planner)
         executor.home(clear_view=True)
     else:
         from autodex.executor.real import RealExecutor

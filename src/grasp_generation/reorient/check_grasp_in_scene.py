@@ -12,7 +12,7 @@ import viser
 from scipy.spatial.transform import Rotation as R
 import yourdfpy
 
-from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH
+from autodex.utils.path import get_obj_root
 
 HAND_URDF = "/home/mingi/AutoDex/src/grasp_generation/BODex/src/curobo/content/assets/robot/inspire_description/inspire_hand_left.urdf"
 
@@ -48,24 +48,29 @@ def main():
     parser.add_argument("--scene_type", default="reorient_8")
     parser.add_argument("--scene_grasps", required=True, help="e.g., 1_2 (where successful grasps came from)")
     parser.add_argument("--scene_view", required=True, help="e.g., 2_1 (scene to display)")
-    parser.add_argument("--version", default="reset_8_pinch_b_5x")
+    parser.add_argument("--version", default="reset_8",
+                        help="BODex reset experiment to inspect; suffix is release height in cm")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--obj_root", type=Path, default=Path(DEFAULT_OBJ_PATH))
+    parser.add_argument("--obj_root", type=Path, default=None,
+                        help="optional v8 object-root override")
     args = parser.parse_args()
+    if not args.version.startswith("reset_"):
+        parser.error("--version must be a reset_<height_mm> experiment")
+    args.obj_root = args.obj_root or Path(get_obj_root("v8"))
 
     # Load grasps from scene_grasps that passed sim_filter
     bo_root = Path('/home/mingi/AutoDex/bodex_outputs/inspire_left')
     candidates = []
-    for ver in ["reset_8_pinch_b", "reset_8_pinch_b_5x"]:
-        sd = bo_root / ver / args.obj / f'reorient_{args.scene_type.split("_")[1]}' / args.scene_grasps
-        if not sd.is_dir(): continue
+    sd = (bo_root / args.version / args.obj /
+          f'reorient_{args.scene_type.split("_")[1]}' / args.scene_grasps)
+    if sd.is_dir():
         for seed in sd.iterdir():
             f = seed / 'sim_eval.json'
             if f.exists():
                 try:
                     if json.load(open(f)).get("success"):
                         candidates.append({
-                            "ver": ver, "seed": seed.name,
+                            "ver": args.version, "seed": seed.name,
                             "wrist_se3": np.load(seed / 'wrist_se3.npy'),
                             "grasp": np.load(seed / 'grasp_pose.npy'),
                             "pregrasp": np.load(seed / 'pregrasp_pose.npy'),

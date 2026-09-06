@@ -16,9 +16,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
+# Keep this shared obstacle definition aligned with scene_cfg.TABLE_SURFACE_Z.
+# The pose is the cuboid centre, not its top face.
+TABLE_SURFACE_Z = 0.040
+TABLE_THICKNESS_Z = 0.2
 TABLE_CUBOID = {
-    "dims": [2, 3, 0.2],
-    "pose": [1.1, 0, -0.1 + 0.035, 1, 0, 0, 0],
+    "dims": [2, 3, TABLE_THICKNESS_Z],
+    "pose": [1.1, 0, TABLE_SURFACE_Z - TABLE_THICKNESS_Z / 2, 1, 0, 0, 0],
 }
 
 

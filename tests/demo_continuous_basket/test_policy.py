@@ -30,8 +30,19 @@ from src.demo.continuous_basket.policy import (
     choose_success_candidates,
 )
 from src.demo.continuous_basket.preflight import build_report, require_ready
-from src.demo.continuous_basket.recording import resolve_signal_generator_params
+from src.demo.continuous_basket.recording import (
+    autodex_session_relative,
+    create_session_dir,
+    parse_autodex_session_relative,
+    resolve_signal_generator_params,
+    should_auto_upload,
+)
+from src.demo.continuous_basket.tabletop import mesh_bottom_z, raise_to_table
 from src.demo.continuous_basket.tracking import LiveGoTrackSession
+from src.demo.continuous_basket.upload_recording import (
+    recording_video_paths,
+    verify_nas_recording,
+)
 
 try:
     from autodex.perception.init_orchestrator import InitOrchestrator
@@ -45,6 +56,37 @@ except ModuleNotFoundError:  # lightweight policy env intentionally has no OpenC
 
 
 class CatalogPolicyTest(unittest.TestCase):
+    def test_table_snap_only_raises_small_mesh_penetrations(self):
+        pose = np.eye(4)
+        pose[2, 3] = 0.030
+        vertices = np.array([[0.0, 0.0, -0.010], [0.0, 0.0, 0.020]])
+        corrected, raise_m, bottom = raise_to_table(
+            pose, vertices, surface_z=0.035, max_raise_m=0.010
+        )
+        self.assertAlmostEqual(bottom, 0.020)
+        self.assertAlmostEqual(raise_m, 0.0)  # required 15 mm is refused
+        self.assertAlmostEqual(corrected[2, 3], 0.030)
+
+        corrected, raise_m, _ = raise_to_table(
+            pose, vertices, surface_z=0.035, max_raise_m=0.020
+        )
+        self.assertAlmostEqual(raise_m, 0.015)
+        self.assertAlmostEqual(mesh_bottom_z(corrected, vertices), 0.035)
+
+    def test_auto_upload_requires_a_real_pick_motion(self):
+        self.assertTrue(should_auto_upload(
+            camera_recording=True, uploads_deferred=False,
+            normal_exit=True, robot_motion_started=True,
+        ))
+        self.assertFalse(should_auto_upload(
+            camera_recording=True, uploads_deferred=False,
+            normal_exit=True, robot_motion_started=False,
+        ))
+        self.assertFalse(should_auto_upload(
+            camera_recording=True, uploads_deferred=False,
+            normal_exit=False, robot_motion_started=True,
+        ))
+
     def test_catalog_runtime_rejects_missing_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "checkpoint is missing"):
@@ -191,6 +233,87 @@ class CatalogPolicyTest(unittest.TestCase):
             )
             self.assertEqual(params["addr"], "/dev/usbtmc0")
             self.assertIsNone(note)
+
+    def test_timestamped_session_layout_is_catalogued_and_non_overwriting(self):
+        import datetime as dt
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "AutoDex"
+            now = dt.datetime(2026, 8, 31, 18, 0, 1, 123456)
+            first, first_id = create_session_dir(
+                root, experiment_name="continuous_basket", arm="franka", hand="inspire",
+                object_names=["banana", "apple"], now=now,
+            )
+            second, second_id = create_session_dir(
+                root, experiment_name="continuous_basket", arm="franka", hand="inspire",
+                object_names=["apple", "banana"], now=now,
+            )
+            self.assertEqual(first_id, "20260831_180001_123456")
+            self.assertEqual(second_id, "20260831_180001_123456_01")
+            self.assertEqual(
+                autodex_session_relative(root, first),
+                Path("AutoDex/experiment/continuous_basket/franka_inspire/apple__banana") / first_id,
+            )
+            self.assertTrue(first.is_dir())
+            self.assertTrue(second.is_dir())
+
+    def test_session_identity_is_timestamp_only(self):
+        import datetime as dt
+        from src.demo.continuous_basket.recording import timestamp_session_name
+        self.assertEqual(
+            timestamp_session_name(now=dt.datetime(2026, 8, 31, 18, 0, 1, 123456)),
+            "20260831_180001_123456",
+        )
+
+    def test_upload_selector_and_nas_verification_are_session_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = Path("AutoDex/experiment/continuous_basket/franka_inspire/banana/20260831_180001_123456")
+            capture = root / "captures1"
+            ours = capture / session / "raw/capture/videos"
+            other = capture / "shared_data/AutoDex/_fulltest/raw/videos"
+            ours.mkdir(parents=True)
+            other.mkdir(parents=True)
+            (ours / "cam_a.avi").write_bytes(b"raw")
+            (other / "stale.avi").write_bytes(b"raw")
+            self.assertEqual(
+                recording_video_paths([capture], session_relative=session),
+                [ours / "cam_a.avi"],
+            )
+
+            session_dir = root / "shared_data" / session
+            cam_param = session_dir / "cam_param"
+            cam_param.mkdir(parents=True)
+            (cam_param / "intrinsics.json").write_text(json.dumps({"cam_a": {}, "cam_b": {}}))
+            videos = session_dir / "videos/capture"
+            videos.mkdir(parents=True)
+            (videos / "cam_a.avi").write_bytes(b"done")
+            ok, detail = verify_nas_recording(session_dir)
+            self.assertFalse(ok)
+            self.assertEqual(detail, "missing=cam_b")
+            (videos / "cam_b.avi").write_bytes(b"done")
+            self.assertEqual(verify_nas_recording(session_dir), (True, "2 camera videos"))
+
+    def test_upload_verification_uses_the_take_active_camera_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "session"
+            (session_dir / "cam_param").mkdir(parents=True)
+            (session_dir / "cam_param/intrinsics.json").write_text(
+                json.dumps({"active": {}, "inactive": {}})
+            )
+            (session_dir / "recording.json").write_text(json.dumps({"camera_serials": ["active"]}))
+            output = session_dir / "videos/capture"
+            output.mkdir(parents=True)
+            (output / "active.avi").write_bytes(b"done")
+            self.assertEqual(verify_nas_recording(session_dir), (True, "1 camera videos"))
+
+    def test_session_argument_rejects_absolute_and_parent_paths(self):
+        self.assertEqual(
+            parse_autodex_session_relative("AutoDex/experiment/continuous_basket/a"),
+            Path("AutoDex/experiment/continuous_basket/a"),
+        )
+        for bad in ("/home/robot/shared_data/AutoDex/x", "AutoDex/../other", "other/x"):
+            with self.assertRaises(ValueError):
+                parse_autodex_session_relative(bad)
 
     def test_basket_marker_offset_uses_marker_frame(self):
         marker_pose = np.eye(4)
@@ -346,15 +469,17 @@ class CatalogPolicyTest(unittest.TestCase):
             self.assertEqual(rows[0].successful_candidate_count, 1)
             require_ready(rows)
 
-            wrong_arm = build_report(
+            other_arm = build_report(
                 parse_catalog([obj]), object_root=obj_root, assets_base=assets,
                 candidate_root=candidates, anchor_root=anchors, require_gotrack=True,
                 arm="xarm",
             )
-            self.assertFalse(wrong_arm[0].ready)
-            self.assertEqual(wrong_arm[0].missing, ["successful_grasp"])
-            with self.assertRaisesRegex(RuntimeError, "banana: successful_grasp"):
-                require_ready(wrong_arm)
+            # A candidate's recorded arm is provenance, not a runtime filter.
+            # The live planner remains responsible for validating it on the
+            # arm selected for the take.
+            self.assertTrue(other_arm[0].ready)
+            self.assertEqual(other_arm[0].successful_candidate_count, 1)
+            require_ready(other_arm)
 
     def test_preflight_direct_script_invocation_has_repo_import_path(self):
         """The command documented for operators works without PYTHONPATH."""

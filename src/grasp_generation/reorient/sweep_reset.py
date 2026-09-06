@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from autodex.utils.path import repo_dir
+from autodex.utils.path import get_obj_root, repo_dir
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plan_reset import (  # noqa: E402
@@ -42,9 +42,9 @@ from plan_reset import (  # noqa: E402
 )
 
 
-def discover_pairs(obj_name: str, hand: str, h_cm: int):
-    """List all (i, j) directories under candidates/{hand}/reset/{obj}/{h_cm}/."""
-    base = _reset_candidate_path(hand) / "reset" / obj_name / f"reorient_{h_cm}"
+def discover_pairs(obj_name: str, hand: str, h_cm: int, *, version: str = "v8"):
+    """List direct v8 (i, j) cells from the runtime reset candidate tree."""
+    base = _reset_candidate_path(hand, h_cm, version) / obj_name / f"reorient_{h_cm}"
     if not base.exists():
         return []
     pairs = []
@@ -60,11 +60,12 @@ def discover_pairs(obj_name: str, hand: str, h_cm: int):
 
 def sweep_one_pair(planner, base_world, urdf_fk, ee_link, obj_verts, *,
                     obj_name, hand, i, j, h_cm, xs, tzs,
-                    place_x, place_y, place_tz, max_seeds, sweep_root, skip_done):
+                    place_x, place_y, place_tz, max_seeds, sweep_root, skip_done,
+                    obj_root, version: str = "v8"):
     """Sweep (x, tz) grid for one (i, j) pair. Writes per-cell + summary."""
     sweep_root.mkdir(parents=True, exist_ok=True)
     h_m = h_cm / 100.0
-    Ti = load_tabletop_pose(obj_name, i)
+    Ti = load_tabletop_pose(obj_name, i, obj_root)
 
     # Per-seed place search: iterate these tz values to find feasible place.
     place_tz_grid = list(np.arange(0.0, 360.0, 30.0))
@@ -108,6 +109,7 @@ def sweep_one_pair(planner, base_world, urdf_fk, ee_link, obj_verts, *,
             result = plan_one_cell(
                 planner, obj_name=obj_name, hand=hand,
                 h_cm=h_cm, i=i, j=j,
+                obj_root=obj_root, version=version,
                 T_obj_start=T_obj_start,
                 place_xy=(place_x, place_y),
                 place_search_tzs=place_tz_grid,
@@ -173,6 +175,8 @@ def main():
     p.add_argument("--h_cm", type=int, default=0)
     p.add_argument("--hand", default="inspire_left",
                     choices=["inspire_left", "inspire", "allegro"])
+    p.add_argument("--version", default="v8",
+                   help="v8 reset/tabletop asset contract (only supported value)")
     p.add_argument("--x_min", type=float, default=0.30)
     p.add_argument("--x_max", type=float, default=0.55)
     p.add_argument("--x_step", type=float, default=0.05)
@@ -188,6 +192,9 @@ def main():
     p.add_argument("--skip_done", action="store_true",
                     help="skip cells with existing trajectory")
     args = p.parse_args()
+    if args.version != "v8":
+        p.error("sweep_reset supports only --version v8; legacy reset assets are not used")
+    obj_root = get_obj_root(args.version)
 
     # Resolve pair list. Default = all pairs (most common case).
     if args.pairs:
@@ -198,7 +205,7 @@ def main():
     elif args.i is not None and args.j is not None:
         pairs = [(args.i, args.j)]
     else:
-        pairs = discover_pairs(args.obj, args.hand, args.h_cm)
+        pairs = discover_pairs(args.obj, args.hand, args.h_cm, version=args.version)
         if not pairs:
             print(f"[sweep] no pairs discovered for {args.obj} h={args.h_cm}cm")
             return
@@ -217,11 +224,11 @@ def main():
     t0 = time.time()
     planner, base_world = init_planner(args.hand)
     urdf_fk, ee_link = load_fk_urdf(args.hand)
-    obj_verts = load_object_vertices(args.obj)
+    obj_verts = load_object_vertices(args.obj, obj_root)
     print(f"[sweep] planner warmup: {time.time() - t0:.1f}s ({len(obj_verts)} mesh verts)")
 
     out_root = (Path(args.out_root) if args.out_root else
-                Path(repo_dir) / "outputs" / "reset_cache" / args.hand / args.obj
+                Path(repo_dir) / "outputs" / "reset_cache" / args.version / args.hand / args.obj
                 / f"reorient_{args.h_cm}")
 
     overall = time.time()
@@ -236,7 +243,7 @@ def main():
                 xs=xs, tzs=tzs,
                 place_x=args.place_x, place_y=args.place_y, place_tz=args.place_tz,
                 max_seeds=args.max_seeds, sweep_root=sweep_root,
-                skip_done=args.skip_done,
+                skip_done=args.skip_done, obj_root=obj_root, version=args.version,
             )
             grand_ok += n_ok
             grand_total += n_tot

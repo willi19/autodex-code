@@ -115,10 +115,13 @@ Before turning on the robot, do all of the following.
    ```bash
    python src/demo/continuous_basket/preflight.py \
      --objects banana wood_organizer='wood organizer' beige_brush='beige brush' \
-     --hand inspire --arm franka --version v8
+     --hand inspire --version v8
    ```
 
-   Start `gotrack_daemon.py` on every capture PC before the default run; the
+   Success provenance is deliberately arm-agnostic: a record from either arm
+   supplies a candidate. The actual execution arm still has to pass live IK,
+   collision, lift, and carry validation before it moves. Start
+   `gotrack_daemon.py` on every capture PC before the default run; the
    runner configures it dynamically per selected catalogue object.
    Before a first robot motion, verify the distributed tracker with a saved
    FoundPose pose. This briefly arms the camera stream and sends commands only
@@ -127,7 +130,7 @@ Before turning on the robot, do all of the following.
    ```bash
    python src/demo/continuous_basket/gotrack_smoke.py \
      --object banana \
-     --init-pose /home/robot/shared_data/AutoDex/experiment/continuous_basket_demo/franka_inspire/<run-id>/init/001_catalog_banana/pose_world.npy \
+     --init-pose /home/robot/shared_data/AutoDex/experiment/continuous_basket/franka_inspire/banana/<timestamp>/init/001_catalog_banana/pose_world.npy \
      --warmup-s 15
    ```
 
@@ -175,6 +178,16 @@ the standard `~/paradex` checkout. The shown planner environment is required
 because it contains cuRobo as well as the vision dependencies. Verify that
 `torch.cuda.is_available()` is true there before starting camera or robot
 processes.
+
+Each run directory is timestamped automatically and cannot overwrite an
+earlier take. The path is
+`AutoDex/experiment/continuous_basket/{arm}_{hand}/{catalogue}/{timestamp}/`.
+On normal completion, the runner automatically uploads only this take's
+capture AVI files to its `videos/capture/` NAS directory; it serializes one GPU
+undistortion per capture PC, verifies all calibrated camera serials, and
+restores the tracking daemons afterwards. It prints the exact
+`upload_recording.py --session ...` command for recovery. Pass
+`--no-upload-video` only to defer that post-take upload intentionally.
 
 ## Next implementation gates
 

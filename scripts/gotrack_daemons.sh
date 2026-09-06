@@ -75,7 +75,12 @@ case "$ACTION" in
         ;;
     status)
         for pc in "${PCS[@]}"; do
-            n=$(ssh -o ConnectTimeout=3 "$pc" "pgrep -fc 'python.*gotrack_daemon'" 2>/dev/null || echo "?")
+            # ``pgrep -f`` sees its own remote command line. The bracketed
+            # grep expression counts only the daemon process, and ``|| true``
+            # keeps the normal zero-daemon state distinguishable from SSH
+            # failure.
+            n=$(ssh -o ConnectTimeout=3 "$pc" "ps -eo args | grep -c '[p]ython .*gotrack_daemon.py' || true" \
+                2>/dev/null || echo "?")
             echo "  $pc: $n"
         done
         ;;

@@ -6,8 +6,8 @@ move and what does it buy? Two kinds of move, cheapest first:
 * **reposition** — same resting face, slide/turn on the table.
   ``(x, yaw) -> (x', yaw')``. One place-down, no re-grasp of a new face.
 * **reorient** — change which face the object rests on.
-  ``tabletop stem -> stem'``. Needs a reset run with the seeds in
-  ``candidates/{hand}/reset/{obj}/reorient_{h}/{i}_{j}/``.
+  ``tabletop stem -> stem'``. Needs v8 reset candidates in
+  ``candidates/{hand}/reset_{h_cm}/{obj}/reorient_{h_cm}/{i}_{j}/``.
 
 This module only COMPUTES and REPORTS. It executes nothing — reorient is a
 human-supervised step, so the caller gets the from/to and decides.
@@ -22,11 +22,10 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from autodex.utils.coverage import (_reorient_cell_solvable, _tabletop_stems,
-                                    load_v7_coverage_order, pick_reorient_target,
+                                    load_coverage_order, pick_reorient_target,
                                     uncovered_scenes)
-from autodex.utils.path import get_obj_root
+from autodex.utils.path import get_obj_root, RESET_RELEASE_HEIGHTS_CM
 from autodex.utils.reposition import pick_reposition_target
-from autodex.utils.tabletop_map import to_reset_index, z_aligned_geodesic_deg
 
 
 def current_placement(pose_robot: np.ndarray,
@@ -50,6 +49,16 @@ def _load_tabletop(obj_name: str, stem: str, obj_root: str) -> np.ndarray:
                                 "info", "tabletop", f"{stem}.npy"))
 
 
+def _z_aligned_geodesic_deg(R_est: np.ndarray, R_tab: np.ndarray) -> float:
+    """Tabletop orientation error after factoring out free world-z yaw."""
+    M = R_est @ R_tab.T
+    theta = np.arctan2(M[1, 0] - M[0, 1], M[0, 0] + M[1, 1])
+    c, s = np.cos(theta), np.sin(theta)
+    R_z = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    cos = (np.trace(R_est.T @ (R_z @ R_tab)) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(float(np.clip(cos, -1.0, 1.0)))))
+
+
 def classify_stem(obj_name: str, pose_robot: np.ndarray,
                   obj_root: str) -> Optional[Tuple[str, float]]:
     """Closest tabletop stem for ``pose_robot`` plus its residual error (deg)."""
@@ -60,7 +69,8 @@ def classify_stem(obj_name: str, pose_robot: np.ndarray,
     errs = []
     for s in stems:
         T = _load_tabletop(obj_name, s, obj_root)
-        errs.append((z_aligned_geodesic_deg(R, T[:3, :3] if T.shape == (4, 4) else T), s))
+        errs.append((_z_aligned_geodesic_deg(
+            R, T[:3, :3] if T.shape == (4, 4) else T), s))
     err, stem = min(errs)
     return stem, err
 
@@ -88,6 +98,8 @@ def plan_next_move(
     Returns a dict with ``current``, ``uncovered``, ``reposition``,
     ``reorient`` and ``recommend`` (``reposition`` | ``reorient`` | ``done``).
     """
+    if version != "v8":
+        raise ValueError("plan_next_move supports only the v8 asset contract")
     root = obj_root or get_obj_root(version)
     out: Dict = {"obj": obj_name, "hand": hand, "version": version,
                  "reposition": None, "reorient": None}
@@ -110,7 +122,7 @@ def plan_next_move(
         out["error"] = (f"no coverage json for {obj_name}/{version} — run "
                         f"src/dataset/compute_v8_coverage.py first")
         return out
-    order = load_v7_coverage_order(obj_name, stem, version=version) or []
+    order = load_coverage_order(obj_name, stem, version=version) or []
     out["uncovered"] = {"n": len(rem), "scenes": sorted(rem),
                         "setcover_len": len(order)}
 
@@ -145,13 +157,13 @@ def plan_next_move(
     if tgt_j is not None:
         j_int, to_stem, n_rem_target = tgt_j
         n_seeds, n_succ = _reorient_cell_solvable(
-            obj_name, hand, int(stem), j_int, h_cm=h_cm, obj_root=root)
+            obj_name, hand, int(stem), j_int, version=version)
         out["reorient"] = {
             "available": True,
             "from_stem": stem, "to_stem": to_stem, "to_target_j": j_int,
-            "cell": f"{to_reset_index(obj_name, stem, root)}_"
-                    f"{to_reset_index(obj_name, to_stem, root)}",
-            "h_cm": h_cm, "n_seeds": n_seeds, "n_past_success": n_succ,
+            "cell": f"{int(stem)}_{j_int}",
+            "height_order_cm": list(RESET_RELEASE_HEIGHTS_CM),
+            "n_seeds": n_seeds, "n_past_success": n_succ,
             "opens": n_rem_target,
             "command": (f"python src/experiment/reset/reorient.py "
                         f"--obj {obj_name} --hand {hand} --target_j {j_int} "
@@ -205,7 +217,8 @@ def format_next_move(res: Dict) -> str:
     ro = res.get("reorient")
     if ro and ro.get("available"):
         L.append(f"  REORIENT    tabletop {ro['from_stem']} -> {ro['to_stem']}  "
-                 f"(cell {ro['cell']} @ reorient_{ro['h_cm']}, "
+                 f"(cell {ro['cell']}; reset heights "
+                 f"{ro['height_order_cm']} cm in order, "
                  f"{ro['n_seeds']} seeds, {ro['n_past_success']} past success)")
         L.append(f"              opens {ro['opens']} uncovered scenes at target")
         L.append(f"              {ro['command']}")

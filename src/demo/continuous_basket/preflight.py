@@ -19,7 +19,11 @@ from typing import Iterable, List, Optional, Sequence
 # Keep the documented direct invocation usable without an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from src.demo.continuous_basket.catalog import CatalogObject, parse_catalog
+from src.demo.continuous_basket.catalog import (
+    CatalogObject,
+    parse_catalog,
+    require_catalog_runtime,
+)
 
 
 DEFAULT_ASSETS_BASE = Path.home() / "shared_data/AutoDex/foundpose_assets"
@@ -52,25 +56,40 @@ class ObjectReadiness:
     missing: List[str]
 
 
-def _successful_candidate_count(paths: Iterable[Path], arm: Optional[str]) -> int:
-    """Count executable, arm-compatible candidate records marked successful.
+def _is_file(path: Path) -> bool:
+    """Return whether a NAS file is usable without letting an audit crash.
 
-    Candidate pools are shared by hand, while results distinguish FR3 and
-    xArm.  A successful xArm grasp must not let an FR3 demo pass preflight.
-    Historical records lacking ``arm`` were xArm runs, matching AutoDex's
-    existing coverage reader.
+    NFS exports can expose a directory while denying traversal to a child
+    created with restrictive permissions.  Treat that exactly like a missing
+    runtime asset so the operator gets a full catalogue report rather than a
+    traceback for the first bad object.
     """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _successful_candidate_count(paths: Iterable[Path], arm: Optional[str] = None) -> int:
+    """Count executable candidate records marked successful, regardless of arm.
+
+    A candidate is geometry for an object+hand pair.  Its historical arm is
+    useful provenance, but must not exclude it from a continuous-demo
+    catalogue: the actual execution arm revalidates IK, collision, lift, and
+    carry before moving.  ``arm`` is retained as an ignored compatibility
+    parameter for callers from older revisions.
+    """
+    del arm
     count = 0
     for wrist_path in paths:
-        if not (wrist_path.parent / "pregrasp_pose.npy").is_file():
+        if not _is_file(wrist_path.parent / "pregrasp_pose.npy"):
             continue
         result_path = wrist_path.parent / "result.json"
-        if not result_path.is_file():
+        if not _is_file(result_path):
             continue
         try:
             result = json.loads(result_path.read_text())
-            if (result.get("success") is True
-                    and (arm is None or str(result.get("arm", "xarm")) == arm)):
+            if result.get("success") is True:
                 count += 1
         except (OSError, ValueError, json.JSONDecodeError):
             continue
@@ -92,13 +111,13 @@ def check_object(
     anchor = anchor_root / f"{item.name}.npz"
     wrists = sorted((candidate_root / item.name).glob("**/wrist_se3.npy"))
     runnable_count = sum(
-        (wrist.parent / "pregrasp_pose.npy").is_file() for wrist in wrists
+        _is_file(wrist.parent / "pregrasp_pose.npy") for wrist in wrists
     )
-    success_count = _successful_candidate_count(wrists, arm)
+    success_count = _successful_candidate_count(wrists)
     missing: List[str] = []
-    if not mesh.is_file():
+    if not _is_file(mesh):
         missing.append("mesh")
-    if not repre.is_file():
+    if not _is_file(repre):
         missing.append("foundpose_repre")
     if not wrists:
         missing.append("grasp_candidates")
@@ -106,7 +125,7 @@ def check_object(
         missing.append("runnable_grasp_candidates")
     if success_count == 0:
         missing.append("successful_grasp")
-    if require_gotrack and not anchor.is_file():
+    if require_gotrack and not _is_file(anchor):
         missing.append("gotrack_anchor_bank")
     return ObjectReadiness(
         name=item.name, mesh=str(mesh), foundpose_repre=str(repre), anchor_bank=str(anchor),
@@ -148,8 +167,8 @@ def main() -> None:
     parser.add_argument("--objects", nargs="+", required=True,
                         help="object_name or object_name=YOLO-E prompt")
     parser.add_argument("--hand", default="inspire")
-    parser.add_argument("--arm", default="franka", choices=["franka", "xarm"],
-                        help="require successful grasp records for this robot arm")
+    parser.add_argument("--arm", default=None, choices=["franka", "xarm"],
+                        help="legacy compatibility only; successful grasps are arm-agnostic")
     parser.add_argument("--version", default="v8")
     parser.add_argument("--assets-base", default=str(DEFAULT_ASSETS_BASE))
     parser.add_argument("--anchor-root", default=str(DEFAULT_ANCHOR_ROOT))
@@ -166,11 +185,20 @@ def main() -> None:
                    if args.object_root else _default_object_root(args.version))
     candidate_root = (Path(args.candidate_root).expanduser()
                       if args.candidate_root else _default_candidate_root(args.hand, args.version))
+    catalogue = parse_catalog(args.objects)
+    # A one-object run goes straight to FoundPose.  A catalogue with two or
+    # more objects invokes YOLO-E before any robot motion, so catch a missing
+    # package/checkpoint here rather than after cameras and daemons are open.
+    if len(catalogue) > 1:
+        try:
+            require_catalog_runtime()
+        except RuntimeError as exc:
+            parser.error(str(exc))
+
     rows = build_report(
-        parse_catalog(args.objects), object_root=object_root,
+        catalogue, object_root=object_root,
         assets_base=Path(args.assets_base).expanduser(), candidate_root=candidate_root,
         anchor_root=Path(args.anchor_root).expanduser(), require_gotrack=not args.no_gotrack,
-        arm=args.arm,
     )
     if args.json:
         print(json.dumps([asdict(row) for row in rows], indent=2))

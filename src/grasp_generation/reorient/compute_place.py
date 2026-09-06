@@ -1,7 +1,7 @@
 """
 Per-grasp place precomputation.
 
-For each candidate seed under candidates/{hand}/reset/{obj}/{h_cm}/{i}_{j}/{seed},
+For each candidate seed under candidates/{hand}/reset_{h_cm}/{obj}/reorient_{h_cm}/{i}_{j}/{seed},
 search a (place_x, place_y, place_tz) grid for a place location that yields
 IK-feasible:
   - q_placed                (always)
@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from autodex.utils.path import get_obj_root
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plan_reset import (  # noqa: E402
@@ -94,8 +96,8 @@ def find_place_for_seed(planner, *, wrist_se3_obj, grasp_q,
     return None
 
 
-def discover_pairs(obj_name: str, hand: str, h_cm: int):
-    base = _reset_candidate_path(hand) / "reset" / obj_name / f"reorient_{h_cm}"
+def discover_pairs(obj_name: str, hand: str, h_cm: int, *, version: str = "v8"):
+    base = _reset_candidate_path(hand, h_cm, version) / obj_name / f"reorient_{h_cm}"
     if not base.exists():
         return []
     pairs = []
@@ -120,6 +122,8 @@ def main():
     p.add_argument("--h_cm", type=int, default=0)
     p.add_argument("--hand", default="inspire_left",
                     choices=["inspire_left", "inspire", "allegro"])
+    p.add_argument("--version", default="v8",
+                   help="v8 reset/tabletop asset contract (only supported value)")
     p.add_argument("--x_min", type=float, default=0.35)
     p.add_argument("--x_max", type=float, default=0.55)
     p.add_argument("--x_step", type=float, default=0.05)
@@ -130,6 +134,9 @@ def main():
     p.add_argument("--overwrite", action="store_true",
                     help="recompute even if place.npy already exists")
     args = p.parse_args()
+    if args.version != "v8":
+        p.error("compute_place supports only --version v8; legacy reset assets are not used")
+    obj_root = get_obj_root(args.version)
 
     # Default = all pairs.
     if args.pairs:
@@ -138,7 +145,7 @@ def main():
     elif args.i is not None and args.j is not None:
         pairs = [(args.i, args.j)]
     else:
-        pairs = discover_pairs(args.obj, args.hand, args.h_cm)
+        pairs = discover_pairs(args.obj, args.hand, args.h_cm, version=args.version)
         if not pairs:
             print(f"[compute_place] no pairs discovered for {args.obj} h={args.h_cm}cm")
             return
@@ -170,18 +177,18 @@ def main():
 
     for (i, j) in pairs:
         if j not in Tj_cache:
-            Tj_cache[j] = load_tabletop_pose(args.obj, j)
+            Tj_cache[j] = load_tabletop_pose(args.obj, j, obj_root)
         Tj_can = Tj_cache[j]
 
         try:
             wrist_o_all, _preg, grasp_all, seed_ids, _places = load_candidates_object_frame(
-                args.obj, args.hand, args.h_cm, i, j,
+                args.obj, args.hand, args.h_cm, i, j, version=args.version,
             )
         except FileNotFoundError as e:
             print(f"[pair {i}_{j}] SKIP — {e}")
             continue
 
-        candidate_dir = (_reset_candidate_path(args.hand) / "reset"
+        candidate_dir = (_reset_candidate_path(args.hand, args.h_cm, args.version)
                          / args.obj / f"reorient_{args.h_cm}" / f"{i}_{j}")
         n_ok = 0
         pair_t0 = time.time()

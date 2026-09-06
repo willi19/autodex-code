@@ -84,7 +84,7 @@ URDF_PATH = os.path.expanduser(
     "~/shared_data/AutoDex/content/assets/robot/fr3_inspire_description/fr3_inspire.urdf")
 
 # Table top in robot frame, from the planner's table cuboid.
-TABLE_SURFACE_Z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2   # 0.035
+TABLE_SURFACE_Z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2   # 0.040
 N_LIFT_IK = 60          # waypoints solved along the +z lift (see ik_seq)
 
 

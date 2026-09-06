@@ -8,7 +8,7 @@ This is deliberately a staged tool.  It never moves the robot unless both
 2. Run ``--stage assets --execute`` (FoundPose representation + GoTrack bank).
 3. Run ``--stage candidates --execute`` (tabletop simulated candidates).
 4. Run the printed collection command, which uses ``run_auto.py`` to record
-   arm-specific physical successes in the same NAS candidate pool.
+   physical successes in the same NAS candidate pool.
 5. Check ``--stage audit`` until preflight is ready, then use the printed
    continuous-demo command.
 
@@ -245,9 +245,9 @@ def _demo_command(items: Sequence[CatalogObject], args) -> list[str]:
     return command + ["--basket-center", *[str(v) for v in basket]]
 
 
-def _franka_successful_tabletops(item: CatalogObject, *, candidate_root: Path,
-                                 scene_root: Path) -> set[str]:
-    """Return stable-pose stems with a real Franka success, if recoverable.
+def _successful_tabletops(item: CatalogObject, *, candidate_root: Path,
+                          scene_root: Path) -> set[str]:
+    """Return stable-pose stems with a real physical success, if recoverable.
 
     Older v8 candidates use the coverage map; newly generated table candidates
     have no coverage file yet, so their hand-specific table-scene metadata is
@@ -271,7 +271,7 @@ def _franka_successful_tabletops(item: CatalogObject, *, candidate_root: Path,
             result = json.loads(result_path.read_text())
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if result.get("success") is not True or str(result.get("arm", "xarm")) != "franka":
+        if result.get("success") is not True:
             continue
         try:
             scene_type, scene_id, grasp_id = wrist.relative_to(object_root).parts[:3]
@@ -294,17 +294,17 @@ def _print_readiness(items: Sequence[CatalogObject], args) -> bool:
     runtime = build_report(
         items, object_root=Path(args.object_root), assets_base=Path(args.assets_base),
         candidate_root=Path.home() / "shared_data/AutoDex/candidates/inspire" / args.version,
-        anchor_root=Path(args.anchor_root), require_gotrack=True, arm="franka",
+        anchor_root=Path(args.anchor_root), require_gotrack=True,
     )
     by_name = {row.name: row for row in runtime}
     candidate_root = Path.home() / "shared_data/AutoDex/candidates/inspire" / args.version
     scene_root = Path.home() / "shared_data/AutoDex/scene"
-    print(f"{'object':<24} {'tabletop':>8} {'candidate':>9} {'FR3 ok':>7} {'FR3 pose':>8}  status")
+    print(f"{'object':<24} {'tabletop':>8} {'candidate':>9} {'phys ok':>7} {'phys pose':>9}  status")
     ready = True
     for row in processing:
         runtime_row = by_name[row.name]
         missing = [*row.missing, *runtime_row.missing]
-        pose_count = len(_franka_successful_tabletops(
+        pose_count = len(_successful_tabletops(
             CatalogObject(row.name, row.name), candidate_root=candidate_root, scene_root=scene_root,
         ))
         if runtime_row.successful_candidate_count and pose_count < args.min_franka_poses:
@@ -343,7 +343,7 @@ def main() -> None:
     parser.add_argument("--seed-num", type=int, default=200)
     parser.add_argument("--collection-trials", type=int, default=8)
     parser.add_argument("--min-franka-poses", type=int, default=1,
-                        help="require this many stable tabletop poses with Franka successes during audit")
+                        help="legacy option name: require this many physical-success tabletop poses during audit")
     parser.add_argument("--auto-label", action="store_true",
                         help="use Charuco lift verification during physical collection")
     basket_source = parser.add_mutually_exclusive_group()
@@ -407,7 +407,7 @@ def main() -> None:
             _run(command, execute=args.execute and args.run_robot)
 
     if args.stage == "demo":
-        print("[demo] This command is blocked until all objects pass the Franka preflight and basket coordinates are known.")
+        print("[demo] This command is blocked until all objects pass preflight and basket coordinates are known.")
         command = _demo_command(items, args)
         if args.basket_center is not None or args.basket_marker_id is not None:
             _run(command, execute=args.execute and args.run_robot)

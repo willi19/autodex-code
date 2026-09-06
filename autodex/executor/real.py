@@ -258,6 +258,9 @@ class RealExecutor:
         self._hand_init = hcfg["init"]
         self._link6_to_wrist = hcfg["link6_to_wrist"]
         self._xarm_init = hcfg["xarm_init"]
+        self._last_hand_qpos = np.asarray(self._hand_init, dtype=np.float64).copy()
+        self._last_hand_action = self._convert(self._last_hand_qpos)
+        self.state_timestamps = []
 
         from paradex.io.robot_controller import get_arm, get_hand
         self.arm = get_arm(arm_name)
@@ -491,6 +494,34 @@ class RealExecutor:
         ts = datetime.datetime.now().isoformat()
         self.state_timestamps.append({"state": state, "time": ts})
 
+    def home(self, clear_view: bool = False) -> None:
+        """Open the hand and move once to the calibrated xArm start pose.
+
+        ``clear_view`` uses the same base-joint offset as the existing recovery
+        path, keeping the arm outside the cameras before live perception.  It
+        is intentionally a caller-controlled one-time action; local retries
+        must use ``execute(..., start_from_current=True)`` instead.
+        """
+        self._log_state("clear_view" if clear_view else "init")
+        self._move_hand(self._convert(self._hand_init))
+        self._last_hand_qpos = np.asarray(self._hand_init, dtype=np.float64).copy()
+        self._last_hand_action = self._convert(self._last_hand_qpos)
+        time.sleep(0.5)
+        target = np.asarray(self._xarm_init, dtype=np.float64).copy()
+        if clear_view:
+            target[0] -= np.deg2rad(40.0)
+        order = [1, 2, 5, 0, 3, 4]
+        if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
+            order = [2, 1, 5, 0, 3, 4]
+        self._move_joint_sequential(target[:6], order, threshold=0.06)
+        err = float(np.linalg.norm(
+            np.asarray(self.arm.get_data()["qpos"][:6], dtype=np.float64) - target[:6]
+        ))
+        if err > 0.1:
+            raise RuntimeError(
+                f"home(): final qpos err={err:.3f} > 0.1; target={target[:6].round(3)}"
+            )
+
     def _make_monitor(self, thresh_nm: float = 15.0, model_path: str = None,
                       watch_joints=(1, 2),
                       sustained_ticks: int = 100,
@@ -580,6 +611,8 @@ class RealExecutor:
         # 3. Pregrasp
         self._log_state("pregrasp")
         self._move_hand(pg_hand)
+        self._last_hand_qpos = np.asarray(plan_result.pregrasp_pose, dtype=np.float64)
+        self._last_hand_action = np.asarray(pg_hand, dtype=np.float64)
 
         # 4. Grasp — interpolated ramp pregrasp → grasp for slower close.
         self._log_state("grasp")
@@ -591,10 +624,13 @@ class RealExecutor:
 
         # 5. Squeeze (2× slower than before: sleep 0.01 → 0.02)
         self._log_state("squeeze")
+        s_hand = g_hand
         for i in range(sl * 5):
             s_hand = g_hand * (1 + i / 5) - pg_hand * (i / 5)
             self._move_hand(s_hand)
             time.sleep(0.02)
+        self._last_hand_qpos = np.asarray(plan_result.grasp_pose, dtype=np.float64)
+        self._last_hand_action = np.asarray(s_hand, dtype=np.float64)
 
         if skip_lift:
             self._log_state("squeeze_done")
@@ -985,7 +1021,7 @@ class RealExecutor:
                 "target": float(target_descend)}
 
     def release(self, plan_result: PlanResult, slow_factor: float = 1.0):
-        """Release object and return arm to init pose.
+        """Release object while leaving the arm at its current raised pose.
 
         slow_factor > 1.0 stretches the open ramp (e.g. 4.0 → 2s instead of 0.5s).
         """
@@ -995,6 +1031,8 @@ class RealExecutor:
         pg_hand = self._convert(plan_result.pregrasp_pose)
         g_hand = self._convert(plan_result.grasp_pose)
         self._release_auto(pg_hand, g_hand, slow_factor=slow_factor)
+        self._last_hand_qpos = np.asarray(plan_result.pregrasp_pose, dtype=np.float64)
+        self._last_hand_action = np.asarray(pg_hand, dtype=np.float64)
 
     def _release_auto(self, pg_hand, g_hand, slow_factor: float = 1.0):
         """Reverse squeeze -> grasp -> pregrasp, then STOP.
