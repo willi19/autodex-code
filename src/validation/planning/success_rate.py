@@ -21,6 +21,7 @@ import sys
 import argparse
 import json
 import logging
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -135,14 +136,39 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
     print(f"Trials per point: {n_trials}")
     print("=" * 60)
 
+    setup_timing = {}
     if not remaining:
         print("  All points already done")
     else:
         logging.getLogger("curobo").setLevel(logging.ERROR)
+        t_ctor = time.perf_counter()
         planner = GraspPlanner(hand=hand)
+        t_ctor = time.perf_counter() - t_ctor
 
+        # Pay the one-time, reusable CUDA/solver setup here so the first grid
+        # point measures steady-state planning instead of MotionGen creation +
+        # CUDA graph capture + the first joint-space trajopt compile.
+        warm_pt = remaining[0]
+        warm_cfg = load_tabletop_scene(obj_name, warm_pt["pose_idx"],
+                                       x_offset=warm_pt["x_offset"],
+                                       z_rotation=np.radians(warm_pt["z_rotation_deg"]))
+        warm_info = planner.warmup(warm_cfg, warmup_js_trajopt=True)
+        setup_timing = {"planner_ctor_s": round(t_ctor, 3), **warm_info["breakdown"]}
+        print("Setup (one-time, reusable):")
+        for k, v in setup_timing.items():
+            print(f"  {k:26s} {v:7.3f}s")
+        print("=" * 60)
+
+    # plan_single_js_s is the wall clock of the whole candidate loop; the js_*
+    # keys break it into cuRobo's own graph/trajopt/finetune solver time plus
+    # the remaining setup overhead.
     stage_keys = ["load_candidates_s", "world_setup_s", "filter_s",
-                  "ik_s", "plan_single_js_s"]
+                  "ik_s", "plan_single_js_s",
+                  "js_graph_s", "js_trajopt_s", "js_finetune_s",
+                  "js_overhead_s"]
+    # Sub-stages of plan_single_js_s — excluded from total_per_point so the
+    # per-point total is not double counted.
+    substage_keys = {"js_graph_s", "js_trajopt_s", "js_finetune_s", "js_overhead_s"}
 
     n_plan_success = sum(1 for r in all_results if r["success_rate"] == 1.0)
     n_plan_fail = sum(1 for r in all_results if r["success_rate"] < 1.0)
@@ -207,6 +233,11 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
             "ik_counts": ik_counts,
             "ik_mean": round(float(np.mean(ik_counts)), 1),
             "avg_timing": avg_timing,
+            # Why plan_single_js rejected each candidate (GRAPH_FAIL /
+            # TRAJOPT_FAIL / FINETUNE_TRAJOPT_FAIL / INVALID_QUERY counts).
+            "js_fail_status": [t.get("js_fail_status") for t in trial_timings if t],
+            # How many IK-reachable candidates plan_single_js had to try.
+            "n_plan_attempts": [t.get("n_plan_attempts", 0) for t in trial_timings if t],
         }
         all_results.append(entry)
 
@@ -271,10 +302,11 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
                     "min": round(float(np.min(vals)), 3),
                     "max": round(float(np.max(vals)), 3),
                 }
+        top_keys = [k for k in stage_keys if k not in substage_keys]
         totals = []
         for r in results:
             if r["avg_timing"]:
-                totals.append(sum(r["avg_timing"].get(k, 0) for k in stage_keys))
+                totals.append(sum(r["avg_timing"].get(k, 0) for k in top_keys))
         if totals:
             stats["total_per_point"] = {
                 "mean": round(float(np.mean(totals)), 3),
@@ -298,6 +330,7 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
         "n_plan_partial": partial,
         "n_plan_always_fail": never_ok,
         "overall_mean_rate": round(float(np.mean(rates)), 3),
+        "setup_timing": setup_timing,
         "timing": {
             "all": timing_all,
             "success": timing_success,
@@ -327,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--x_step", type=float, default=0.05, help="X offset step")
     parser.add_argument("--z_step", type=float, default=30, help="Z rotation step (degrees)")
     parser.add_argument("--save_dir", type=str, default=None, help="Output directory")
-    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"])
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire", "inspire_left", "fr3_inspire"])
     args = parser.parse_args()
 
     x_offsets = np.arange(args.x_min, args.x_max + 1e-6, args.x_step).round(3).tolist()

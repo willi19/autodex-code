@@ -1,4 +1,5 @@
 import os
+import time as _perf
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
@@ -130,6 +131,28 @@ def _to_curobo_world(scene_cfg: dict) -> dict:
     return cfg
 
 
+def _js_break_timing(js_break: dict, t_plan: float, js_status: dict) -> dict:
+    """Flatten the accumulated plan_single_js stage times into timing keys.
+
+    ``js_*_s`` are cuRobo's own solver clocks summed over every candidate
+    attempted in this plan() call; ``js_overhead_s`` is the remainder of the
+    measured wall clock (tensor setup, CUDA sync, start-state checks, the
+    first-call joint-space trajopt compile).
+    """
+    solve = js_break["solve_s"]
+    out = {
+        "js_graph_s": round(js_break["graph_s"], 3),
+        "js_trajopt_s": round(js_break["trajopt_s"], 3),
+        "js_finetune_s": round(js_break["finetune_s"], 3),
+        "js_solve_s": round(solve, 3),
+        "js_overhead_s": round(max(t_plan - solve, 0.0), 3),
+        "js_curobo_attempts": int(js_break["curobo_attempts"]),
+    }
+    if js_status:
+        out["js_fail_status"] = js_status
+    return out
+
+
 def _to_curobo_pose(poses_se3: np.ndarray, device) -> Pose:
     """(B, 4, 4) -> cuRobo Pose."""
     position = torch.tensor(poses_se3[:, :3, 3], dtype=torch.float32, device=device).contiguous()
@@ -225,6 +248,13 @@ class GraspPlanner:
         # Candidate searches deliberately test many paths expected to fail.
         # Detailed cuRobo checks and collision-mesh exports are opt-in.
         self._verbose_planning = bool(verbose_planning)
+        # Per-call cuRobo breakdown of the last plan_single_js. Side-channel so
+        # the many _refine_fingers callers keep their (ok, traj) signature.
+        self._last_js_stats: dict = {}
+        # One-time, reusable CUDA/solver setup cost, filled in by
+        # _init_motion_gen / _init_ik_solver / warmup. Paid once per process
+        # and amortised over every later plan() on the same world structure.
+        self.setup_timing: dict = {}
 
     def set_verbose_planning(self, enabled: bool = True) -> None:
         """Enable detailed per-failure cuRobo diagnostics when needed."""
@@ -260,6 +290,7 @@ class GraspPlanner:
     # ── world setup ───────────────────────────────────────────────────────────
 
     def _init_motion_gen(self, world_cfg: dict, use_cuda_graph: bool = True):
+        t0 = _perf.perf_counter()
         config = MotionGenConfig.load_from_robot_config(
             self._robot_cfg,
             WorldConfig.from_dict(world_cfg),
@@ -277,8 +308,19 @@ class GraspPlanner:
             collision_activation_distance=self._collision_act_dist,
             store_debug_in_result=True,
         )
+        t1 = _perf.perf_counter()
         self._motion_gen = MotionGen(config)
+        t2 = _perf.perf_counter()
+        # CUDA graph capture + first solver compile. Once per process, and the
+        # dominant term of the historical "~10s first plan".
         self._motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
+        t3 = _perf.perf_counter()
+        self.setup_timing.update({
+            "motion_gen_config_s": round(t1 - t0, 3),
+            "motion_gen_build_s": round(t2 - t1, 3),
+            "motion_gen_warmup_s": round(t3 - t2, 3),
+            "motion_gen_total_s": round(t3 - t0, 3),
+        })
         self._plan_cfg = MotionGenPlanConfig(
             enable_graph=True,
             enable_opt=True,
@@ -354,6 +396,7 @@ class GraspPlanner:
         else:
             self._update_target_pose_only(world_cfg)
         self._cached_world = world_cfg
+        t_mg = _time.perf_counter()
 
         # ``_init_motion_gen`` warms Cartesian/graph planning.  The normal
         # fixed-Inspire route also invokes plan_single_js, which that initial
@@ -361,6 +404,7 @@ class GraspPlanner:
         # its unmeasured one-time setup phase.
         if warmup_js_trajopt:
             self._motion_gen.warmup(enable_graph=False, warmup_js_trajopt=True)
+        t_js = _time.perf_counter()
 
         world_cfg_no_target = dict(world_cfg)
         world_cfg_no_target["mesh"] = {}
@@ -369,11 +413,19 @@ class GraspPlanner:
             self._init_ik_solver(world_cfg_no_target)
         else:
             self._ik_solver.update_world(WorldConfig.from_dict(world_cfg_no_target))
+        t_end = _time.perf_counter()
+        self.setup_timing.update({
+            "warmup_motion_gen_s": round(t_mg - t0, 3),
+            "warmup_js_trajopt_s": round(t_js - t_mg, 3),
+            "warmup_ik_s": round(t_end - t_js, 3),
+            "warmup_total_s": round(t_end - t0, 3),
+        })
         return {
-            "total_s": round(_time.perf_counter() - t0, 3),
+            "total_s": round(t_end - t0, 3),
             "motion_gen_created": motion_gen_created,
             "ik_solver_created": ik_created,
             "joint_space_trajopt_warmed": bool(warmup_js_trajopt),
+            "breakdown": dict(self.setup_timing),
         }
 
     # ── collision check ───────────────────────────────────────────────────────
@@ -516,6 +568,7 @@ class GraspPlanner:
     # ── IK solver ─────────────────────────────────────────────────────────────
 
     def _init_ik_solver(self, world_cfg: dict, use_cuda_graph: bool = True):
+        t0 = _perf.perf_counter()
         config = IKSolverConfig.load_from_robot_config(
             self._robot_cfg,
             WorldConfig.from_dict(world_cfg),
@@ -525,7 +578,14 @@ class GraspPlanner:
             collision_activation_distance=self._collision_act_dist,
             use_cuda_graph=self._use_cuda_graph,
         )
+        t1 = _perf.perf_counter()
         self._ik_solver = IKSolver(config)
+        t2 = _perf.perf_counter()
+        self.setup_timing.update({
+            "ik_config_s": round(t1 - t0, 3),
+            "ik_build_s": round(t2 - t1, 3),
+            "ik_total_s": round(t2 - t0, 3),
+        })
 
     def solve_ik(self, scene_cfg: dict, obj_name: str, grasp_version: str,
                  seed: Optional[int] = None, hand: str = "allegro",
@@ -1420,7 +1480,25 @@ class GraspPlanner:
         goal = JointState.from_position(
             torch.tensor(goal_joint, dtype=torch.float32, device=self._tensor_args.device).unsqueeze(0)
         )
+        t_js = _perf.perf_counter()
         result = self._motion_gen.plan_single_js(start_state=start, goal_state=goal, plan_config=self._plan_cfg)
+        # cuRobo already accumulates per-stage solve times across attempts;
+        # keep them so callers can break plan_single_js_s down instead of
+        # seeing one opaque wall-clock number.
+        self._last_js_stats = {
+            "wall_s": round(_perf.perf_counter() - t_js, 4),
+            "graph_s": round(float(result.graph_time or 0.0), 4),
+            "trajopt_s": round(float(result.trajopt_time or 0.0), 4),
+            "finetune_s": round(float(result.finetune_time or 0.0), 4),
+            "solve_s": round(float(result.solve_time or 0.0), 4),
+            # plan_single_js sets attempts to the 0-indexed loop counter; the
+            # early check_start_state return leaves the dataclass default (1).
+            "attempts": (1 if not result.valid_query
+                         else int(getattr(result, "attempts", 0) or 0) + 1),
+            "status": (str(result.status) if result.status is not None else None),
+            "valid_query": bool(result.valid_query),
+            "success": bool(result.success.item()),
+        }
         if not result.success.item() and not self._verbose_planning:
             # Candidate searches expect failures. Keep collision exports and
             # low-level cuRobo checks for an explicit diagnostic run only.
@@ -2281,12 +2359,25 @@ class GraspPlanner:
             np.random.shuffle(ik_valid)
         t0 = _time.time()
         n_attempts = 0
+        # Per-stage cuRobo breakdown accumulated over every attempted candidate.
+        js_break = {"graph_s": 0.0, "trajopt_s": 0.0, "finetune_s": 0.0,
+                    "solve_s": 0.0, "curobo_attempts": 0}
+        js_status = {}
         for idx in ik_valid:
             t1 = _time.time()
             ok, traj = self._refine_fingers(self._init_state, ik_qpos[idx])
             n_attempts += 1
+            st = self._last_js_stats
+            for k in ("graph_s", "trajopt_s", "finetune_s", "solve_s"):
+                js_break[k] += st.get(k, 0.0)
+            js_break["curobo_attempts"] += st.get("attempts", 0)
+            if not ok:
+                key = "INVALID_QUERY" if not st.get("valid_query", True) else str(st.get("status"))
+                js_status[key] = js_status.get(key, 0) + 1
             print(f"[planner] plan_single_js #{n_attempts} (idx={idx}): "
-                  f"{'ok' if ok else 'fail'} ({_time.time() - t1:.2f}s)")
+                  f"{'ok' if ok else 'fail'} ({_time.time() - t1:.2f}s "
+                  f"graph={st.get('graph_s', 0):.2f} traj={st.get('trajopt_s', 0):.2f} "
+                  f"ft={st.get('finetune_s', 0):.2f})")
             if ok:
                 t_plan = _time.time() - t0
                 print(f"[planner] Selected candidate #{idx}/{N}")
@@ -2296,10 +2387,12 @@ class GraspPlanner:
                     scene_info=scene_info[idx],
                     timing={**base_timing, "plan_single_js_s": round(t_plan, 3),
                             "n_plan_attempts": n_attempts,
+                            **_js_break_timing(js_break, t_plan, js_status),
                             "candidate_idx": int(idx)},
                     openpose_pose=openpose_list[idx],
                 )
 
         t_plan = _time.time() - t0
         return _fail_result({**base_timing, "plan_single_js_s": round(t_plan, 3),
-                             "n_plan_attempts": n_attempts})
+                             "n_plan_attempts": n_attempts,
+                             **_js_break_timing(js_break, t_plan, js_status)})
